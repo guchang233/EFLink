@@ -1,0 +1,16 @@
+name: Build Windows module
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        shell: cmd
+        run: tools\build.cmd
+      - name: Package
+        run: python tools/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EFLink-Windows-x64
+          path: dist/*

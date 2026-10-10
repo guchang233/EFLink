@@ -1,0 +1,12 @@
+/build/
+/dist/
+/reports/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+__pycache__/
+*.tmp
+test-environments/
+/references/

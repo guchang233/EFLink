@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "id": "eflink.core",
+  "name": "EF Link · 终末地联机",
+  "author": "EF Link contributors",
+  "version": "1.2.0-dev",
+  "abi": 1,
+  "libraries": {"windows-x64": "native/windows-x64/eflink.core.dll"},
+  "default_configuration": {
+    "player_name": "",
+    "gui_enabled": true,
+    "menu_key": 187,
+    "show_remote_players": true,
+    "show_player_markers": true,
+    "follow_host_world": true,
+    "sync_combat": true,
+    "room_name": "",
+    "max_players": 8,
+    "port": 47615,
+    "saved_servers": []
+  },
+  "dependencies": []
+}

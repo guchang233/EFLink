@@ -1,0 +1,73 @@
+# EF Link · 终末地联机模块
+
+EF Link 是一个独立的 Windows x64 / Better-Endfield 模块，为终末地 mod 提供局域网房间、玩家连接、角色姿态同步和通用数据通道。它自带游戏内 ImGui，不需要 WebUI，也不需要 Minecraft、EndCraft 客户端或桥接协议。
+
+按 **=**（主键盘等号键，可在设置中改为 F1–F12）打开联机菜单：开放房间、自动发现局域网房间、直接连接、收藏服务器、查看玩家、聊天和调整设置。关闭菜单后连接继续运行。
+
+## 安装和连接
+
+1. 在 Better-Endfield 管理应用的“第三方模块”中导入 `EFLink-1.2.0-dev.zip` 并启用。本版世界同步仍处于实验阶段。
+2. 启动终末地，登录并进入可移动的场景。
+3. 房主按 = → 开放房间 → 填写房间名称、人数和可选密码 → 开放房间。
+4. 好友按 = → 局域网房间 → 加入；也可以在“直接连接”中填写房主的 `IP:端口`。
+5. 客机接收房主地图快照；玩家列表可以发起传送。关闭菜单后，屏幕标记显示其他玩家的位置和距离。完整世界入场尚未完成，界面会明确显示接管缺口。
+
+默认游戏端口为 TCP/UDP **47615**；房间发现使用 UDP **47616**。名单、名字、收藏和快捷键保存在 `%LOCALAPPDATA%\EFLink\settings.json`；密码不保存。Windows 防火墙弹窗由玩家自行允许游戏联网。ImGui 绘制数据交给 Unity CanvasRenderer，由游戏当前渲染后端处理；运行时不创建覆盖窗口。独占全屏仍待实机验收。
+
+独立启动环境可设置 `EFLINK_PROFILE_DIR` 为绝对目录，使此实例的 EF Link 偏好保存在该目录的 `settings.json`。游戏和启动器的完整隔离仍由实际多开工具负责。
+
+升级同 ID 的 DLL 后需要正常重启游戏。若安装过旧实验模块 `endcraft.link`，使用新的 `eflink.core` 即可；旧模块的 WebUI 不是本模块的入口。
+
+## 当前范围
+
+提供房间控制、可靠/不可靠消息、聊天、玩家加入离开通知，以及干员位置、朝向、骨骼动作和切人同步。远端角色使用游戏原生资源和材质，并以插值平滑显示；不会安装另一套相机或第一人称系统。
+
+1.2.0-dev 新增房主地图/敌人快照、地图版本隔离、玩家传送请求和世界入场握手。客机的账号怪物与房间怪物分开管理，房间怪物尝试从原生模板独立创建；这一创建流程仍待实机验证。传送接入原生移动和地图加载流程；屏幕标记通过没有鼠标命中目标的 CanvasRenderer 绘制。
+
+目标是房主电脑运行房间服务器，客机真正加入同一个世界。收到快照、处于相同地图或看到角色，都不计为完成入场。入场需要客机隔离、原生逻辑玩家、房主战斗和场景规则全部就绪，再由房主确认。当前原生适配器尚不具备这些完整能力，因此实验版本禁止客机结算战斗，避免两套世界同时推进。
+
+完整大世界和副本合作战斗仍在开发：动态实体创建、远端玩家逻辑角色、敌人技能和动画、玩家受伤、资源/建筑/任务及奖励尚未接管。具体实现与边界见 [docs/WORLD.md](docs/WORLD.md)，不能把协议测试视作这些玩法的实机验收。
+
+本次不包含 EF ↔ Minecraft 连接。
+
+验证记录和明确未验收项见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+
+## 从源码构建
+
+安装 Visual Studio 2022/2026 C++ x64 工具和 Windows SDK。依赖源码已包含在仓库，无需在线下载：
+
+```powershell
+.\tools\build.cmd
+python .\tools\package.py
+```
+
+构建会运行协议、网络和 DLL/API 测试，并生成 `build/eflink.core.dll` 与原生菜单预览程序。打包生成可直接导入的模块 ZIP、SDK ZIP 和完整源码 ZIP。
+
+菜单预览使用正式 DLL 的相同界面和真实网络栈，使用独立 D3D11 窗口供布局检查；它不验证游戏内 Unity 渲染：
+
+```powershell
+.\build\EFLink.Preview.exe
+.\build\EFLink.Preview.exe --host
+```
+
+单游戏客户端测试可在开房后运行 `python tools/link-mirror.py`；镜像客户端只用于测试，不代替双 EF 实机验收。
+
+## 开发者
+
+模块 ID：`eflink.core`。公共 C ABI：`EFLink_GetApiV1` 与兼容其传输接口的 `EFLink_GetApiV2`。头文件位于 `include/EndfieldLink/EndfieldLink.h`，开发指南见 [docs/SDK.md](docs/SDK.md)，可编译的 Better-Endfield 扩展示例位于 `examples/echo/`。
+
+| 目录 | 用途 |
+|---|---|
+| `src/link_protocol.h`、`src/link_net.h` | 独立于游戏和 GUI 的通信层 |
+| `src/link_world.h` | 游戏线程上的采样、模型加载和姿态显示 |
+| `src/link_session.h`、`src/link_entry.h` | 房主快照、入场握手、权限和世界版本 |
+| `src/link_gui.cpp`、`src/link_native_gui.h` | 游戏内 ImGui / Unity CanvasRenderer 菜单和 HUD |
+| `src/link_imgui_mesh.h` | ImGui 绘制命令转换、裁剪和颜色插值 |
+| `src/link_module.cpp` | Better-Endfield 生命周期、控制器和公开 C API |
+| `include/` | EF Link ABI 与固定版本的 Better-Endfield ABI |
+| `tests/` | 协议、真实回环网络与 DLL 接口测试 |
+| `tools/` | 构建、打包、镜像客户端和开发诊断 |
+
+## 来源和许可
+
+AGPL-3.0。复用已有 EF Link 的网络与游戏接入代码，沿用 [Better-Endfield](https://github.com/Dr-hydra/Better-Endfield) 的第三方模块和共享钩子 ABI；独立项目不包含 Minecraft 代码。第三方组件及固定来源见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 和 [docs/REUSE.md](docs/REUSE.md)。发行文件不包含游戏资产、账号、UID 截图、运行日志或本机配置。

@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "id": "eflink.example.echo",
+  "name": "EF Link SDK Echo Example",
+  "author": "EF Link contributors",
+  "version": "1.0.0",
+  "abi": 1,
+  "libraries": {"windows-x64": "native/windows-x64/eflink.example.echo.dll"},
+  "dependencies": ["eflink.core"],
+  "default_configuration": {}
+}
