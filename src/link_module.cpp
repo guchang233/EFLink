@@ -373,7 +373,17 @@ std::uint64_t __fastcall onSend(void* netSession,void* message,void* info) {
         static const auto nameOf=reinterpret_cast<const char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_get_name"));
         const char* name=objectClass&&nameOf?nameOf(objectClass(message)):nullptr;
         int scope=0;
-        {std::lock_guard lock(worldMutex);scope=world.outboundScope();}
+        {
+            std::lock_guard lock(worldMutex);scope=world.outboundScope();
+#ifdef EFLINK_NATIVE_DIAGNOSTICS
+            // Which client code path sends scene and teleport requests.
+            if(name&&(std::strncmp(name,"CS_SCENE_",9)==0||std::strstr(name,"TELEPORT")||std::strstr(name,"REPATRIATE"))&&std::strcmp(name,"CS_SCENE_TOUCH_TRIGGER_VOLUME_REQ")!=0) {
+                void* frames[40]{};const auto n=RtlCaptureStackBackTrace(1,40,frames,nullptr);
+                std::vector<std::uintptr_t> stack;for(USHORT i=0;i<n;++i)stack.push_back(reinterpret_cast<std::uintptr_t>(frames[i]));
+                world.recordSendTrace(name,std::move(stack));
+            }
+#endif
+        }
         std::lock_guard lock(outboundMutex);auto& counts=outboundCounts[scope];
         const std::string key=name?name:"?";
         if(counts.size()<512||counts.contains(key))++counts[key];
@@ -675,7 +685,7 @@ json perform(const json& input) {
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe") {
+    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe"||action=="meta_search"||action=="send_traces") {
         std::lock_guard lock(worldMutex);world.queueDiagnostic(input);return {{"queued",true},{"diagnostic",true}};}
     else if(action=="native_skill_probe") {std::lock_guard lock(worldMutex);world.queueNativeCast(input);return {{"queued",true},{"diagnostic",true}};}
 #endif

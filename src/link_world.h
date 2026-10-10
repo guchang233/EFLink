@@ -7,6 +7,7 @@
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_native_feed.h"
+#include "authority/link_metadata.h"
 #include "authority/link_native_op_policy.h"
 #include "authority/link_official_view.h"
 #include "nlohmann/json.hpp"
@@ -2601,6 +2602,8 @@ public:
                 else if(action=="native_self_cast_probe")record["result"]=selfCast(command.value("automatic",false));
                 else if(action=="native_feed_lifecycle_probe")record["result"]=feedLifecycleProbe(command);
                 else if(action=="enemy_census")record["result"]=enemyCensus();
+                else if(action=="meta_search")record["result"]=metadataIndex.search(command.at("method").get<std::string>(),command.value("class",std::string{}),(std::min)(std::size_t(400),command.value("limit",std::size_t(200))));
+                else if(action=="send_traces")record["result"]=resolveSendTraces();
                 else if(action=="native_move_probe")record["result"]=nativeMoveProbe(command);
                 else throw std::runtime_error("unknown diagnostic");
             }catch(const std::exception& e){record["error"]=e.what();}
@@ -2654,6 +2657,18 @@ public:
                 e["hp"]=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             out.push_back(std::move(e));
         }
+        return out;
+    }
+    // Call stacks of outgoing scene/teleport requests (diagnostic, bounded).
+    authority::MetadataIndex metadataIndex;
+    std::deque<std::pair<std::string,std::vector<std::uintptr_t>>> sendTraces;
+    void recordSendTrace(const std::string& name,std::vector<std::uintptr_t> frames) {
+        if(sendTraces.size()>=24)sendTraces.pop_front();
+        sendTraces.emplace_back(name,std::move(frames));
+    }
+    nlohmann::json resolveSendTraces() {
+        nlohmann::json out=nlohmann::json::array();
+        for(const auto& [name,frames]:sendTraces)out.push_back({{"message",name},{"stack",metadataIndex.resolve(frames)}});
         return out;
     }
     std::set<std::uint64_t> diagnosticFeedIds;
