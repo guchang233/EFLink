@@ -26,7 +26,7 @@ cl %TASK_FLAGS% ..\src\link_preview.cpp /Fe:EFLink.Preview.exe /link user32.lib
 if errorlevel 1 exit /b 1
 cl %TASK_FLAGS% /LD ..\examples\echo\echo.cpp /Fe:eflink.example.echo.dll /link /DYNAMICBASE /NXCOMPAT
 if errorlevel 1 exit /b 1
-for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_input_ownership_test link_map_consent_test link_native_op_policy_test link_official_view_test) do (
+for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_input_ownership_test link_map_consent_test link_native_op_policy_test link_official_view_test link_official_monster_test) do (
     cl %TASK_FLAGS% ..\tests\%%T.cpp /Fe:%%T.exe /link ws2_32.lib iphlpapi.lib
     if errorlevel 1 exit /b 1
 )

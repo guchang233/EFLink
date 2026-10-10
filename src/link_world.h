@@ -157,7 +157,9 @@ class World {
     bool feedOperating=false; // inside our own injected enter/leave view call
     authority::NativeOpPolicy nativeOpPolicy;std::map<std::uint64_t,std::uint64_t> leakedOwners;
     // Latest official SCENE_MONSTER bytes per monster this account's server sent.
-    std::map<std::uint64_t,std::string> officialMonsters;std::uint64_t officialRestored=0;
+    std::map<std::uint64_t,std::string> officialMonsters;
+    std::uint64_t officialRestored=0;
+    std::vector<std::string> enteringOfficial;std::uint64_t officialForwarded=0; // host's official SCENE_MONSTERs for this guest
     struct FeedScope {bool& flag;bool previous;explicit FeedScope(bool& f):flag(f),previous(f){flag=true;}~FeedScope(){flag=previous;}};
     void leaveNative(const std::vector<std::uint64_t>& ids) {
         if(ids.empty())return;
@@ -382,16 +384,19 @@ class World {
             std::uint64_t id=0;if(f) symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value")(data,f,&id);
             if(id) return levelId+":level:"+std::to_string(id);
         }
+        // Native feed: every monster without a level logic ID was spawned at
+        // runtime by the host's server (scripts, challenge waves, spawners).
+        // Guests create it under the host's server ID, so that ID is its
+        // identity. Script slots are not unique: a challenge spawns its whole
+        // wave into slot 0 of one script.
+        if(nativeFeedAdapter) {
+            const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
+            return id?levelId+":server:"+std::to_string(id):std::string{};
+        }
+        // Legacy replica path: matched guest-account entities by script slot.
         const auto script=api.value<std::uint64_t>(gm("Entity","get_parentScriptId","","System.UInt64"),entity);
         const auto slot=api.value<std::uint32_t>(gm("Entity","get_parentScriptSlotId","","System.UInt32"),entity);
         if(script) return levelId+":script:"+std::to_string(script)+":"+std::to_string(slot);
-        // Native feed: monsters the host's server spawned at runtime (challenge
-        // waves, spawners) have neither level data nor a script slot. Guests
-        // create them under the host's server ID, so that ID is their identity.
-        // (The legacy replica path matched guest-account entities and must not.)
-        if(nativeFeedAdapter)
-            if(const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity))
-                return levelId+":server:"+std::to_string(id);
         return {};
     }
     void restoreEnemy(Enemy& e) {
@@ -717,6 +722,11 @@ class World {
             // Death is a room lifetime event. A later pool reset/positive HP read
             // must not overwrite the confirmed tombstone for this spawn.
             if(roomHost)if(auto old=hostEnemySeeds.find(key);old!=hostEnemySeeds.end()&&!old->second.value("alive",true))continue;
+            // Runtime-spawned monsters (scripts, challenges) need their official
+            // server data on the guest; level monsters are completed from level data.
+            if(roomHost&&nativeFeedAdapter&&key.find(":server:")!=std::string::npos)
+                if(auto official=officialMonsters.find(state.value("server_id",std::uint64_t(0)));official!=officialMonsters.end()&&official->second.size()<=16384)
+                    state["official"]=authority::NativeFeed::encode64(official->second);
             if(roomHost)hostEnemySeeds[key]=state;else entities.push_back(std::move(state));
         }
         if(roomHost)for(const auto& [key,seed]:hostEnemySeeds) {
@@ -934,6 +944,8 @@ class World {
             ++matchedEnemies;
         }
         if(!entering.empty())try {FeedScope scope(feedOperating);feed.enter(entering);}catch(const std::exception& e) {++feedErrors;feedError=e.what();}
+        if(!enteringOfficial.empty())try {FeedScope scope(feedOperating);feed.enterRaw(enteringOfficial);}catch(const std::exception& e) {++feedErrors;feedError=e.what();}
+        enteringOfficial.clear();
     }
     // Ask the client to create a host monster under its real server ID. Returns
     // the native entity once the game's own pipeline has spawned it.
@@ -952,6 +964,11 @@ class World {
         }
         if(s.nativeDataReady) {s.error.clear();return nullptr;}
         if(now<s.retry)return nullptr;s.retry=now+5000;
+        if(item.contains("official"))try {
+            float position[3];for(int i=0;i<3;++i)position[i]=item.at("position")[i].get<float>();
+            enteringOfficial.push_back(authority::officialMonsterForGuest(authority::NativeFeed::decode64(item.at("official").get<std::string>()),position,item.at("hp").get<double>()));
+            ++officialForwarded;s.committed=true;s.error="awaiting native spawn";return nullptr;
+        }catch(const std::exception& e) {s.error=std::string("official data rejected: ")+e.what();}
         authority::FeedMonster m;m.id=id;m.templateId=item.value("template",std::string{});
         if(m.templateId.empty()) {s.error="host monster template missing";return nullptr;}
         for(int i=0;i<3;++i)m.position[i]=item.at("position")[i].get<float>();
@@ -2762,7 +2779,7 @@ public:
                     {"private_recorded",privateRecords.size()},{"withheld",withheldCount},{"withheld_pending",withheldOfficial.size()},
                     {"fed",std::count_if(spawnedEnemies.begin(),spawnedEnemies.end(),[](const auto& item){return item.second.native;})},
                     {"ops_suppressed",opsSuppressed},{"known_fed_owners",nativeOpPolicy.fedCount()},{"retired_owners",nativeOpPolicy.retiredCount()},
-                    {"official_cached",officialMonsters.size()},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
+                    {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
                 {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
                 {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},

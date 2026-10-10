@@ -10,6 +10,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace eflink::authority {
@@ -80,6 +81,47 @@ inline void eulerDegrees(const float q[4],float out[3]) {
     out[0]=deg(pitch);out[1]=deg(yaw);out[2]=deg(roll);
 }
 
+// A SCENE_MONSTER exactly as the host's official server sent it, adapted for
+// a guest: current host position and HP, and no battle_inst_id (the monster is
+// never a battle entity of the guest's account). Every other field (script
+// ownership, attributes, skills, buffs, spawner library) stays verbatim.
+struct RawField {int field=0,wire=0;std::string_view whole,payload;};
+inline bool rawFields(std::string_view b,std::vector<RawField>& out) {
+    std::size_t at=0;
+    auto varint=[&](std::uint64_t& v){v=0;for(int shift=0;shift<64;shift+=7){if(at>=b.size())return false;const auto c=static_cast<unsigned char>(b[at++]);v|=std::uint64_t(c&0x7f)<<shift;if(!(c&0x80))return true;}return false;};
+    while(at<b.size()) {
+        const auto start=at;std::uint64_t key=0;if(!varint(key))return false;
+        RawField f;f.field=int(key>>3);f.wire=int(key&7);const auto body=at;std::uint64_t v=0;
+        switch(f.wire) {
+            case 0:if(!varint(v))return false;break;
+            case 1:if(b.size()-at<8)return false;at+=8;break;
+            case 5:if(b.size()-at<4)return false;at+=4;break;
+            case 2:{if(!varint(v)||v>b.size()-at)return false;f.payload=b.substr(at,std::size_t(v));at+=std::size_t(v);break;}
+            default:return false;
+        }
+        (void)body;f.whole=b.substr(start,at-start);out.push_back(f);
+    }
+    return true;
+}
+inline std::string officialMonsterForGuest(const std::string& raw,const float position[3],double hp) {
+    std::vector<RawField> top;if(!rawFields(raw,top))throw std::runtime_error("official monster malformed");
+    auto wrap=[](int field,const std::string& body){ProtoWriter w;w.key(field,2);w.varint(body.size());return w.bytes()+body;};
+    std::string out;bool common=false;
+    for(const auto& f:top) {
+        if(f.field==1&&f.wire==2) {
+            std::vector<RawField> c;if(!rawFields(f.payload,c))throw std::runtime_error("official common info malformed");
+            std::string body;for(const auto& g:c)if(g.field!=4&&g.field!=8)body.append(g.whole);
+            ProtoWriter now;now.msg(4,vector3(position));now.f64(8,hp);body+=now.bytes();
+            out+=wrap(1,body);common=true;
+        } else if(f.field==5&&f.wire==2) {
+            std::vector<RawField> c;if(!rawFields(f.payload,c))throw std::runtime_error("official battle info malformed");
+            std::string body;for(const auto& g:c)if(g.field!=4)body.append(g.whole);
+            out+=wrap(5,body);
+        } else out.append(f.whole);
+    }
+    if(!common)throw std::runtime_error("official monster has no common info");
+    return out;
+}
 class NativeFeed {
     unity::Api api;const BE_HostApiV1* runtime=nullptr;
     template<class T> static T symbol(const char* name) {
@@ -138,6 +180,7 @@ class NativeFeed {
         api.call(api.method("GameplayNetwork",handler,parameter.c_str(),"System.Void","Gameplay.Beyond.dll","Beyond.Gameplay"),network,{message});
     }
 public:
+    static std::string encode64(const std::string& bytes) {return base64(bytes);}
     std::uint64_t entered=0,left=0;
     static std::string decode64(const std::string& text) {
         std::string out;unsigned bits=0;int count=0;

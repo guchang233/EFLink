@@ -12,6 +12,10 @@ cl %TASK_FLAGS% ..\tests\link_official_view_test.cpp /Fe:link_official_view_test
 if errorlevel 1 exit /b 1
 link_official_view_test.exe
 if not "%errorlevel%"=="0" exit /b 1
+cl %TASK_FLAGS% ..\tests\link_official_monster_test.cpp /Fe:link_official_monster_test.exe
+if errorlevel 1 exit /b 1
+link_official_monster_test.exe
+if not "%errorlevel%"=="0" exit /b 1
 cl %TASK_FLAGS% ..\tests\link_native_op_policy_test.cpp /Fe:link_native_op_policy_test.exe
 if errorlevel 1 exit /b 1
 link_native_op_policy_test.exe
