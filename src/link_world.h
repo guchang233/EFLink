@@ -131,7 +131,8 @@ class World {
     std::uint64_t guestHitsSent=0,roomHitsApplied=0,playerHitsSent=0,playerHitsTaken=0,enemyCastsSent=0,enemyCastsMirrored=0,enemyCastsRejected=0;
     bool guestGatesReady=false,guestRestrictionsActive=false;std::string guestGateError;
     std::map<std::string,std::uint64_t> blockedGuestActions;
-    std::uint64_t damageHookCalls=0,guestHitCandidates=0,guestZeroDamage=0,guestHitSendFailed=0;
+    std::uint64_t damageHookCalls=0,guestHitCandidates=0,guestZeroDamage=0,guestHitSendFailed=0,guestDeathsBlocked=0;
+    std::map<std::string,std::uint64_t> guestHitSources; // template of whatever damaged a host monster here
     std::uint64_t lastAppliedRevision=0,lastAppliedEpoch=0,lastHostDiagnostics=0;
     std::string lastDiagnosedEnemy;
     std::uint16_t localPeer=0;
@@ -384,7 +385,13 @@ class World {
         const auto script=api.value<std::uint64_t>(gm("Entity","get_parentScriptId","","System.UInt64"),entity);
         const auto slot=api.value<std::uint32_t>(gm("Entity","get_parentScriptSlotId","","System.UInt32"),entity);
         if(script) return levelId+":script:"+std::to_string(script)+":"+std::to_string(slot);
-        // Account server IDs and local instance UIDs are deliberately never matched.
+        // Native feed: monsters the host's server spawned at runtime (challenge
+        // waves, spawners) have neither level data nor a script slot. Guests
+        // create them under the host's server ID, so that ID is their identity.
+        // (The legacy replica path matched guest-account entities and must not.)
+        if(nativeFeedAdapter)
+            if(const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity))
+                return levelId+":server:"+std::to_string(id);
         return {};
     }
     void restoreEnemy(Enemy& e) {
@@ -1820,6 +1827,9 @@ public:
     // messages are withheld (kept in order for restoration on leave); messages
     // carrying the player's own characters always pass.
     bool filtering() const {return nativeFeedAdapter&&feedFilterActive&&guestRealm;}
+    // 0 outside any room, 1 guest inside the host world, 2 hosting a room.
+    int outboundScope() const {return filtering()?1:roomHost?2:0;}
+    const std::set<std::uint64_t>& fedIds() const {return nativeOpPolicy.fedIds();}
     // Every official monster enter/leave view (in or out of a room) keeps the
     // exact server data, so the player's own world can be restored verbatim.
     void observeOfficial(const std::string& type,const std::string& bytes) {
@@ -1852,7 +1862,10 @@ public:
         if(!nativeFeedAdapter)return false;
         // EF Link's own stand-in actors for other players (0xEF.. room IDs) are
         // never battle entities of this account either.
-        const bool suppress=(guestRealm&&feedOperating)||nativeOpPolicy.suppress(serverId,battleInstance);
+        // Inside the host world a host monster can still be handed a battle
+        // instance by this client during combat; its source ID alone decides.
+        const bool suppress=(guestRealm&&feedOperating)||nativeOpPolicy.suppress(serverId,battleInstance)||
+            (filtering()&&serverId&&nativeOpPolicy.fedIds().contains(serverId));
         if(suppress)++opsSuppressed;
         else if(battleInstance==0&&guestRealm&&leakedOwners.size()<64)++leakedOwners[serverId];
         return suppress;
@@ -2362,6 +2375,10 @@ public:
             if(!sourceEntity||api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),sourceEntity))return {};
             for(const auto& [peer,actor]:actors)if(actor.entity==sourceEntity)return {};
             ++guestHitCandidates;
+            if(auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),sourceEntity)) {
+                auto sourceTemplate=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
+                if(guestHitSources.size()<64||guestHitSources.contains(sourceTemplate))++guestHitSources[sourceTemplate];
+            }
             GuestHit hit{ability,target,identity,key};
             hit.before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
@@ -2383,6 +2400,22 @@ public:
         }catch(const std::exception& e){replicationError=e.what();}
     }
     struct DeathObservation {void* entity=nullptr;NativeIdentity identity;std::string key;};
+    // Guest in the host world: a host monster dies only when the host says so.
+    // A local death (e.g. this account's own turrets) is not executed; the next
+    // host snapshot restores its health.
+    bool guestBlocksDeath(Net& net,void* entity) {
+        try {
+            if(!filtering()||net.currentRole()!=Role::Client||!session||!entity)return false;
+            const auto& hosted=session->snapshot();
+            for(const auto& [key,enemy]:enemies)if(enemy.entity==entity&&currentEnemy(enemy)&&roomEnemy(key)) {
+                for(const auto& e:hosted.at("entities"))if(e.at("key")==key&&e.value("alive",true)&&e.at("hp").get<double>()>0) {
+                    ++guestDeathsBlocked;return true;
+                }
+                return false;
+            }
+        }catch(...) {}
+        return false;
+    }
     std::optional<DeathObservation> beforeNativeDeath(Net& net,void* entity) {
         try {
             if(net.currentRole()!=Role::Host||!roomHost||!entity)return {};
@@ -2419,11 +2452,38 @@ public:
                 else if(action=="native_travel_probe") {queueSelfTravel(command);record["result"]="queued";}
                 else if(action=="native_self_cast_probe")record["result"]=selfCast(command.value("automatic",false));
                 else if(action=="native_feed_lifecycle_probe")record["result"]=feedLifecycleProbe(command);
+                else if(action=="enemy_census")record["result"]=enemyCensus();
                 else throw std::runtime_error("unknown diagnostic");
             }catch(const std::exception& e){record["error"]=e.what();}
             if(diagnosticResults.size()>=8)diagnosticResults.erase(diagnosticResults.begin());
             diagnosticResults.push_back(std::move(record));
         }
+    }
+    // Read-only identity of every enemy the client currently has (game thread).
+    nlohmann::json enemyCensus() {
+        nlohmann::json out=nlohmann::json::array();
+        std::set<std::uint64_t> fedNow;for(const auto& [key,s]:spawnedEnemies)if(s.native)fedNow.insert(s.serverId);
+        V3 self{};if(character)self=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
+        for(auto* entity:sceneEnemies()) {
+            if(out.size()>=96)break;
+            if(!usable(entity)||!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),entity))continue;
+            nlohmann::json e;
+            const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
+            e["server_id"]=id;e["fed"]=fedNow.contains(id);
+            e["battle_inst"]=api.value<std::uint64_t>(gm("Entity","get_serverBattleInstId","","System.UInt64"),entity);
+            e["started"]=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);
+            e["key"]=entityKey(entity);
+            e["script"]=api.value<std::uint64_t>(gm("Entity","get_parentScriptId","","System.UInt64"),entity);
+            e["level_data"]=api.call(gm("Entity","get_inLevelData","","Beyond.Gameplay.LevelEntityData"),entity)!=nullptr;
+            if(auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity))
+                e["template"]=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
+            const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),entity);
+            e["distance"]=std::sqrt((p.x-self.x)*(p.x-self.x)+(p.y-self.y)*(p.y-self.y)+(p.z-self.z)*(p.z-self.z));
+            if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity))
+                e["hp"]=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+            out.push_back(std::move(e));
+        }
+        return out;
     }
     std::set<std::uint64_t> diagnosticFeedIds;
     nlohmann::json feedLifecycleProbe(const nlohmann::json& command) {
@@ -2706,7 +2766,7 @@ public:
                 {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
                 {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
-                    {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},
+                    {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
                     {"owned_here",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second==localPeer;})},

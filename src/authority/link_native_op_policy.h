@@ -30,6 +30,7 @@ public:
         if((serverId>>56)==0xEF)return true; // current room-owned actor IDs
         return serverId&&battleInstance==0&&(fed.contains(serverId)||retired.contains(serverId));
     }
+    const std::set<std::uint64_t>& fedIds() const{return fed;}
     std::size_t fedCount() const{return fed.size();}
     std::size_t retiredCount() const{return retired.size();}
 };

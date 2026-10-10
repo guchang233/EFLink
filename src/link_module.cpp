@@ -10,6 +10,7 @@
 #include "link_gui.h"
 #include <type_traits>
 #include <map>
+#include <deque>
 #include "link_settings.h"
 #include "authority/native_proto_codec.h"
 
@@ -135,6 +136,7 @@ void __fastcall onDie(void* entity,void* info) {
     if(!nextDie)return;
     if(info&&info!=dieMethod.method_info) {nextDie(entity,info);return;}
     std::lock_guard lock(worldMutex);
+    if(!cleanupRequested&&world.guestBlocksDeath(net,entity))return;
     auto observation=cleanupRequested?std::optional<eflink::World::DeathObservation>{}:world.beforeNativeDeath(net,entity);
     nextDie(entity,info);
     if(observation)world.afterNativeDeath(*observation);
@@ -277,6 +279,10 @@ void __fastcall onReceive(void* bus,const void* response,void* info) {
 // generic, so its shared body has no metadata pointer. It is the one target
 // the three non-generic op creators each call exactly once and that the
 // reporter's flush/upload code never calls.
+// Outbound census state (roadmap M1 observation).
+std::mutex outboundMutex;std::map<std::string,std::uint64_t> outboundCounts[3]; // outside, guest in host world, hosting
+std::deque<std::string> outboundBattleOps; // guest in host world: serialized CS_BATTLE_OP, bounded
+std::map<std::pair<std::uint64_t,std::uint64_t>,std::uint64_t> createdOps; // guest in host world: allowed ops by (source id, battle instance)
 using CreateServerOp=void(__fastcall*)(void*,int,void*,const std::uint64_t*,void*);
 CreateServerOp nextCreateOp=nullptr;bool opFilterReady=false;std::string opFilterError;
 void __fastcall onCreateServerOp(void* reporter,int type,void* data,const std::uint64_t* owner,void* info) {
@@ -285,6 +291,10 @@ void __fastcall onCreateServerOp(void* reporter,int type,void* data,const std::u
         // Pure provenance checks stay active during native shutdown too; that
         // shutdown can synchronously create the same withdrawal operations.
         if(world.suppressServerOp(owner[0],owner[1]))return;
+        if(world.outboundScope()==1) {
+            std::lock_guard census(outboundMutex);const std::pair key{owner[0],owner[1]};
+            if(createdOps.size()<1024||createdOps.contains(key))++createdOps[key];
+        }
     }
     if(nextCreateOp)nextCreateOp(reporter,type,data,owner,info);
 }
@@ -321,6 +331,37 @@ void installOpFilter(const BE_HostApiV1* api) {
     opFilterReady=host.hooks->create(host.hooks->context,kId,reinterpret_cast<void*>(candidates[0]),reinterpret_cast<void*>(onCreateServerOp),reinterpret_cast<void**>(&nextCreateOp),&handle)==BE_Result_Ok;
     if(!opFilterReady)opFilterError="op filter hook failed";
     else opFilterError="rva "+std::to_string(candidates[0]-reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"GameAssembly.dll")));
+}
+// Outbound request census (roadmap M1, observation only): counts the protobuf
+// type of every HGNetSession.SendMessage call per room role. Every call is
+// forwarded unchanged; nothing is stored beyond type names and counts.
+using SendMessageFn=std::uint64_t(__fastcall*)(void*,void*,void*);
+SendMessageFn nextSend=nullptr;BE_ResolvedMethodV1 sendMethod{};bool outboundObserverReady=false;
+std::uint64_t __fastcall onSend(void* netSession,void* message,void* info) {
+    if(outboundObserverReady&&message&&(!info||info==sendMethod.method_info))try {
+        static const auto dll=GetModuleHandleW(L"GameAssembly.dll");
+        static const auto objectClass=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(dll,"il2cpp_object_get_class"));
+        static const auto nameOf=reinterpret_cast<const char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_get_name"));
+        const char* name=objectClass&&nameOf?nameOf(objectClass(message)):nullptr;
+        int scope=0;
+        {std::lock_guard lock(worldMutex);scope=world.outboundScope();}
+        std::lock_guard lock(outboundMutex);auto& counts=outboundCounts[scope];
+        const std::string key=name?name:"?";
+        if(counts.size()<512||counts.contains(key))++counts[key];
+        if(scope==1&&key=="CS_BATTLE_OP"&&outboundBattleOps.size()<200)
+            outboundBattleOps.push_back(officialCodec.serialize(message,256*1024));
+    }catch(...) {}
+    return nextSend(netSession,message,info);
+}
+nlohmann::json outboundStatus() {
+    std::lock_guard lock(outboundMutex);
+    return {{"ready",outboundObserverReady},{"outside",outboundCounts[0]},{"guest_room",outboundCounts[1]},{"hosting",outboundCounts[2]}};
+}
+void installOutboundObserver(const BE_HostApiV1* api) {
+    BE_MethodDescriptorV1 send{"Network.Beyond.dll","Beyond.Network","HGNetSession","SendMessage","Google.Protobuf.IMessage","System.UInt64",1};
+    if(api->resolve_method(api->context,&send,&sendMethod)!=BE_Result_Ok||!sendMethod.method_pointer)return;
+    std::uint64_t handle=0;
+    outboundObserverReady=host.hooks->create(host.hooks->context,kId,sendMethod.method_pointer,reinterpret_cast<void*>(onSend),reinterpret_cast<void**>(&nextSend),&handle)==BE_Result_Ok;
 }
 void installOfficialFilter(const BE_HostApiV1* api) {
     BE_FieldDescriptorV1 body{"Network.Beyond.dll","Beyond.Network","NetResponse","msgBody","Google.Protobuf.IMessage"};BE_ResolvedFieldV1 field{};
@@ -361,6 +402,7 @@ BE_Result installHook() {
         if(!eflink::roomAdapterAvailable)return result;
         installOfficialFilter(api);
         installOpFilter(api);
+        installOutboundObserver(api);
         installGuestGates(api);
         BE_MethodDescriptorV1 markTarget{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","GetMarkTargetScore",
             "Beyond.Gameplay.Core.AbilitySystem|Beyond.Gameplay.Core.BattleManager.MarkTargetPriority&|System.Single&|System.Boolean&","System.Boolean",4};
@@ -481,7 +523,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut}}}};
@@ -582,10 +624,19 @@ json perform(const json& input) {
     } else if(action=="leave") net.leave();
     else if(action=="host_map_choice") {std::lock_guard lock(worldMutex);world.chooseHostMap(net,input.at("token").get<std::uint64_t>(),input.at("follow").get<bool>());}
     else if(action=="teleport_to_player") {std::lock_guard lock(worldMutex);session.requestTeleport(net,input.at("id").get<std::uint16_t>());}
+    else if(action=="outbound_capture") {
+        nlohmann::json fed=nlohmann::json::array();
+        {std::lock_guard lock(worldMutex);for(auto id:world.fedIds())fed.push_back(id);}
+        std::lock_guard lock(outboundMutex);nlohmann::json ops(outboundBattleOps);outboundBattleOps.clear();
+        nlohmann::json created=nlohmann::json::array();
+        for(const auto& [key,count]:createdOps)created.push_back({{"source",key.first},{"battle_inst",key.second},{"count",count}});
+        createdOps.clear();
+        return {{"battle_ops",ops},{"created",created},{"fed",fed},{"diagnostic",true}};
+    }
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe") {
+    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census") {
         std::lock_guard lock(worldMutex);world.queueDiagnostic(input);return {{"queued",true},{"diagnostic",true}};}
     else if(action=="native_skill_probe") {std::lock_guard lock(worldMutex);world.queueNativeCast(input);return {{"queued",true},{"diagnostic",true}};}
 #endif
@@ -672,7 +723,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;
+        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     std::lock_guard lock(lifecycle);std::lock_guard lockWorld(worldMutex);host={};
