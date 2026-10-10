@@ -164,6 +164,11 @@ class World {
     // Latest official SCENE_MONSTER bytes per monster this account's server sent.
     std::map<std::uint64_t,std::string> officialMonsters;
     std::uint64_t officialRestored=0;
+    // Guest in the host world. Level monsters share server IDs across accounts,
+    // so the instance UID tells this account's monster from the host's:
+    // leavingPrivate = own monsters sent out of view once (still releasing
+    // asynchronously); fedInstance = the instance accepted as the host's monster.
+    std::map<std::uint64_t,std::uint32_t> leavingPrivate,fedInstance;std::uint64_t privateLeaveSkipped=0,feedWaitsForRelease=0;
     std::vector<std::string> enteringOfficial;std::uint64_t officialForwarded=0; // host's official SCENE_MONSTERs for this guest
     bool detachFedScripts=false; // diagnostic toggle, see officialMonsterForGuest
     std::map<std::string,std::uint64_t> damageCensus; // hook:target class:result
@@ -458,7 +463,7 @@ class World {
             // Messages the official server sent meanwhile, in their original order.
             for(const auto& [type,bytes]:withheldOfficial)feed.replay(type,bytes);
         }catch(const std::exception& e) {++feedErrors;feedError=e.what();}
-        privateRecords.clear();privateRecordsLevel.clear();withheldOfficial.clear();
+        privateRecords.clear();privateRecordsLevel.clear();withheldOfficial.clear();leavingPrivate.clear();fedInstance.clear();
     }
     void dropEnemies() {
         // Host monsters entered by the feed leave view whenever the room's
@@ -569,9 +574,14 @@ class World {
                 // This account's monster: record it, then let it leave view through
                 // the client's own handler. Host monsters entered by the feed stay.
                 const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
-                if(!id||fed.contains(id))continue;
+                if(!id)continue;
+                const auto instance=identityOf(entity).instance;
+                if(auto f=fedInstance.find(id);f!=fedInstance.end()&&f->second==instance)continue; // the host's monster
+                // Already sent out of view: it is releasing; a second leave makes
+                // the client release the same entity twice.
+                if(auto l=leavingPrivate.find(id);l!=leavingPrivate.end()&&l->second==instance) {++privateLeaveSkipped;continue;}
                 if(!privateRecords.contains(id)&&privateRecords.size()<1024)privateRecords.emplace(id,recordOf(entity));
-                privateRecordsLevel=mapId+"/"+levelId;leaving.push_back(id);continue;
+                privateRecordsLevel=mapId+"/"+levelId;leaving.push_back(id);leavingPrivate[id]=instance;continue;
             }
             if(guestRealm) {
                 bool owned=false;
@@ -966,7 +976,17 @@ class World {
         if(!id)return nullptr; // script-slot entities have no stable server ID yet
         auto& s=spawnedEnemies[key];s.native=true;s.serverId=id;
         nativeOpPolicy.rememberFed(id);
-        if(auto* entity=nativeEntity(id)) {s.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);s.nativeDataReady=true;s.error.clear();return entity;}
+        if(auto* entity=nativeEntity(id)) {
+            const auto instance=identityOf(entity).instance;
+            // This account's monster with the same ID is still releasing: wait.
+            if(auto l=leavingPrivate.find(id);l!=leavingPrivate.end()&&l->second==instance) {++feedWaitsForRelease;s.error="waiting for private release";return nullptr;}
+            if(auto f=fedInstance.find(id);f==fedInstance.end()||f->second!=instance) {
+                // Only an instance created after our own enter counts as the host's.
+                if(!s.committed) {s.error="unexpected instance with host ID";return nullptr;}
+                fedInstance[id]=instance;
+            }
+            s.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);s.nativeDataReady=true;s.error.clear();return entity;
+        }
         s.started=false;
         const auto now=nowMs();
         if(now>=s.nativeCheckAt) {
@@ -2859,7 +2879,7 @@ public:
                     {"private_recorded",privateRecords.size()},{"withheld",withheldCount},{"withheld_pending",withheldOfficial.size()},
                     {"fed",std::count_if(spawnedEnemies.begin(),spawnedEnemies.end(),[](const auto& item){return item.second.native;})},
                     {"ops_suppressed",opsSuppressed},{"known_fed_owners",nativeOpPolicy.fedCount()},{"retired_owners",nativeOpPolicy.retiredCount()},
-                    {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"detach_scripts",detachFedScripts},{"scene_mode",hostModeId},{"host_owns_all",hostOwnsAll},{"in_subgame",hostInSubGame},{"native_move",nativeMovePuppets},{"native_move_interval_ms",nativeMoveIntervalMs},{"native_moves_sent",feed.moved},{"native_move_route",feed.moveRoute},{"native_move_errors",nativeMoveErrors},{"native_move_error",nativeMoveError},{"damage_census",damageCensus},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
+                    {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"detach_scripts",detachFedScripts},{"private_leave_skipped",privateLeaveSkipped},{"feed_waits_for_release",feedWaitsForRelease},{"scene_mode",hostModeId},{"host_owns_all",hostOwnsAll},{"in_subgame",hostInSubGame},{"native_move",nativeMovePuppets},{"native_move_interval_ms",nativeMoveIntervalMs},{"native_moves_sent",feed.moved},{"native_move_route",feed.moveRoute},{"native_move_errors",nativeMoveErrors},{"native_move_error",nativeMoveError},{"damage_census",damageCensus},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
                 {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
                 {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
