@@ -10,3 +10,7 @@ __pycache__/
 *.tmp
 test-environments/
 /references/
+
+# Local caches / runtime files
+.zig-cache/
+imgui.ini

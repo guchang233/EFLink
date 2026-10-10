@@ -32,8 +32,11 @@ json inspect(const json& request) {
     if(!api||!dll)throw std::runtime_error("runtime unavailable");
     const auto name=request.at("class").get<std::string>(),space=request.value("namespace",std::string("Beyond.Gameplay.Core"));
     const auto library=request.value("assembly",std::string("Gameplay.Beyond.dll"));
-    if(name.empty()||name.size()>200||(space!="Beyond"&&space.rfind("Beyond.",0)!=0)||space.size()>200||
-       (library!="Gameplay.Beyond.dll"&&library!="Common.Beyond.dll"))throw std::runtime_error("invalid class/assembly");
+    const bool protocol=library=="Beyond.Network.Proto.dll"&&space=="Proto";
+    const bool application=(library=="Gameplay.Beyond.dll"||library=="Common.Beyond.dll"||
+        library=="Network.Beyond.dll")&&(space=="Beyond"||space.rfind("Beyond.",0)==0);
+    if(name.empty()||name.size()>200||space.size()>200||(!protocol&&!application))
+        throw std::runtime_error("invalid class/assembly");
     BE_ResolvedClassV1 type{};
     if(api->resolve_class(api->context,library.c_str(),space.c_str(),name.c_str(),&type)!=BE_Result_Ok)throw std::runtime_error("class unresolved");
     auto methods=sym<const void*(*)(const void*,void**)>(dll,"il2cpp_class_get_methods");
@@ -97,7 +100,12 @@ json inspect(const json& request) {
             int value=0;staticValue(field,&value);literals[fieldName(field)]=value;
         }
     }
-    return {{"class",name},{"methods",output},{"literals",literals},{"gameplay_modified",false}};
+    auto valueType=sym<bool(*)(const void*)>(dll,"il2cpp_class_is_valuetype");
+    auto valueSize=sym<int(*)(const void*,unsigned*)>(dll,"il2cpp_class_value_size");
+    json layout={{"is_value_type",valueType(type.class_info)}};
+    if(valueType(type.class_info)) {unsigned alignment=0;layout["value_size"]=valueSize(type.class_info,&alignment);layout["alignment"]=alignment;}
+    return {{"class",name},{"assembly",library},{"namespace",space},{"methods",output},
+        {"literals",literals},{"layout",layout},{"gameplay_modified",false}};
 }
 BE_Result BE_CALL configure(const char*) {return BE_Result_Ok;}
 BE_Result BE_CALL message(const char* request,const char* body) {

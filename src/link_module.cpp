@@ -8,7 +8,10 @@
 #include "runtime_scope.h"
 #include "nlohmann/json.hpp"
 #include "link_gui.h"
+#include <type_traits>
+#include <map>
 #include "link_settings.h"
+#include "authority/native_proto_codec.h"
 
 using nlohmann::json;
 namespace {
@@ -93,7 +96,7 @@ void __fastcall onCanvas(void* info) {
     try {
         if(cleanupRequested.load()) {
             if(!cleanupDone.load()) {gui.shutdownGame(api);world.shutdown();cleanupDone=true;}
-        } else if(initialized) {gui.tickGame(api);world.menu(api,gui.visible());}
+        } else if(initialized) {if(world.takeHostMapNotice())gui.open();gui.tickGame(api);world.menu(api,gui.visible());}
     } catch(...) {}
     rendering=false;
 }
@@ -155,13 +158,180 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     if(!nextDamage) return 0;
     if(info&&info!=damageMethod.method_info) return nextDamage(ability,modifier,info);
     std::lock_guard lock(worldMutex);
-    if(!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
+    if(!cleanupRequested)world.damageHookSeen();
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
+    if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
     const auto result=nextDamage(ability,modifier,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
     return result;
+}
+// Exact metadata signatures, shared hook ownership, and a role-dependent gate.
+// No input interception or sticky gameplay/UI-forbid handles are involved.
+template<int Slot,class Result,bool BlockValue,class... Args> struct GuestGate {
+    using Next=Result(__fastcall*)(void*,Args...,void*);
+    static inline Next next=nullptr;
+    static inline BE_ResolvedMethodV1 method{};
+    static inline const char* label="";
+    static Result __fastcall call(void* self,Args... args,void* info) {
+        if(!next) {if constexpr(!std::is_void_v<Result>)return Result(BlockValue);else return;}
+        if(!info||info==method.method_info) {
+            std::lock_guard lock(worldMutex);
+            if(!cleanupRequested&&world.blockPrivateAction(net,label)) {
+                if constexpr(!std::is_void_v<Result>)return Result(BlockValue);else return;
+            }
+        }
+        return next(self,args...,info);
+    }
+    static bool install(const BE_HostApiV1* api,const char* space,const char* type,const char* name,const char* params,const char* result) {
+        label=name;unsigned count=params[0]?1:0;for(auto* p=params;*p;++p)if(*p=='|')++count;
+        BE_MethodDescriptorV1 descriptor{"Gameplay.Beyond.dll",space,type,name,params[0]?params:nullptr,result,count};
+        if(api->resolve_method(api->context,&descriptor,&method)!=BE_Result_Ok||!method.method_pointer)return false;
+        std::uint64_t handle=0;
+        return host.hooks->create(host.hooks->context,kId,method.method_pointer,reinterpret_cast<void*>(call),reinterpret_cast<void**>(&next),&handle)==BE_Result_Ok;
+    }
+};
+bool installGuestGates(const BE_HostApiV1* api) {
+    bool ready=true;std::string error;
+    auto require=[&](bool ok,const char* name){if(!ok){ready=false;error+=std::string(name)+"; ";}};
+    require(GuestGate<0,bool,true>::install(api,"Beyond.Gameplay","InteractOptionManagerForInteractive","_GlobalBlocked","","System.Boolean"),"interact_options");
+    require(GuestGate<1,bool,false>::install(api,"Beyond.Gameplay.Core","InteractiveBaseTrigger","GetConditionResult","","System.Boolean"),"interact_condition");
+    require(GuestGate<2,void,false>::install(api,"Beyond.Gameplay.Core","InteractiveBaseTrigger","_EvaluateConditionFinished","","System.Void"),"interact_execute");
+    require(GuestGate<3,void,false>::install(api,"Beyond.Gameplay.Core","StepOnTrigger","OnEvaluateConditionSucceed","","System.Void"),"step_trigger");
+    require(GuestGate<4,void,false>::install(api,"Beyond.Gameplay.Core","ScanTrigger","OnEvaluateConditionSucceed","","System.Void"),"scan_trigger");
+    require(GuestGate<5,bool,false>::install(api,"Beyond.Gameplay.Core","ScanTrigger","CanScan","","System.Boolean"),"scan_query");
+    require(GuestGate<6,void,false,void*>::install(api,"Beyond.Gameplay.Core","AttackTrigger","_AttackEventFilter","Beyond.Gameplay.Core.EventParams","System.Void"),"attack_interactive");
+    require(GuestGate<7,void,false,bool,bool>::install(api,"Beyond.Gameplay","TriggerVolumeManager","CheckTriggers","System.Boolean|System.Boolean","System.Void"),"level_trigger_volumes");
+    require(GuestGate<8,bool,false,void*,void*>::install(api,"Beyond.Gameplay.Core","DungeonManager","CheckCanEnterDungeonAndToast","System.String|System.String","System.Boolean"),"dungeon_check");
+    require(GuestGate<9,bool,false,void*,void*,bool>::install(api,"Beyond.Gameplay.Core","DungeonManager","TryReqEnterDungeon","Proto.CS_ENTER_DUNGEON|System.String|System.Boolean","System.Boolean"),"dungeon_request_packet");
+    require(GuestGate<10,bool,false,void*,void*,int>::install(api,"Beyond.Gameplay.Core","DungeonManager","TryReqEnterDungeon","System.String|System.String|System.Int32","System.Boolean"),"dungeon_request");
+    require(GuestGate<11,bool,false,void*,void*,void*,int>::install(api,"Beyond.Gameplay.Core","DungeonManager","TryReqEnterDungeon","System.String|System.Collections.Generic.List<Beyond.Gameplay.CharInfo>|System.String|System.Int32","System.Boolean"),"dungeon_request_squad");
+    require(GuestGate<12,void,false,void*>::install(api,"Beyond.Gameplay.Core","DungeonManager","TouchDungeonEntrance","System.String","System.Void"),"dungeon_entrance");
+    require(GuestGate<13,void,false,void*,eflink::unity::V3,bool>::install(api,"Beyond.Gameplay","GameplayNetwork","SendKillTree","System.String|UnityEngine.Vector3|System.Boolean","System.Void"),"resource_tree");
+    require(GuestGate<14,void,false,void*,void*>::install(api,"Beyond.Gameplay","GameplayNetwork","C2STeleportWithValidationData","Beyond.Gameplay.TeleportValidationData|System.Action","System.Void"),"account_teleport_validation");
+    require(GuestGate<15,void,false,int,eflink::unity::V3,eflink::unity::V3,int,int,int,void*,std::uint32_t>::install(api,"Beyond.Gameplay","GameplayNetwork","C2STeleport","System.Int32|UnityEngine.Vector3|UnityEngine.Vector3|Beyond.GEnums.C2STeleportReason|Beyond.Gameplay.TeleportUIType|Beyond.Gameplay.TeleportOptions|System.Action|System.UInt32","System.Void"),"account_teleport");
+    require(GuestGate<16,void,false,void*,std::uint64_t,bool>::install(api,"Beyond.Gameplay","GameMechanicsSystem","SendReqStartGameMechanic","System.String|System.UInt64|System.Boolean","System.Void"),"subgame_request");
+    require(GuestGate<17,void,false,void*,bool>::install(api,"Beyond.Gameplay","GameMechanicsSystem","SendReqStartGameMsg","Proto.CS_GAME_MECHANICS_REQ_START|System.Boolean","System.Void"),"subgame_request_packet");
+    require(GuestGate<18,void,false,std::uint64_t,std::uint64_t>::install(api,"Beyond.Gameplay.Core.DynamicScene","DynamicSceneTriggerSystem","OnDynamicTriggerEnter","System.UInt64|System.UInt64","System.Void"),"dynamic_scene_trigger");
+    require(GuestGate<19,void,false,void*,void*,eflink::unity::V3,eflink::unity::V3>::install(api,"Beyond.Gameplay","GameplayNetwork","C2STeleportWithValidationData","Beyond.Gameplay.TeleportValidationData|System.Action|UnityEngine.Vector3|UnityEngine.Vector3","System.Void"),"account_teleport_validation_position");
+    {std::lock_guard lock(worldMutex);world.setGuestGates(ready,std::move(error));}
+    return ready;
+}
+using MarkTargetScore=bool(__fastcall*)(void*,void*,void*,float*,bool*,void*);
+MarkTargetScore nextMarkTargetScore=nullptr;BE_ResolvedMethodV1 markTargetScoreMethod{};
+bool __fastcall onMarkTargetScore(void* manager,void* ability,void* priority,float* score,bool* onScreen,void* info) {
+    if(!nextMarkTargetScore)return false;
+    if(!info||info==markTargetScoreMethod.method_info) {
+        std::lock_guard lock(worldMutex);
+        try {if(!cleanupRequested&&!world.allowRoomTarget(net,ability))return false;}
+        catch(...) {return false;} // An unloaded candidate cannot be selected.
+    }
+    return nextMarkTargetScore(manager,ability,priority,score,onScreen,info);
+}
+// Guest in a native room: this account's monster enter/leave messages are
+// withheld (and replayed on leave); everything else reaches the game unchanged.
+using ReceiveMessage=void(__fastcall*)(void*,const void*,void*);
+ReceiveMessage nextReceive=nullptr;BE_ResolvedMethodV1 receiveMethod{};
+std::size_t responseBodyOffset=0;eflink::authority::NativeProtoCodec officialCodec;bool officialFilterReady=false;
+eflink::authority::NativeFeed officialViewParser;
+void __fastcall onReceive(void* bus,const void* response,void* info) {
+    alignas(8) unsigned char filtered[32]{};bool replaced=false;
+    std::unique_ptr<eflink::unity::Api::TemporaryRoot> replacementRoot;
+    if(nextReceive&&officialFilterReady&&response&&(!info||info==receiveMethod.method_info))try {
+        void* body=nullptr;std::memcpy(&body,static_cast<const unsigned char*>(response)+responseBodyOffset,sizeof body);
+        if(body) {
+            auto dll=GetModuleHandleW(L"GameAssembly.dll");
+            auto objectClass=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(dll,"il2cpp_object_get_class"));
+            auto nameOf=reinterpret_cast<const char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_get_name"));
+            const char* name=objectClass&&nameOf?nameOf(objectClass(body)):nullptr;
+            if(name&&(std::strcmp(name,"SC_OBJECT_ENTER_VIEW")==0||std::strcmp(name,"SC_OBJECT_LEAVE_VIEW")==0)) {
+                std::lock_guard lock(worldMutex);
+                if(!cleanupRequested) {
+                    const auto bytes=eflink::authority::NativeFeed::decode64(officialCodec.serialize(body));
+                    world.observeOfficial(name,bytes);
+                    const auto split=world.filtering()?eflink::authority::splitOfficialView(name,bytes):eflink::authority::OfficialViewSplit{};
+                    if(split.changed) {
+                        if(!split.visible.empty()) {
+                            // Keep headMsg, packing state and receive timestamp.
+                            // Only msgBody changes; never consume official seq IDs.
+                            auto* replacement=officialViewParser.parseView(name,split.visible);
+                            replacementRoot=std::make_unique<eflink::unity::Api::TemporaryRoot>(runtime(),replacement);
+                            std::memcpy(filtered,response,sizeof filtered);
+                            std::memcpy(filtered+responseBodyOffset,&replacement,sizeof replacement);
+                            replaced=true;
+                        }
+                        // Commit only after the replacement parsed successfully.
+                        world.withholdOfficial(name,split.withheld);
+                        if(!replaced)return;
+                    }
+                }
+            }
+        }
+    }catch(...) {}
+    // Dispatch once, outside the preparation catch. A native handler failure
+    // must never cause a second dispatch of the unsplit private-world message.
+    if(nextReceive)nextReceive(bus,replaced?filtered:response,info);
+}
+// ServerReporter.CreateServerOp<T>(opType, data, ref OwnerInfo{serverId,...}) is
+// generic, so its shared body has no metadata pointer. It is the one target
+// the three non-generic op creators each call exactly once and that the
+// reporter's flush/upload code never calls.
+using CreateServerOp=void(__fastcall*)(void*,int,void*,const std::uint64_t*,void*);
+CreateServerOp nextCreateOp=nullptr;bool opFilterReady=false;std::string opFilterError;
+void __fastcall onCreateServerOp(void* reporter,int type,void* data,const std::uint64_t* owner,void* info) {
+    if(owner&&opFilterReady) {
+        std::lock_guard lock(worldMutex);
+        // Pure provenance checks stay active during native shutdown too; that
+        // shutdown can synchronously create the same withdrawal operations.
+        if(world.suppressServerOp(owner[0],owner[1]))return;
+    }
+    if(nextCreateOp)nextCreateOp(reporter,type,data,owner,info);
+}
+std::map<std::uintptr_t,int> directCalls(const void* code) {
+    std::map<std::uintptr_t,int> calls;if(!code)return calls;
+    auto* p=static_cast<const unsigned char*>(code);
+    MEMORY_BASIC_INFORMATION mbi{};if(!VirtualQuery(p,&mbi,sizeof mbi))return calls;
+    const auto end=reinterpret_cast<const unsigned char*>(mbi.BaseAddress)+mbi.RegionSize;
+    for(std::size_t i=0;i<4096&&p+i+5<=end;++i) {
+        if(p[i]==0xCC&&p[i+1]==0xCC)break; // padding after the function
+        if(p[i]==0xE8) {std::int32_t rel;std::memcpy(&rel,p+i+1,4);++calls[reinterpret_cast<std::uintptr_t>(p+i+5)+std::intptr_t(rel)];}
+    }
+    return calls;
+}
+void installOpFilter(const BE_HostApiV1* api) {
+    auto resolve=[&](const char* name,const char* params,const char* result,unsigned count)->const void* {
+        BE_MethodDescriptorV1 d{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager/ServerReporter",name,params,result,count};BE_ResolvedMethodV1 r{};
+        return api->resolve_method(api->context,&d,&r)==BE_Result_Ok?r.method_pointer:nullptr;};
+    const void* creators[]={
+        resolve("CreateModifyEntityValueOp","Beyond.Gameplay.Core.Entity|System.Double|System.Single|Beyond.Gameplay.Core.BattleManager.ServerReporter.ModifyValueType","Proto.BATTLE_ENTITY_VALUE_MODIFY_DATA",4),
+        resolve("CreateServerActionOp","Beyond.Gameplay.Core.AbilityAction.ServerActionParams&","System.Void",1),
+        resolve("CreateUpdateAtbInfoOp","Proto.BATTLE_UPDATE_ATB_INFO_REASON|Proto.TEMPLATE_ID|Proto.TEMPLATE_ID|System.Double","System.Void",4)};
+    const void* others[]={resolve("Flush",nullptr,"System.Void",0),resolve("TryUpLoad","System.Boolean","System.Void",1)};
+    for(auto* c:creators)if(!c){opFilterError="op creators unresolved";return;}
+    auto first=directCalls(creators[0]);std::vector<std::uintptr_t> candidates;
+    for(const auto& [target,count]:first) {
+        if(count!=1)continue;bool everywhere=true;
+        for(int i=1;i<3&&everywhere;++i){auto calls=directCalls(creators[i]);everywhere=calls.contains(target)&&calls[target]==1;}
+        for(auto* o:others)if(everywhere&&o&&directCalls(o).contains(target))everywhere=false;
+        if(everywhere)candidates.push_back(target);
+    }
+    if(candidates.size()!=1){opFilterError="CreateServerOp not uniquely identified ("+std::to_string(candidates.size())+")";return;}
+    std::uint64_t handle=0;
+    opFilterReady=host.hooks->create(host.hooks->context,kId,reinterpret_cast<void*>(candidates[0]),reinterpret_cast<void*>(onCreateServerOp),reinterpret_cast<void**>(&nextCreateOp),&handle)==BE_Result_Ok;
+    if(!opFilterReady)opFilterError="op filter hook failed";
+    else opFilterError="rva "+std::to_string(candidates[0]-reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"GameAssembly.dll")));
+}
+void installOfficialFilter(const BE_HostApiV1* api) {
+    BE_FieldDescriptorV1 body{"Network.Beyond.dll","Beyond.Network","NetResponse","msgBody","Google.Protobuf.IMessage"};BE_ResolvedFieldV1 field{};
+    if(api->resolve_field(api->context,&body,&field)!=BE_Result_Ok||field.offset<16||field.offset>40)return;
+    responseBodyOffset=std::size_t(field.offset)-16; // boxed offsets include the object header
+    if(responseBodyOffset!=8)return; // verified 32-byte current-client NetResponse layout
+    BE_MethodDescriptorV1 rx{"Network.Beyond.dll","Beyond.Network","NetBus","HandleMessage","Beyond.Network.NetResponse","System.Void",1};
+    if(api->resolve_method(api->context,&rx,&receiveMethod)!=BE_Result_Ok||!receiveMethod.method_pointer)return;
+    try {officialCodec.bind(api);officialViewParser.bind(api);}catch(...) {return;}
+    std::uint64_t handle=0;
+    officialFilterReady=host.hooks->create(host.hooks->context,kId,receiveMethod.method_pointer,reinterpret_cast<void*>(onReceive),reinterpret_cast<void**>(&nextReceive),&handle)==BE_Result_Ok;
 }
 BE_Result installHook() {
     if(hooked.load()) return BE_Result_Ok;
@@ -187,6 +357,18 @@ BE_Result installHook() {
     std::uint64_t handle=0;
     const auto result=host.hooks->create(host.hooks->context,kId,tickMethod.method_pointer,reinterpret_cast<void*>(onTick),reinterpret_cast<void**>(&nextTick),&handle);
     if(result==BE_Result_Ok) {
+        hooked.store(true);
+        if(!eflink::roomAdapterAvailable)return result;
+        installOfficialFilter(api);
+        installOpFilter(api);
+        installGuestGates(api);
+        BE_MethodDescriptorV1 markTarget{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","GetMarkTargetScore",
+            "Beyond.Gameplay.Core.AbilitySystem|Beyond.Gameplay.Core.BattleManager.MarkTargetPriority&|System.Single&|System.Boolean&","System.Boolean",4};
+        if(api->resolve_method(api->context,&markTarget,&markTargetScoreMethod)==BE_Result_Ok&&markTargetScoreMethod.method_pointer) {
+            std::uint64_t scoreHandle=0;
+            if(host.hooks->create(host.hooks->context,kId,markTargetScoreMethod.method_pointer,reinterpret_cast<void*>(onMarkTargetScore),reinterpret_cast<void**>(&nextMarkTargetScore),&scoreHandle)!=BE_Result_Ok)
+                {std::lock_guard lock(worldMutex);world.requireTargetGate(false);}
+        }else {std::lock_guard lock(worldMutex);world.requireTargetGate(false);}
         hooked.store(true);
         BE_MethodDescriptorV1 damage{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","AbilitySystem","ApplyModifier","Beyond.Gameplay.Core.AbilitySystem.Modifier&","Beyond.Gameplay.Core.AbilitySystem.Modifier.ApplyResult",1};
         if(api->resolve_method(api->context,&damage,&damageMethod)==BE_Result_Ok&&damageMethod.method_pointer) {
@@ -299,7 +481,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut}}}};
@@ -398,11 +580,12 @@ json perform(const json& input) {
         const auto address=input.at("address").get<std::string>();const auto password=input.value("password",std::string{});
         if(address.empty()||address.size()>256||password.size()>128) throw std::runtime_error("地址或密码无效");net.join(address,password);
     } else if(action=="leave") net.leave();
+    else if(action=="host_map_choice") {std::lock_guard lock(worldMutex);world.chooseHostMap(net,input.at("token").get<std::uint64_t>(),input.at("follow").get<bool>());}
     else if(action=="teleport_to_player") {std::lock_guard lock(worldMutex);session.requestTeleport(net,input.at("id").get<std::uint16_t>());}
-    else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.status().at("markers")}};}
+    else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe") {
+    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe") {
         std::lock_guard lock(worldMutex);world.queueDiagnostic(input);return {{"queued",true},{"diagnostic",true}};}
     else if(action=="native_skill_probe") {std::lock_guard lock(worldMutex);world.queueNativeCast(input);return {{"queued",true},{"diagnostic",true}};}
 #endif
@@ -489,7 +672,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;
+        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     std::lock_guard lock(lifecycle);std::lock_guard lockWorld(worldMutex);host={};

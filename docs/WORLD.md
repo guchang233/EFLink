@@ -1,12 +1,16 @@
 # Hosted world protocol (experimental, schema 2)
 
+> Historical replica protocol, rejected as an implementation of a shared server
+> world. The current requirement is [SERVER_GOAL.md](SERVER_GOAL.md). Admission
+> flags below certify only the old bounded experiment, never real world authority.
+
 EF Link 1.2.0-dev adds a host-owned world session. The game thread samples and applies
 native state; the network thread only copies bounded packets. The `eflink.world.v1`
 channel is reserved by the core and cannot be opened by third-party modules.
 
 ## State and authority
 
-The host broadcasts a full map/level snapshot every 200 ms. Map or level changes advance
+The host broadcasts a full map/level snapshot every 50 ms (20 Hz). Map or level changes advance
 `epoch`; each broadcast advances `revision`. Late joiners receive a complete current
 snapshot. Clients reject snapshots from anyone except peer 1, old epochs, duplicate
 revisions, wrong rooms, duplicate entity keys, invalid coordinates, and invalid HP.
@@ -29,8 +33,10 @@ with current room/epoch/revision, attempt token and native replica facts. The ho
 `entry_result` for that exact epoch/token only. Map/entity readiness alone cannot pass:
 host-owned simulation/rules/combat/logical players and guest isolation/logical players
 are mandatory. A member also needs a bound host actor and must acknowledge that
-actor's current entity ID. Production currently reports incomplete capabilities, so admission is
-blocked honestly. Capability withdrawal, local readiness loss, three-second expiry,
+actor's current entity ID. The experimental overworld adapter admits its bounded room
+combat after native replicas and interaction guards are ready; this does not certify
+complete dungeon, quest, resource, reward or account isolation. Capability withdrawal,
+local readiness loss, three-second expiry,
 map change and disconnect revoke actions. No configuration toggle can assert authority.
 
 Enemy keys use level logic IDs or script IDs and slots. The native adapter currently
@@ -78,8 +84,8 @@ Each player owns their own body, as in an official co-op world. Every client
 interpolates a remote player's 30 Hz pose stream 100 ms in the past and applies the
 position, rotation and Biped bone pose to that player's native room actor every frame,
 on the host and on guests alike. The actor's gameplay position (enemy targeting, hit
-volumes) is placed on the drawn body with `MovementComponent.TeleportTo`. The 5 Hz
-world snapshot is not used for drawing: it froze between packets and then jumped.
+volumes) is placed on the drawn body with `MovementComponent.TeleportTo`. World
+snapshots are not used for drawing players: older builds froze between packets and jumped.
 
 Earlier builds steered the host's actor with `CharacterController.MoveTo` at sprint
 gait plus a native-physics gate. The sprint overshot a 0.15 m dead band and hunted
@@ -87,7 +93,7 @@ around the target, so a standing guest wandered about 1 m on the host. That path
 its `_NeedFixedTick` hook are removed. While the host executes an admitted guest's
 native skill, the skill's root motion drives the actor until the cast ends.
 
-## Co-op combat (dev47–55)
+## Co-op combat (dev47–64)
 
 Admission is now granted when it is true: the host has set its account enemies aside
 for room-owned enemies (`isolated_world`), players have native actors, the host
@@ -114,7 +120,7 @@ player when its owner is not engaged and someone else is 4 m closer; anyone with
 60 m when an engaged owner is more than 35 m away. On the owner's machine the enemy's
 native AI runs and fights that player's real operator with native damage, hit
 reactions and death. The owner reports the enemy's position, facing and engagement
-at 10 Hz (`enemy_state`) and its casts (`enemy_cast`). Everyone else keeps that
+at 20 Hz (`enemy_state`) and its casts (`enemy_cast`). Everyone else keeps that
 enemy's AI paused (its controller still ticks): it walks to the reported positions
 with `EnemyController.MoveTo` so the enemy's own locomotion animation plays, snaps
 only when more than 5 m off, and replays each cast with `TryCastSkill` aimed at the
@@ -127,10 +133,41 @@ guest's hits killed 8 room enemies through the native death path; room enemies
 fought the host's operator (14 casts announced); 6 enemies handed to a real guest
 by proximity entered Battle on the guest, damaged and killed its operator natively
 (the game switched to the next squad member), and the host replayed their casts and
-walked its puppets. Still open: a guest's own native attack reaching the damage hook
-(only protocol-level hits from a scripted guest were exercised), stand-in hit
-forwarding, enemy effects beyond the replayed cast, hit reactions on puppets, boss
+walked its puppets. In dev58, two native guest attack casts produced 22 measured
+hits, all accepted by the host; the host enemy's health fell from 34651 to 32710.97.
+This exercised actual native damage rather than injected protocol hits. Still open:
+manual input acceptance, stand-in hit forwarding, enemy effects beyond the replayed
+cast, hit reactions on puppets, boss
 scripts, dungeon co-op, drops/rewards and quests.
+
+## Guest private-world restrictions and frame work (dev58–64)
+
+Guests following the host cannot execute their account world's interaction options,
+scan/step/attack triggers, trigger volumes, dynamic-scene triggers, tree destruction,
+private teleport requests, dungeon entry requests or subgame start requests. These
+are native method gates, not persistent UI locks. The restriction remains during
+return-home loading and ends when that travel finishes. Guests can still use EF
+Link's player teleport. Admission requires all gates and the battle target filter
+to install, and all host enemy replicas to be ready. An installation error is
+reported in the menu and prevents admission.
+
+Private enemies are temporarily removed from the native battle mark list, without
+unregistering their ability, AI or account entity. A cached main target pointing at
+one of them is reset through native battle methods. Original membership is restored
+on leave, without duplicates and only while the entity identity still matches.
+Successful target isolation is required for admission. Native automatic target
+scoring also rejects quarantined account enemies; on guests, only current room
+enemy replicas are eligible. Damage against private non-enemy
+objects is also suppressed. These guards stop private-world interactions; they do
+not implement shared dungeon scripts, rewards or resource collection.
+
+The host publishes world state and the AI owner reports enemy state every 50 ms.
+Puppets interpolate 100 ms behind. Replayed skills retain their native root motion:
+movement resumes when the native cast ends, checked every 50 ms, instead of waiting
+a fixed 1.5 seconds. Guest world application runs once per new revision (retrying
+missing replicas). HUD frames copy only marker data. Development movement diagnostics
+sample at 1 Hz and host AI diagnostics sample one enemy every 250 ms. Unchanged AI
+tick ownership no longer generates repeated native pause/resume calls.
 
 Development builds (`EFLINK_NATIVE_DIAGNOSTICS`) add `native_owner_probe`,
 `native_travel_probe` and `native_self_cast_probe`. Like `native_skill_probe` they are
@@ -140,6 +177,15 @@ The previous skill-intent executor (host casts a guest's skill on its actor) rem
 in the protocol and development diagnostics but is no longer used by players.
 
 ## HUD and external integrations
+
+After the initial join, a host map or level change requires the guest's confirmation
+in the native menu. Repeated snapshots cannot grant travel, and confirmations carry
+a destination token so an old prompt cannot approve a newer map. Declining leaves
+the guest in the current map with entry/combat revoked and a button to follow later;
+leaving the room still returns home. A host return to the guest's current map resumes
+preparation directly. An explicit EF Link teleport to a player in the new host map
+also grants consent. Unsupported host dungeon/subgame scenes show the notification
+but cannot be followed until host scene rules are ready.
 
 Native camera projection produces normalized screen coordinates and distance. The
 injected Dear ImGui renderer draws labels, edge markers and other-map labels through

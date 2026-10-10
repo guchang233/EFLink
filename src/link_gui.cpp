@@ -93,7 +93,7 @@ void theme() {
 }
 void copyText(char* dst,std::size_t capacity,const std::string& text) {strncpy_s(dst,capacity,text.c_str(),_TRUNCATE);}
 struct Panel {
-    Gui::Request request;json state;std::string feedback;int tab=0;bool close=false,initialized=false;
+    Gui::Request request;json state;std::string feedback;int tab=0;bool close=false,initialized=false;std::uint64_t lastMapPrompt=0;
     char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
     int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,markers=true,follow=true,combat=true;std::uint64_t lastRefresh=0,lastChat=0;
     json call(const json& input) {
@@ -205,13 +205,19 @@ struct Panel {
             if(send&&*chat) {call({{"action","chat"},{"text",chat}});chat[0]=0;}ImGui::EndDisabled();
         } else {
             ImGui::Text("玩家设置");ImGui::InputText("玩家名称",name,sizeof(name));ImGui::Checkbox("在游戏中显示其他玩家",&remote);
-            ImGui::Checkbox("屏幕显示玩家位置与距离",&markers);ImGui::Checkbox("跟随房主地图与世界",&follow);ImGui::Checkbox("接收房主敌人状态（实验）",&combat);
+            ImGui::Checkbox("屏幕显示玩家位置与距离",&markers);
+            ImGui::TextWrapped("真实共享世界正在实现，地图跟随和联机战斗尚未开放。旧场景复制已停用。");
             const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
             if(ImGui::Combo("菜单快捷键",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
             if(ImGui::Button("保存设置")) save();ImGui::SameLine();ImGui::TextDisabled("收藏、名字与设置自动保存在本机。");
             ImGui::Separator();ImGui::Text("房主世界接入");ImGui::TextWrapped("地图和实体加载完成后，还需完成客机世界隔离、逻辑玩家与房主规则接管。入场未完成时禁止客机结算战斗。");
             auto g=state.value("game",json::object());ImGui::Text("游戏接入：%s",state.value("hook_ready",false)?"已连接":"等待终末地场景");
             auto w=state.value("world_session",json::object());auto native=g.value("world_replication",json::object());
+            auto policy=native.value("guest_policy",json::object());
+            if(policy.value("restricted",false)) {
+                ImGui::TextWrapped("房客模式：地图机关、采集、资源破坏和私人副本入口已禁用。切图和传送由房主世界管理，离开房间后恢复。");
+                if(!policy.value("ready",false))ImGui::TextWrapped("交互隔离未就绪：%s",policy.value("error",std::string{}).c_str());
+            }
             ImGui::Text("世界状态：%s  /  地图版本 %llu",w.value("ready",false)?"已收到":"等待房主",static_cast<unsigned long long>(w.value("epoch",std::uint64_t(0))));
             auto entry=w.value("entry",json::object());
             ImGui::Text("房主世界：%s",entry.value("active",false)?"已完成入场":"接管未完成");
@@ -238,6 +244,32 @@ struct Panel {
             if(requestLeave) ImGui::OpenPopup("离开房间");
             if(ImGui::BeginPopupModal("离开房间",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {ImGui::Text("%s",role=="host"?"关闭房间会断开所有玩家。":"确定结束当前连接？");if(ImGui::Button("确认")) {call({{"action","leave"}});joinPassword[0]=0;ImGui::CloseCurrentPopup();}ImGui::SameLine();if(ImGui::Button("返回")) ImGui::CloseCurrentPopup();ImGui::EndPopup();}}
         else ImGui::TextDisabled("局域网连接  ·  同一地图显示玩家");
+        auto change=state.value("game",json::object()).value("world_replication",json::object()).value("host_map_change",json::object());
+        const bool pending=role=="client"&&change.value("pending",false);
+        const auto token=change.value("token",std::uint64_t(0));
+        auto blockers=state.value("world_session",json::object()).value("entry",json::object()).value("blockers",json::array());
+        const bool supported=std::find(blockers.begin(),blockers.end(),json("host_scene_rules"))==blockers.end();
+        if(pending) {
+            ImGui::TextColored({.85f,.93f,.35f,1},"房主已切换地图：%s",change.value("level",std::string{}).c_str());
+            if(change.value("deferred",false)) {
+                ImGui::TextDisabled("已暂不跟随，联机战斗暂停；可稍后跟随或离开房间。");
+                ImGui::BeginDisabled(!supported);if(ImGui::Button("现在跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
+            }else if(token!=lastMapPrompt) {lastMapPrompt=token;ImGui::OpenPopup("房主切换地图");}
+        }
+        if(ImGui::BeginPopupModal("房主切换地图",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {
+            if(!pending)ImGui::CloseCurrentPopup();
+            else {
+                ImGui::Text("房主已前往：%s",change.value("level",std::string{}).c_str());
+                ImGui::Text("是否跟随房主切换地图？");
+                ImGui::TextDisabled("暂不跟随会留在当前地图，并暂停联机战斗。");
+                if(!supported)ImGui::TextWrapped("房主当前场景尚未开放联机入场，请等待其回到大世界。");
+                ImGui::BeginDisabled(!supported);
+                if(ImGui::Button("跟随切换",{150,0})) {call({{"action","host_map_choice"},{"token",token},{"follow",true}});if(feedback.empty())ImGui::CloseCurrentPopup();}
+                ImGui::EndDisabled();ImGui::SameLine();
+                if(ImGui::Button("暂不跟随",{150,0})) {call({{"action","host_map_choice"},{"token",token},{"follow",false}});if(feedback.empty())ImGui::CloseCurrentPopup();}
+            }
+            ImGui::EndPopup();
+        }
         ImGui::End();
     }
 };

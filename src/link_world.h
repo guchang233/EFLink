@@ -5,12 +5,25 @@
 #include "link_session.h"
 #include "unity_bridge.h"
 #include "link_native_identity.h"
+#include "link_map_consent.h"
+#include "authority/link_native_feed.h"
+#include "authority/link_native_op_policy.h"
+#include "authority/link_official_view.h"
 #include "nlohmann/json.hpp"
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <optional>
 
 namespace eflink {
+// The rejected private-world quarantine/replica adapter must never certify or
+// execute shared-world admission. Replaced by the native server adapter in progress.
+inline constexpr bool legacyReplicaAdapterAvailable=false;
+// Native world feed: the guest's client receives the host world's monsters as
+// standard server messages (same server IDs, native create/spawn/remove), and
+// its own account monsters leave view natively instead of being hidden.
+inline constexpr bool nativeFeedAdapter=true;
+inline constexpr bool roomAdapterAvailable=legacyReplicaAdapterAvailable||nativeFeedAdapter;
 class World {
     using V3=eflink::unity::V3;using Q=eflink::unity::Quaternion;
     eflink::unity::Api api;
@@ -62,6 +75,7 @@ class World {
         std::uint64_t teleports=0;
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         nlohmann::json movementDiagnostics=nlohmann::json::object();
+        std::uint64_t lastDiagnostics=0;
 #endif
         nlohmann::json waiting=nlohmann::json::array();
         nlohmann::json growth;
@@ -78,23 +92,28 @@ class World {
 #endif
         bool borrowed=false,aiPaused=false,controllerPaused=false,hidden=false,originalActive=true,stateChanged=false;
         double originalHp=0;V3 originalPosition{};
-        std::uint64_t mirroredCastAt=0;
-        bool visibilityApplied=false;
+        std::uint64_t mirroredCastAt=0,lastCastCheck=0;
+        bool mirroredCasting=false;
+        bool visibilityApplied=false,battleTargetDetached=false;
     };
     std::map<std::string,Enemy> enemies;
     // Private account enemies and room replicas have separate lifetimes. Never
     // overwrite an account enemy merely because its level logic ID matches the host.
     std::map<void*,Enemy> privateEnemies;
-    bool guestRealm=false,roomHost=false;
+    bool guestRealm=false,roomHost=false,privateTargetIsolationReady=false;
+    HostMapConsent hostMapConsent;
+    std::string hostMapChoiceMap,hostMapChoiceLevel;
+    std::uint64_t hostMapChoiceRoom=0;
     std::map<std::string,nlohmann::json> hostEnemySeeds;
     struct Spawn {void* data=nullptr;std::uint32_t root=0;std::uint64_t retry=0;std::string error;
         std::uint64_t id=0;std::uint32_t generation=0;bool ownershipEstablished=false,committed=false;
-        int pipeline=-1;bool resourcesComplete=false,inAoi=false,preload=false,initialStateApplied=false,started=false;};
+        int pipeline=-1;bool resourcesComplete=false,inAoi=false,preload=false,initialStateApplied=false,started=false;
+        bool native=false,nativeDataReady=false;std::uint64_t serverId=0,nativeCheckAt=0;};
     std::map<std::string,Spawn> spawnedEnemies;
     std::uint32_t nextSpawnGeneration=0;
     std::uint64_t lastEnemies=0,lastProjection=0,enemyEpoch=0;
     bool applyingDamage=false;std::string replicationError;
-    std::size_t matchedEnemies=0,missingEnemies=0;
+    std::size_t matchedEnemies=0,missingEnemies=0,deferredNativeEnemies=0;
     nlohmann::json markers=nlohmann::json::array();
     // Room entry and exit use the game's own loading pipeline so the official
     // loading panel covers the scene swap, as an official teleport does.
@@ -110,6 +129,11 @@ class World {
     nlohmann::json nativeHits=nlohmann::json::array();
     std::uint64_t nativeDeaths=0;
     std::uint64_t guestHitsSent=0,roomHitsApplied=0,playerHitsSent=0,playerHitsTaken=0,enemyCastsSent=0,enemyCastsMirrored=0,enemyCastsRejected=0;
+    bool guestGatesReady=false,guestRestrictionsActive=false;std::string guestGateError;
+    std::map<std::string,std::uint64_t> blockedGuestActions;
+    std::uint64_t damageHookCalls=0,guestHitCandidates=0,guestZeroDamage=0,guestHitSendFailed=0;
+    std::uint64_t lastAppliedRevision=0,lastAppliedEpoch=0,lastHostDiagnostics=0;
+    std::string lastDiagnosedEnemy;
     std::uint16_t localPeer=0;
     // Enemy ownership, as in official co-op: an enemy's AI runs on the machine of
     // the player it fights, against that player's real operator (the game's enemy
@@ -122,6 +146,53 @@ class World {
     std::map<std::string,Motion> motions;
     std::uint64_t lastOwnership=0,lastEnemyReport=0,ownershipChanges=0,enemyStatesSent=0,enemyStatesApplied=0,enemyMoves=0,enemyWalks=0,enemySnaps=0;
     bool replayingCast=false;
+    // Native feed state (guest): host monsters entered under their server IDs,
+    // this account's monsters that left view on join (restored on leave), and
+    // official enter/leave messages withheld while in the host's world.
+    authority::NativeFeed feed;
+    std::map<std::uint64_t,authority::FeedMonster> privateRecords;std::string privateRecordsLevel;
+    std::vector<std::pair<std::string,std::string>> withheldOfficial;
+    bool feedFilterActive=false;std::uint64_t withheldCount=0,feedErrors=0,opsSuppressed=0;std::string feedError;
+    bool feedOperating=false; // inside our own injected enter/leave view call
+    authority::NativeOpPolicy nativeOpPolicy;std::map<std::uint64_t,std::uint64_t> leakedOwners;
+    // Latest official SCENE_MONSTER bytes per monster this account's server sent.
+    std::map<std::uint64_t,std::string> officialMonsters;std::uint64_t officialRestored=0;
+    struct FeedScope {bool& flag;bool previous;explicit FeedScope(bool& f):flag(f),previous(f){flag=true;}~FeedScope(){flag=previous;}};
+    void leaveNative(const std::vector<std::uint64_t>& ids) {
+        if(ids.empty())return;
+        // The native view handler schedules withdrawal on later ticks. Register
+        // the IDs before dispatch and keep them after the private world resumes.
+        nativeOpPolicy.rememberRetired(ids);
+        FeedScope scope(feedOperating);feed.bind(runtime);feed.leave(ids);
+    }
+    bool roomEnemy(const std::string& key) const {
+        return spawnedEnemies.contains(key)||(nativeFeedAdapter&&roomHost&&enemies.contains(key));
+    }
+    static std::uint64_t serverIdFromKey(const std::string& key) {
+        const auto at=key.rfind(":level:");if(at==std::string::npos)return 0;
+        try {return std::stoull(key.substr(at+7));}catch(...) {return 0;}
+    }
+    authority::FeedMonster recordOf(void* entity) {
+        authority::FeedMonster m;
+        m.id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
+        auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity);
+        if(data) {
+            m.templateId=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
+            const auto p=api.value<V3>(gm("BaseEntityData","get_position","","UnityEngine.Vector3"),data);
+            const auto r=api.value<V3>(gm("BaseEntityData","get_rotation","","UnityEngine.Vector3"),data);
+            m.position[0]=p.x;m.position[1]=p.y;m.position[2]=p.z;m.rotation[0]=r.x;m.rotation[1]=r.y;m.rotation[2]=r.z;
+            m.scene=api.value<int>(gm("BaseEntityData","get_levelIdNum","","System.Int32"),data);
+            auto* server=api.call(gm("BaseEntityData","get_serverData","","Beyond.Gameplay.EntityServerData"),data);
+            if(server&&classOf(server)=="Beyond.Gameplay.EnemyServerData")m.level=api.value<int>(gm("EnemyServerData","get_level","","System.Int32","Beyond.Gameplay"),server);
+        }
+        if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity))
+            m.hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+        // Keep this account's battle identity so the restored monster reports
+        // to the player's own official world exactly as before.
+        m.battleInstance=api.value<std::uint64_t>(gm("Entity","get_serverBattleInstId","","System.UInt64"),entity);
+        m.generation=(std::max)(1u,api.value<std::uint32_t>(gm("Entity","get_serverGeneration","","System.UInt32"),entity));
+        return m;
+    }
     std::uint64_t lastGuestDiagnostics=0;double localHp=0,localMaxHp=0;
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     std::map<std::string,std::pair<std::uint16_t,std::uint64_t>> ownerPins; // development: forced owner for 30 s
@@ -266,7 +337,33 @@ class World {
         release(spawn.root);spawn.data=nullptr;spawn.ownershipEstablished=false;
         spawn.committed=false;
     }
+    // A host monster delivered through the native feed lives under its real
+    // server ID; it is looked up, never allocated by EF Link.
+    void* nativeEntity(std::uint64_t id) {
+        auto* container=staticObject("objectContainer");if(!container||!id)return nullptr;
+        auto* entity=api.call(gm("ObjectContainer","GetEntityById","System.UInt64","Beyond.Gameplay.Core.Entity"),container,{&id});
+        if(!usable(entity)||api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity)!=id)return nullptr;
+        return entity;
+    }
+    // Committed native data can legitimately have no entity while outside the
+    // client's AOI. Do not reset its spawn pipeline by repeatedly entering view.
+    // Confirm the host template and isolated battle identity, not just the ID:
+    // level monster IDs can also exist in this account's private world.
+    bool nativeDataAccepted(std::uint64_t id,const std::string& expectedTemplate) {
+        auto klass=api.klass("EntityManager","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
+        auto* field_=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,"s_manager");
+        void* manager=nullptr;if(field_)symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field_,&manager);
+        if(!manager||!id||expectedTemplate.empty())return false;
+        void* data=nullptr;
+        if(!api.value<bool>(gm("EntityManager","TryGetEntityData","System.UInt64|Beyond.Gameplay.Core.BaseEntityData&","System.Boolean"),manager,{&id,&data})||!data)return false;
+        eflink::unity::Api::TemporaryRoot dataRoot(runtime,data);
+        return api.value<std::uint64_t>(gm("BaseEntityData","get_id","","System.UInt64"),data)==id&&
+            api.value<bool>(gm("BaseEntityData","get_isCommitted","","System.Boolean"),data)&&
+            api.value<std::uint64_t>(gm("BaseEntityData","get_serverBattleInstId","","System.UInt64"),data)==0&&
+            text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data))==expectedTemplate;
+    }
     void* spawnEntity(const Spawn& spawn) {
+        if(spawn.native)return nativeEntity(spawn.serverId);
         if(!currentSpawn(spawn))return nullptr;
         auto* entity=api.call(gm("BaseEntityData","GetEntity","","Beyond.Gameplay.Core.Entity"),spawn.data);
         if(!usable(entity))return nullptr;
@@ -292,6 +389,17 @@ class World {
     }
     void restoreEnemy(Enemy& e) {
         if(!e.borrowed||!currentEnemy(e)) return;
+        if(e.battleTargetDetached) {
+            auto* battle=staticObject("battle");
+            auto* list=battle?api.call(gm("BattleManager","get_allBattleMarkEntities","","Beyond.UnorderedArray<Beyond.Gameplay.Core.Entity>"),battle):nullptr;
+            if(list) {
+                eflink::unity::Api::TemporaryRoot listRoot(runtime,list);
+                auto* result=collection(list,"Contains",{e.entity});bool contains=false;
+                if(result)std::memcpy(&contains,runtime->object_unbox(runtime->context,result),sizeof contains);
+                if(!contains)collection(list,"Add",{e.entity});
+                e.battleTargetDetached=false;
+            }
+        }
         auto* ai=api.call(gm("Entity","get_enemyAICom","","Beyond.Gameplay.AI.EnemyAIComponent"),e.entity);
         auto* ctrl=api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),e.entity);
         auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e.entity);
@@ -304,11 +412,46 @@ class World {
         if(e.hidden) {auto* component=api.call(entityModel,e.entity);auto* go=component?api.call(modelGo,component):nullptr;if(go&&alive(go)) api.call(setActive,go,{&e.originalActive});}
         e.borrowed=e.aiPaused=e.controllerPaused=e.hidden=e.stateChanged=false;
     }
+    void restorePrivateWorld() {
+        if(!nativeFeedAdapter)return;
+        feedFilterActive=false;
+        try {
+            FeedScope scope(feedOperating);
+            feed.bind(runtime);
+            if(!privateRecords.empty()&&privateRecordsLevel==mapId+"/"+levelId) {
+                std::vector<std::string> verbatim;
+                for(auto it=privateRecords.begin();it!=privateRecords.end();) {
+                    if(auto official=officialMonsters.find(it->first);official!=officialMonsters.end()) {
+                        verbatim.push_back(official->second);it=privateRecords.erase(it);
+                    } else ++it;
+                }
+                if(!verbatim.empty()) {feed.enterRaw(verbatim);officialRestored+=verbatim.size();}
+                std::vector<authority::FeedMonster> restore;
+                // Only monsters that still carry this account's battle identity are
+                // rebuilt; one without it is left for the official server to resend
+                // rather than recreated as an unattributed local copy.
+                for(const auto& [id,record]:privateRecords)if(!record.templateId.empty()&&record.hp>0&&record.battleInstance)restore.push_back(record);
+                if(!restore.empty())feed.enter(restore);
+            }
+            // Messages the official server sent meanwhile, in their original order.
+            for(const auto& [type,bytes]:withheldOfficial)feed.replay(type,bytes);
+        }catch(const std::exception& e) {++feedErrors;feedError=e.what();}
+        privateRecords.clear();privateRecordsLevel.clear();withheldOfficial.clear();
+    }
     void dropEnemies() {
+        // Host monsters entered by the feed leave view whenever the room's
+        // monster set is rebuilt; this account's own monsters only come back
+        // when the player actually leaves the host world (restorePrivateWorld).
+        if(nativeFeedAdapter) {
+            std::vector<std::uint64_t> fedIds;
+            for(const auto& [key,s]:spawnedEnemies)if(s.native&&s.serverId)fedIds.push_back(s.serverId);
+            if(!fedIds.empty())try {leaveNative(fedIds);}catch(const std::exception& e) {++feedErrors;feedError=e.what();}
+        }
         for(auto& [pointer,e]:privateEnemies) {try {restoreEnemy(e);}catch(...) {}release(e.root);}
         privateEnemies.clear();
+        privateTargetIsolationReady=false;
         for(auto& [key,e]:enemies) {try {restoreEnemy(e);}catch(...) {}release(e.root);}
-        enemies.clear();matchedEnemies=missingEnemies=0;lastEnemies=0;
+        enemies.clear();matchedEnemies=missingEnemies=deferredNativeEnemies=0;lastEnemies=0;
         for(auto& [key,s]:spawnedEnemies)releaseSpawn(s);
         spawnedEnemies.clear();
         hostEnemySeeds.clear();
@@ -328,6 +471,27 @@ class World {
         auto* ctrl=api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),e.entity);
         if(ai&&api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),ai)) {api.call(gm("TickComponent","PauseTick"),ai);e.aiPaused=true;}
         if(ctrl&&api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),ctrl)) {api.call(gm("TickComponent","PauseTick"),ctrl);e.controllerPaused=true;}
+    }
+    void excludePrivateBattleTarget(Enemy& e,void* list) {
+        auto* result=collection(list,"Contains",{e.entity});bool contains=false;
+        if(!result)throw std::runtime_error("无法检查原生寻敌列表");
+        std::memcpy(&contains,runtime->object_unbox(runtime->context,result),sizeof contains);
+        if(contains) {
+            // Only borrow membership of the native target list. Leave entity,
+            // ability, AI registration and account lifecycle intact.
+            e.battleTargetDetached=true;collection(list,"Remove",{e.entity});
+        }
+    }
+    void clearPrivateBattleTarget(void* battle) {
+        auto* target=api.call(gm("BattleManager","get_mainTarget","","Beyond.Gameplay.Core.AbilitySystem"),battle);
+        auto* entity=target?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),target):nullptr;
+        if(auto it=privateEnemies.find(entity);it!=privateEnemies.end()&&currentEnemy(it->second)) {
+            api.call(gm("BattleManager","ForceResetLockTarget"),battle);
+            auto method=gm("BattleManager","SetMainTarget","Beyond.ObjectPtr<Beyond.Gameplay.Core.AbilitySystem>|System.Boolean");
+            auto* empty=api.parameterValue(method,0);eflink::unity::Api::TemporaryRoot emptyRoot(runtime,empty);
+            bool manual=false;api.call(method,battle,{runtime->object_unbox(runtime->context,empty),&manual});
+            ++blockedGuestActions["private_target_cache"];
+        }
     }
     // The native container's enemy list. FindObjectsOfType walks every Unity
     // object in the scene and caused a periodic frame hitch while in a room.
@@ -361,13 +525,32 @@ class World {
         return out;
     }
     void scanEnemies() {
+        privateTargetIsolationReady=false;
         const auto started=std::chrono::steady_clock::now();
         const auto entities=sceneEnemies();
+        void* battle=nullptr;void* battleList=nullptr;
+        std::vector<std::uint64_t> leaving;std::set<std::uint64_t> fed;
+        if(nativeFeedAdapter&&guestRealm)for(const auto& [key,s]:spawnedEnemies)if(s.native)fed.insert(s.serverId);
+        if(guestRealm&&!nativeFeedAdapter) {
+            battle=staticObject("battle");
+            battleList=battle?api.call(gm("BattleManager","get_allBattleMarkEntities","","Beyond.UnorderedArray<Beyond.Gameplay.Core.Entity>"),battle):nullptr;
+            if(!battleList)throw std::runtime_error("原生寻敌列表尚未就绪");
+        }
+        std::optional<eflink::unity::Api::TemporaryRoot> battleListRoot;
+        if(battleList)battleListRoot.emplace(runtime,battleList);
         std::set<std::string> present;std::set<void*> privatePresent;
         for(const auto& [key,s]:spawnedEnemies) if(auto it=enemies.find(key);it!=enemies.end()&&currentEnemy(it->second)) present.insert(key);
         for(std::size_t i=0;i<entities.size()&&present.size()<512&&privatePresent.size()<512;++i) {
             auto* entity=entities[i];
             if(!usable(entity)||entity==character||!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),entity)) continue;
+            if(nativeFeedAdapter&&guestRealm) {
+                // This account's monster: record it, then let it leave view through
+                // the client's own handler. Host monsters entered by the feed stay.
+                const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
+                if(!id||fed.contains(id))continue;
+                if(!privateRecords.contains(id)&&privateRecords.size()<1024)privateRecords.emplace(id,recordOf(entity));
+                privateRecordsLevel=mapId+"/"+levelId;leaving.push_back(id);continue;
+            }
             if(guestRealm) {
                 bool owned=false;
                 for(const auto& [key,s]:spawnedEnemies) if(spawnEntity(s)==entity) {owned=true;break;}
@@ -381,6 +564,7 @@ class World {
                 privatePresent.insert(entity);auto& original=privateEnemies[entity];
                 if(!currentEnemy(original)) {release(original.root);original=trackEnemy(entity);}
                 pauseEnemy(original);
+                excludePrivateBattleTarget(original,battleList);
                 auto* component=api.call(entityModel,entity);auto* go=component?api.call(modelGo,component):nullptr;
                 if(go&&alive(go)) {bool visible=false;api.call(setActive,go,{&visible});original.hidden=true;}
                 continue;
@@ -398,6 +582,10 @@ class World {
             if(privatePresent.contains(it->first)) {++it;continue;}
             try {restoreEnemy(it->second);}catch(...) {}release(it->second.root);it=privateEnemies.erase(it);
         }
+        if(!leaving.empty())try {leaveNative(leaving);}
+            catch(const std::exception& e) {++feedErrors;feedError=e.what();throw;}
+        if(battle)clearPrivateBattleTarget(battle);
+        privateTargetIsolationReady=true;
         perf.scanMs=elapsedMs(started);
     }
     nlohmann::json enemyState(void* entity,const std::string& key) {
@@ -415,7 +603,8 @@ class World {
             if(server&&classOf(server)=="Beyond.Gameplay.EnemyServerData")
                 enemyLevel=api.value<int>(gm("EnemyServerData","get_level","","System.Int32","Beyond.Gameplay"),server);
             return {{"key",key},{"kind","enemy"},{"position",{pos.x,pos.y,pos.z}},{"rotation",{rotation.x,rotation.y,rotation.z,rotation.w}},
-                {"template",templateId},{"enemy_level",enemyLevel},{"hp",(std::max)(0.,hp)},{"max_hp",max},{"alive",api.value<bool>(entityAlive,entity)}};
+                {"template",templateId},{"enemy_level",enemyLevel},{"server_id",api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity)},
+                {"battle_inst",api.value<std::uint64_t>(gm("Entity","get_serverBattleInstId","","System.UInt64"),entity)},{"hp",(std::max)(0.,hp)},{"max_hp",max},{"alive",api.value<bool>(entityAlive,entity)}};
     }
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     // Development: read-only state of a room enemy's native AI.
@@ -474,6 +663,7 @@ class World {
     }
 #endif
     void updateHostEnemies() {
+        if(nativeFeedAdapter)return; // host monsters are native already; nothing to spawn
         auto* info=staticObject("worldInfo");if(!info)return;
         const int level=api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info);
         for(auto& [key,seed]:hostEnemySeeds) {
@@ -497,10 +687,18 @@ class World {
             if(auto it=enemies.find(key);it==enemies.end())enemies.emplace(key,trackEnemy(entity));
             else if(!currentEnemy(it->second)) {release(it->second.root);it->second=trackEnemy(entity);}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-            diagnoseAI(key,entity);
+            // Diagnostics are sampled once below instead of for the whole group.
 #endif
         }
     }
+#ifdef EFLINK_NATIVE_DIAGNOSTICS
+    void sampleHostDiagnostic() {
+        if(nowMs()-lastHostDiagnostics<250||enemies.empty())return;
+        lastHostDiagnostics=nowMs();
+        auto it=enemies.upper_bound(lastDiagnosedEnemy);if(it==enemies.end())it=enemies.begin();
+        lastDiagnosedEnemy=it->first;if(currentEnemy(it->second))diagnoseAI(it->first,it->second.entity);
+    }
+#endif
     nlohmann::json captureWorld() {
         auto* info=staticObject("worldInfo");auto* levelLoader=staticObject("levelLoader");
         if(!info||!character) return nlohmann::json::object();
@@ -514,7 +712,11 @@ class World {
             if(roomHost)if(auto old=hostEnemySeeds.find(key);old!=hostEnemySeeds.end()&&!old->second.value("alive",true))continue;
             if(roomHost)hostEnemySeeds[key]=state;else entities.push_back(std::move(state));
         }
-        if(roomHost)for(const auto& [key,seed]:hostEnemySeeds) {auto item=seed;item["owner"]=ownerOf(key);entities.push_back(std::move(item));}
+        if(roomHost)for(const auto& [key,seed]:hostEnemySeeds) {
+            // Natively unloaded host monsters are not published; tombstones are.
+            if(nativeFeedAdapter&&!enemies.contains(key)&&seed.value("alive",true))continue;
+            auto item=seed;item["owner"]=ownerOf(key);entities.push_back(std::move(item));
+        }
         return {{"map",mapId},{"level",levelId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
             {"loading",levelLoader&&api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader)},
             {"position",{position.x,position.y,position.z}},{"entities",entities}};
@@ -645,28 +847,52 @@ class World {
         }
     }
     void applyWorld(const nlohmann::json& snapshot) {
-        matchedEnemies=missingEnemies=0;
+        matchedEnemies=missingEnemies=deferredNativeEnemies=0;
         std::set<std::string> present;for(const auto& item:snapshot.at("entities")) present.insert(item.at("key").get<std::string>());
+        std::vector<std::uint64_t> gone;
         for(auto it=spawnedEnemies.begin();it!=spawnedEnemies.end();) {
             if(present.contains(it->first)) {++it;continue;}
             if(auto bound=enemies.find(it->first);bound!=enemies.end()) {release(bound->second.root);enemies.erase(bound);}
+            if(it->second.native&&it->second.serverId)gone.push_back(it->second.serverId);
             releaseSpawn(it->second);
             it=spawnedEnemies.erase(it);
+        }
+        std::vector<authority::FeedMonster> entering;
+        if(nativeFeedAdapter) {
+            feed.bind(runtime);feedFilterActive=true;
+            // Host monsters that died leave view natively instead of being hidden.
+            for(const auto& item:snapshot.at("entities"))if(item.at("hp").get<double>()<=0||!item.value("alive",true)) {
+                const auto key=item.at("key").get<std::string>();
+                if(auto s=spawnedEnemies.find(key);s!=spawnedEnemies.end()&&s->second.native) {
+                    gone.push_back(s->second.serverId);
+                    if(auto bound=enemies.find(key);bound!=enemies.end()) {release(bound->second.root);enemies.erase(bound);}
+                    spawnedEnemies.erase(s);
+                }
+            }
+            if(!gone.empty())try {leaveNative(gone);}catch(const std::exception& e) {++feedErrors;feedError=e.what();}
         }
         for(const auto& item:snapshot.at("entities")) {
             auto found=enemies.find(item.at("key").get<std::string>());
             if(found==enemies.end()||!currentEnemy(found->second)) {
                 if(item.at("hp").get<double>()<=0||!item.value("alive",true)) continue;
-                if(auto* created=spawnEnemy(item,snapshot.at("level_num").get<int>())) {
+                if(auto* created=nativeFeedAdapter?feedEnemy(item,snapshot.at("level_num").get<int>(),entering):spawnEnemy(item,snapshot.at("level_num").get<int>())) {
                     auto key=item.at("key").get<std::string>();auto& entry=enemies[key];release(entry.root);entry=trackEnemy(created);found=enemies.find(key);
-                } else {++missingEnemies;continue;}
+                } else {
+                    const auto spawn=spawnedEnemies.find(item.at("key").get<std::string>());
+                    if(nativeFeedAdapter&&spawn!=spawnedEnemies.end()&&spawn->second.nativeDataReady)++deferredNativeEnemies;
+                    else ++missingEnemies;
+                    continue;
+                }
             }
             auto& e=found->second;auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e.entity);
             if(!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),e.entity)) {
                 if(api.value<bool>(gm("Entity","get_hasInited","","System.Boolean"),e.entity))api.call(gm("Entity","TryStart"),e.entity);
                 if(!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),e.entity)){++missingEnemies;continue;}
             }
-            if(auto spawn=spawnedEnemies.find(item.at("key").get<std::string>());spawn!=spawnedEnemies.end())spawn->second.started=true;
+            if(auto spawn=spawnedEnemies.find(item.at("key").get<std::string>());spawn!=spawnedEnemies.end()) {
+                spawn->second.started=true;
+                if(spawn->second.native) {spawn->second.nativeDataReady=true;spawn->second.error.clear();}
+            }
             auto* movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),e.entity);
             if(!ability||!movement) {++missingEnemies;continue;}
             pauseEnemy(e);
@@ -691,12 +917,41 @@ class World {
             // it yet; never raise the bar back above the locally resolved value.
             if(auto hit=localHitAt.find(item.at("key").get<std::string>());hit!=localHitAt.end()&&nowMs()-hit->second<1000)
                 hp=(std::min)(hp,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability));
-            api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
+            // Write only real changes: every native HP write is a battle operation
+            // the client reports, so an unchanged value must not be rewritten.
+            if(std::abs(api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)-hp)>.5)
+                api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
             auto* component=api.call(entityModel,e.entity);auto* go=component?api.call(modelGo,component):nullptr;
             bool visible=item["hp"].get<double>()>0&&item.value("alive",true);
             if(go&&alive(go)&&(!e.visibilityApplied||e.hidden==visible)) {api.call(setActive,go,{&visible});e.hidden=!visible;e.visibilityApplied=true;}
             ++matchedEnemies;
         }
+        if(!entering.empty())try {FeedScope scope(feedOperating);feed.enter(entering);}catch(const std::exception& e) {++feedErrors;feedError=e.what();}
+    }
+    // Ask the client to create a host monster under its real server ID. Returns
+    // the native entity once the game's own pipeline has spawned it.
+    void* feedEnemy(const nlohmann::json& item,int levelNumber,std::vector<authority::FeedMonster>& entering) {
+        const auto key=item.at("key").get<std::string>();
+        const std::uint64_t id=item.value("server_id",serverIdFromKey(key));
+        if(!id)return nullptr; // script-slot entities have no stable server ID yet
+        auto& s=spawnedEnemies[key];s.native=true;s.serverId=id;
+        nativeOpPolicy.rememberFed(id);
+        if(auto* entity=nativeEntity(id)) {s.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);s.nativeDataReady=true;s.error.clear();return entity;}
+        s.started=false;
+        const auto now=nowMs();
+        if(now>=s.nativeCheckAt) {
+            s.nativeCheckAt=now+250;
+            s.nativeDataReady=nativeDataAccepted(id,item.value("template",std::string{}));
+        }
+        if(s.nativeDataReady) {s.error.clear();return nullptr;}
+        if(now<s.retry)return nullptr;s.retry=now+5000;
+        authority::FeedMonster m;m.id=id;m.templateId=item.value("template",std::string{});
+        if(m.templateId.empty()) {s.error="host monster template missing";return nullptr;}
+        for(int i=0;i<3;++i)m.position[i]=item.at("position")[i].get<float>();
+        if(item.contains("rotation")) {float q[4];for(int i=0;i<4;++i)q[i]=item["rotation"][i].get<float>();authority::eulerDegrees(q,m.rotation);}
+        m.scene=levelNumber;m.hp=item.at("hp").get<double>();m.level=item.value("enemy_level",1);
+        entering.push_back(std::move(m));s.committed=true;s.error="awaiting native spawn";
+        return nullptr;
     }
     static std::string operatorTemplate(const std::string& path) {
         return characterTemplate(path);
@@ -949,7 +1204,7 @@ class World {
                 actor.casting=anySkillCasting(ability);
                 actor.abilityTicking=api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),ability);
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-                actor.movementDiagnostics=movementState(actor.entity);
+                if(nowMs()-actor.lastDiagnostics>=1000) {actor.lastDiagnostics=nowMs();actor.movementDiagnostics=movementState(actor.entity);}
 #endif
                 // Each player owns their own body, as in an official co-op world:
                 // the actor follows that player's interpolated pose every frame
@@ -1139,7 +1394,14 @@ class World {
         api.call(gm("GameLevelLoader","LoadAtPos","Beyond.Gameplay.Core.GameLevelLoader.LoadingSource|System.Int32|UnityEngine.Vector3|Beyond.Gameplay.TeleportParam&|System.Action|System.Action"),levelLoader,{&source,&level,&travel->position,raw,nullptr,nullptr});
     }
     void replication(Net& net,Session& link) {
+        if(!roomAdapterAvailable) {
+            session=&link;link.setAuthority({});link.update(net);link.reportEntry(net,{});
+            guestRestrictionsActive=false;
+            replicationError="真实服务器世界适配器尚未接入；旧场景复制已停用";
+            return;
+        }
         session=&link;link.update(net);const auto role=net.currentRole();
+        guestRestrictionsActive=privateActionsRestricted(net);
         const bool connected=role==Role::Host||role==Role::Client;
         if(connected&&!backgroundLease) {
             backgroundOriginal=api.value<bool>(m("Application","get_runInBackground","","System.Boolean"));
@@ -1149,15 +1411,21 @@ class World {
         nativeDeltaTime=api.value<float>(m("Time","get_deltaTime","","System.Single"));
         if(auto* pause=staticObject("pauseGamePlayAndGameViewManager"))simulationPaused=api.value<bool>(gm("PauseGamePlayAndGameViewManager","get_isInPause","","System.Boolean"),pause);
         const bool hostRoom=role==Role::Host&&link.followHost&&link.combat;
-        const bool quarantine=hostRoom||(role==Role::Client&&link.followHost&&link.combat&&link.ready());
-        if(quarantine!=guestRealm||hostRoom!=roomHost) {dropEnemies();guestRealm=quarantine;roomHost=hostRoom;lastEnemies=0;}
+        const bool quarantine=(hostRoom&&!nativeFeedAdapter)||(role==Role::Client&&link.followHost&&link.combat&&link.ready());
+        if(quarantine!=guestRealm||hostRoom!=roomHost) {
+            const bool leavingHostWorld=nativeFeedAdapter&&guestRealm&&!quarantine;
+            dropEnemies();
+            if(leavingHostWorld)restorePrivateWorld();
+            guestRealm=quarantine;roomHost=hostRoom;lastEnemies=0;
+        }
         localPeer=net.snapshot().localId;
         // The host world is authoritative when its account enemies are set aside
         // for room-owned enemies (isolation), players have native actors and the
         // host settles combat. Dungeon/subgame scripts are not taken over, so a
         // room is only admitted in the overworld.
-        link.setAuthority({roomHost,roomHost&&character!=nullptr,roomHost&&link.combat,roomHost&&character&&overworldScene()});
+        link.setAuthority({roomHost&&privateTargetIsolationReady,roomHost&&character!=nullptr,roomHost&&link.combat,roomHost&&character&&overworldScene()});
         if(role==Role::Offline||role==Role::Connecting||!link.followHost) {
+            hostMapConsent.reset();hostMapChoiceMap.clear();hostMapChoiceLevel.clear();hostMapChoiceRoom=0;
             if(!enemies.empty()||!privateEnemies.empty()||!spawnedEnemies.empty()) dropEnemies();dropActors();enemyEpoch=0;
             // Leaving the host's world returns this player to where they entered
             // from, behind the loading panel, like leaving an official co-op world.
@@ -1167,7 +1435,7 @@ class World {
             return;
         }
         auto request=link.takeTeleport();
-        if(!request.empty()) {auto pos=request["position"];travel=Travel{request["map"].get<std::string>(),request["level"].get<std::string>(),{pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},nowMs()+60000,false,request.value("level_num",0)};travelState="queued";replicationError.clear();}
+        if(!request.empty()) {hostMapConsent.explicitTeleport(request["map"].get<std::string>()+"/"+request["level"].get<std::string>());auto pos=request["position"];travel=Travel{request["map"].get<std::string>(),request["level"].get<std::string>(),{pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},nowMs()+60000,false,request.value("level_num",0)};travelState="queued";replicationError.clear();}
         if(!character||mapId.empty()||levelId.empty()) {
             for(auto& [peer,avatar]:avatars)destroyAvatar(avatar);avatars.clear();
             dropActors();link.unbindPlayer(net.snapshot().localId);
@@ -1178,7 +1446,7 @@ class World {
         }
         if(auto growth=localGrowth();!growth.is_null())link.publishGrowth(net,localModel,growth);
         if(enemyMap!=mapId+"/"+levelId) {dropEnemies();enemyMap=mapId+"/"+levelId;travelState=travel?travelState:"idle";}
-        if(nowMs()-lastEnemies>1000) {lastEnemies=nowMs();scanEnemies();
+        if(nowMs()-lastEnemies>(nativeFeedAdapter&&guestRealm?250u:1000u)) {lastEnemies=nowMs();scanEnemies();
             for(auto& [key,s]:spawnedEnemies) if(!roomHost) {auto* created=spawnEntity(s);if(created&&!enemies.contains(key)) enemies[key]=trackEnemy(created);}}
         if(role==Role::Host) {
             if(roomHost) {updateHostEnemies();applyRoomHits(link);applyEnemyStates(link);assignOwners();mirrorEnemyCasts(net,link);applyPlayerHits(link);}
@@ -1191,11 +1459,18 @@ class World {
                     castNative(peer,command.at("key").get<std::string>(),command.at("skill").get<std::string>());
                 }catch(const std::exception& e) {++nativeCastRejected;replicationError=e.what();}
             }
-            // Enemy state is sampled for each 100 ms snapshot, not every tick.
-            if(nowMs()-lastCapture>=100) {lastCapture=nowMs();link.publish(net,captureWorld());}
+            if(nowMs()-lastCapture>=50) {lastCapture=nowMs();link.publish(net,captureWorld());}
+#ifdef EFLINK_NATIVE_DIAGNOSTICS
+            sampleHostDiagnostic();
+#endif
         } else if(role==Role::Client&&link.ready()) {
             auto* info=staticObject("worldInfo");if(info) link.publishLocation(net,mapId,levelId,api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info));
             const auto& snapshot=link.snapshot();
+            const auto room=net.snapshot().roomId;
+            if(hostMapChoiceRoom!=room) {hostMapConsent.reset();hostMapChoiceRoom=room;}
+            hostMapChoiceMap=snapshot.at("map").get<std::string>();hostMapChoiceLevel=snapshot.at("level").get<std::string>();
+            hostMapConsent.observe(hostMapChoiceMap+"/"+hostMapChoiceLevel,hostMapChoiceMap==mapId&&hostMapChoiceLevel==levelId);
+            if(hostMapConsent.pending()&&travel&&!travel->started&&!travel->homeward)travel.reset();
             if(enemyEpoch!=link.generation()) {
                 if(!home) {
                     // An interrupted return trip still points at the original home.
@@ -1207,11 +1482,19 @@ class World {
                 }
                 dropEnemies();enemyEpoch=link.generation();scanEnemies();lastEnemies=nowMs();
                 // Arrive beside the host rather than inside their operator.
-                auto pos=snapshot.at("position");travel=Travel{snapshot["map"].get<std::string>(),snapshot["level"].get<std::string>(),{pos[0].get<float>()+1.2f,pos[1].get<float>(),pos[2].get<float>()+.6f},nowMs()+60000,false,snapshot.value("level_num",0)};travelState="entering_host_world";
+                if(!hostMapConsent.pending()) {auto pos=snapshot.at("position");travel=Travel{snapshot["map"].get<std::string>(),snapshot["level"].get<std::string>(),{pos[0].get<float>()+1.2f,pos[1].get<float>(),pos[2].get<float>()+.6f},nowMs()+60000,false,snapshot.value("level_num",0)};travelState="entering_host_world";}
             }
             if(snapshot.at("map")!=mapId||snapshot.at("level")!=levelId) {
-                if(!travel&&travelState!="failed") {auto pos=snapshot.at("position");travel=Travel{snapshot["map"].get<std::string>(),snapshot["level"].get<std::string>(),{pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},nowMs()+60000,false,snapshot.value("level_num",0)};travelState="following_host";}
-            } else if(link.combat) {applyWorld(snapshot);mirrorEnemyCasts(net,link);reportOwnedEnemies(net,link);}
+                if(hostMapConsent.pending())travelState=hostMapConsent.deferred()?"host_map_follow_deferred":"awaiting_host_map_choice";
+                else if(!travel&&travelState!="failed") {auto pos=snapshot.at("position");travel=Travel{snapshot["map"].get<std::string>(),snapshot["level"].get<std::string>(),{pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},nowMs()+60000,false,snapshot.value("level_num",0)};travelState="following_host";}
+            } else if(link.combat) {
+                // Each reliable snapshot is applied once. Retry unfinished native
+                // spawns, but do not reset HP/AI and scan replicas twice per packet.
+                if(lastAppliedEpoch!=link.generation()||lastAppliedRevision!=link.worldRevision()||missingEnemies) {
+                    applyWorld(snapshot);lastAppliedEpoch=link.generation();lastAppliedRevision=link.worldRevision();
+                }
+                mirrorEnemyCasts(net,link);reportOwnedEnemies(net,link);
+            }
             else for(auto& [key,e]:enemies) restoreEnemy(e);
             applyPlayerHits(link);
             auto* levelLoader=staticObject("levelLoader");
@@ -1220,14 +1503,14 @@ class World {
                 !api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader);
             auto hostActor=actors.find(proto::kHostId);
             const bool players=hostActor!=actors.end()&&hostActor->second.started&&currentActor(hostActor->second);
-            // A replica that cannot be built is simply not hittable; it does not
-            // keep the whole player out of the room.
-            link.reportEntry(net,{loaded,loaded&&link.combat,loaded&&guestRealm,players});
+            // Missing committed data or an unfinished visible entity blocks
+            // this partial adapter. A committed native node awaiting its AOI
+            // entity is counted separately and does not trigger re-entry.
+            link.reportEntry(net,{loaded,loaded&&link.combat&&missingEnemies==0,loaded&&guestRealm&&guestGatesReady&&privateTargetIsolationReady,players});
         } else if(role==Role::Client&&!link.ready()) {for(auto& [key,e]:enemies) restoreEnemy(e);}
         try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
         updateActors(net,link);
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-        runDiagnostics();
         if(diagnosticCast) {
             auto command=std::move(*diagnosticCast);diagnosticCast.reset();
             try {
@@ -1302,7 +1585,11 @@ class World {
         if(go!=model) bindLocalModel(go);
         character=entity;
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-        try {localMovementDiagnostics=movementState(entity);}catch(const std::exception& e){localMovementDiagnostics={{"error",e.what()}};}
+        static std::uint64_t lastMovementDiagnostics=0;
+        if(now-lastMovementDiagnostics>=1000) {
+            lastMovementDiagnostics=now;
+            try {localMovementDiagnostics=movementState(entity);}catch(const std::exception& e){localMovementDiagnostics={{"error",e.what()}};}
+        }
 #endif
         if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity)) {
             localHp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
@@ -1517,6 +1804,105 @@ class World {
         return out;
     }
 public:
+    const nlohmann::json& markerSnapshot() const {return markers;}
+    bool takeHostMapNotice() {return hostMapConsent.takeNotice();}
+    void chooseHostMap(Net& net,std::uint64_t token,bool follow) {
+        if(net.currentRole()!=Role::Client||!session||!session->followHost)throw std::runtime_error("当前不是跟随房主的房客");
+        if(follow) {
+            const auto blockers=session->entryStatus().at("blockers");
+            if(std::find(blockers.begin(),blockers.end(),nlohmann::json("host_scene_rules"))!=blockers.end())
+                throw std::runtime_error("房主当前场景尚未开放联机入场");
+        }
+        hostMapConsent.choose(token,follow);if(follow){travelState="queued";replicationError.clear();}
+    }
+    void damageHookSeen() {++damageHookCalls;}
+    // Receive filter (guest in a native room): this account's monster enter/leave
+    // messages are withheld (kept in order for restoration on leave); messages
+    // carrying the player's own characters always pass.
+    bool filtering() const {return nativeFeedAdapter&&feedFilterActive&&guestRealm;}
+    // Every official monster enter/leave view (in or out of a room) keeps the
+    // exact server data, so the player's own world can be restored verbatim.
+    void observeOfficial(const std::string& type,const std::string& bytes) {
+        if(!nativeFeedAdapter)return;
+        if(type=="SC_OBJECT_ENTER_VIEW") {
+            fields(bytes,[&](int f,int w,const std::string& detail,std::uint64_t){
+                if(f==1&&w==2)fields(detail,[&](int g,int x,const std::string& monster,std::uint64_t){
+                    if(g==2&&x==2) {
+                        std::uint64_t id=0;
+                        fields(monster,[&](int h,int y,const std::string& common,std::uint64_t){
+                            if(h==1&&y==2)fields(common,[&](int k,int z,const std::string&,std::uint64_t v){if(k==1&&z==0)id=v;return k!=1;});
+                            return !id;});
+                        if(id&&(officialMonsters.size()<4096||officialMonsters.contains(id)))officialMonsters[id]=monster;
+                    }
+                    return true;});
+                return true;});
+        } else if(type=="SC_OBJECT_LEAVE_VIEW") {
+            fields(bytes,[&](int f,int w,const std::string& item,std::uint64_t){
+                if(f==1&&w==2) {std::uint64_t id=0;fields(item,[&](int g,int x,const std::string&,std::uint64_t v){if(g==2&&x==0)id=v;return true;});officialMonsters.erase(id);}
+                return true;});
+        }
+    }
+    // Guest in the host world: battle operations of host monsters (and side
+    // effects of our own enter/leave calls) are not created at all, so they
+    // never reach this account's official server and consume no sequence IDs.
+    // A host monster shown here never has a battle instance of this account
+    // (battleInstId 0); its operations stay local even while the native
+    // pipeline is still unloading it after the player left the room.
+    bool suppressServerOp(std::uint64_t serverId,std::uint64_t battleInstance) {
+        if(!nativeFeedAdapter)return false;
+        // EF Link's own stand-in actors for other players (0xEF.. room IDs) are
+        // never battle entities of this account either.
+        const bool suppress=(guestRealm&&feedOperating)||nativeOpPolicy.suppress(serverId,battleInstance);
+        if(suppress)++opsSuppressed;
+        else if(battleInstance==0&&guestRealm&&leakedOwners.size()<64)++leakedOwners[serverId];
+        return suppress;
+    }
+    bool withholdOfficial(const std::string& type,std::string bytes) {
+        if(!nativeFeedAdapter||!feedFilterActive||!guestRealm)return false;
+        if(withheldOfficial.size()<512)withheldOfficial.emplace_back(type,std::move(bytes));
+        ++withheldCount;return true;
+    }
+    static bool readVarint(const std::string& b,std::size_t& at,std::uint64_t& v) {
+        v=0;for(int shift=0;shift<64&&at<b.size();shift+=7){const auto c=static_cast<unsigned char>(b[at++]);v|=std::uint64_t(c&0x7f)<<shift;if(!(c&0x80))return true;}
+        return false;
+    }
+    static bool fields(const std::string& b,const std::function<bool(int,int,const std::string&,std::uint64_t)>& visit) {
+        std::size_t at=0;
+        while(at<b.size()) {
+            std::uint64_t key=0,value=0;if(!readVarint(b,at,key))return false;
+            const int field=int(key>>3),wire=int(key&7);std::string payload;
+            if(wire==0){if(!readVarint(b,at,value))return false;}
+            else if(wire==1){if(at+8>b.size())return false;at+=8;}
+            else if(wire==5){if(at+4>b.size())return false;at+=4;}
+            else if(wire==2){if(!readVarint(b,at,value)||at+value>b.size())return false;payload=b.substr(at,std::size_t(value));at+=std::size_t(value);}
+            else return false;
+            if(!visit(field,wire,payload,value))return true;
+        }
+        return true;
+    }
+    void setGuestGates(bool ready,std::string error) {guestGatesReady=ready;guestGateError=std::move(error);}
+    bool privateActionsRestricted(Net& net) const {
+        if(!roomAdapterAvailable)return false;
+        return (net.currentRole()==Role::Client&&session&&session->followHost)||home.has_value()||(travel&&travel->homeward);
+    }
+    void requireTargetGate(bool ready) {if(!ready){guestGatesReady=false;guestGateError+="battle_target_filter; ";}}
+    bool allowRoomTarget(Net& net,void* ability) {
+        if(!ability||net.currentRole()==Role::Offline||!session||!session->followHost)return true;
+        if(!guestRealm)return true;
+        auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
+        if(auto it=privateEnemies.find(entity);it!=privateEnemies.end()&&currentEnemy(it->second)) {
+            ++blockedGuestActions["private_enemy_target"];return false;
+        }
+        if(net.currentRole()==Role::Client) {
+            for(const auto& [key,enemy]:enemies)if(enemy.entity==entity&&roomEnemy(key)&&currentEnemy(enemy))return true;
+            ++blockedGuestActions["private_object_target"];return false;
+        }
+        return true;
+    }
+    bool blockPrivateAction(Net& net,const char* action) {
+        if(!privateActionsRestricted(net))return false;
+        ++blockedGuestActions[action];return true;
+    }
     bool roomEnemyAssignTarget(Net& net,void* controller,void*& target) {
         if(!controller||net.currentRole()!=Role::Host||!session||!session->ready()||!roomHost||!character)return false;
         Enemy* owned=nullptr;
@@ -1683,6 +2069,7 @@ public:
     // A puppet keeps its controller ticking: it walks to reported positions with
     // the enemy's own locomotion animation instead of sliding.
     void setEnemyAI(Enemy& e,bool run) {
+        if(!e.controllerPaused&&((run&&!e.aiPaused)||(!run&&e.aiPaused)))return;
         auto* ai=api.call(gm("Entity","get_enemyAICom","","Beyond.Gameplay.AI.EnemyAIComponent"),e.entity);
         auto* ctrl=api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),e.entity);
         if(e.controllerPaused&&ctrl)api.call(gm("TickComponent","ResumeTick"),ctrl);
@@ -1720,7 +2107,7 @@ public:
             const auto role=net.currentRole();
             if(!(role==Role::Host&&roomHost)&&!(role==Role::Client&&guestRealm))return;
             auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
-            std::string key;for(const auto& [id,e]:enemies)if(e.entity==entity&&currentEnemy(e)&&spawnedEnemies.contains(id)) {key=id;break;}
+            std::string key;for(const auto& [id,e]:enemies)if(e.entity==entity&&currentEnemy(e)&&roomEnemy(id)) {key=id;break;}
             if(key.empty()||ownerOf(key)!=localPeer)return;
             const auto skill=text(skillString);if(skill.empty()||skill.size()>128)return;
             const auto peer=castTarget(targetHandle);
@@ -1731,7 +2118,7 @@ public:
     // same player, so its attack animation and effects play here too. Damage
     // from a puppet is blocked; the owner's machine resolves the real hit.
     bool replayEnemyCast(const std::string& key,const std::string& id,std::uint16_t peer) {
-        auto e=enemies.find(key);if(e==enemies.end()||!spawnedEnemies.contains(key)||!currentEnemy(e->second))return false;
+        auto e=enemies.find(key);if(e==enemies.end()||!roomEnemy(key)||!currentEnemy(e->second))return false;
         auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity);
         if(!ability||!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),e->second.entity))return false;
         void* targetEntity=nullptr;
@@ -1756,7 +2143,10 @@ public:
         try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});}
         catch(...) {replayingCast=false;throw;}
         replayingCast=false;
-        if(accepted)e->second.mirroredCastAt=nowMs();
+        if(accepted) {
+            e->second.mirroredCastAt=nowMs();
+            e->second.lastCastCheck=0;e->second.mirroredCasting=true;
+        }
         return accepted;
     }
     void mirrorEnemyCasts(Net& net,Session& link) {
@@ -1781,14 +2171,25 @@ public:
         }
         m.stamp=stamp;m.samples.emplace_back(stamp,position,rotation);while(m.samples.size()>8)m.samples.pop_front();
     }
-    // Every frame: draw puppet enemies between their last reports (150 ms
-    // behind), instead of jumping at each 10 Hz update.
+    // Every frame: interpolate puppet enemies 100 ms behind their 20 Hz reports.
     void updateEnemyMotion() {
-        const auto now=nowMs();if(now<150)return;const auto target=now-150;
+        const auto now=nowMs();if(now<100)return;const auto target=now-100;
         for(auto& [key,m]:motions) {
             if(m.samples.empty())continue;
             auto e=enemies.find(key);if(e==enemies.end()||!currentEnemy(e->second))continue;
-            if(e->second.mirroredCastAt&&now-e->second.mirroredCastAt<1500)continue;
+            if(e->second.mirroredCastAt) {
+                if(now-e->second.mirroredCastAt<50)continue; // Allow the native timeline's first tick.
+                // Preserve actual native skill root motion, then resume as soon
+                // as the cast ends; a fixed timeout stalls short casts and can
+                // interrupt longer ones.
+                if(now-e->second.lastCastCheck>=50) {
+                    auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity);
+                    e->second.mirroredCasting=ability&&anySkillCasting(ability);
+                    e->second.lastCastCheck=now;
+                }
+                if(e->second.mirroredCasting)continue;
+                e->second.mirroredCastAt=0;
+            }
             auto [t0,p0,q0]=m.samples.front();V3 p=p0;Q q=q0;
             for(std::size_t i=1;i<m.samples.size();++i) {
                 const auto& [ta,pa,qa]=m.samples[i-1];const auto& [tb,pb,qb]=m.samples[i];
@@ -1835,7 +2236,7 @@ public:
         for(const auto& [peer,actor]:actors)if(roomTargetable(actor)&&session->canAct(peer))
             players.push_back({peer,api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),actor.entity)});
         for(auto& [key,e]:enemies) {
-            if(!currentEnemy(e)||!spawnedEnemies.contains(key))continue;
+            if(!currentEnemy(e)||!roomEnemy(key))continue;
             if(auto seed=hostEnemySeeds.find(key);seed!=hostEnemySeeds.end()&&!seed->second.value("alive",true))continue;
             const auto here=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
             auto distance=[&](std::uint16_t peer){
@@ -1876,14 +2277,14 @@ public:
     }
     // Guest: report enemies whose AI runs on this machine (10 Hz).
     void reportOwnedEnemies(Net& net,Session& link) {
-        if(nowMs()-lastEnemyReport<100)return;lastEnemyReport=nowMs();
+        if(nowMs()-lastEnemyReport<50)return;lastEnemyReport=nowMs();
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         if(nowMs()-lastGuestDiagnostics>1000) {lastGuestDiagnostics=nowMs();
             for(const auto& [key,e]:enemies)if(ownerOf(key)==localPeer&&currentEnemy(e))diagnoseAI(key,e.entity);}
 #endif
         nlohmann::json states=nlohmann::json::array();
         for(const auto& [key,e]:enemies) {
-            if(ownerOf(key)!=localPeer||!spawnedEnemies.contains(key)||!currentEnemy(e)||states.size()>=64)continue;
+            if(ownerOf(key)!=localPeer||!roomEnemy(key)||!currentEnemy(e)||states.size()>=64)continue;
             const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
             auto* component=api.call(entityModel,e.entity);auto* go=component?api.call(modelGo,component):nullptr;
             Q q{0,0,0,1};if(go&&alive(go))q=api.value<Q>(getRotation,api.call(getTransform,go));
@@ -1947,15 +2348,20 @@ public:
         try {
             if(applyingDamage||!session||!session->combat||!session->followHost||!session->ready()||net.currentRole()!=Role::Client||!ability||!modifier||!character)return {};
             if(!session->canAct(net.snapshot().localId))return {};
+            const auto& hosted=session->snapshot();
+            if(hosted.value("map",std::string{})!=mapId||hosted.value("level",std::string{})!=levelId)return {};
             if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier))return {};
             auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
             std::string key;NativeIdentity identity;
-            for(const auto& [id,e]:enemies)if(e.entity==target&&currentEnemy(e)&&spawnedEnemies.contains(id)) {key=id;identity=e.identity;break;}
+            for(const auto& [id,e]:enemies)if(e.entity==target&&currentEnemy(e)&&roomEnemy(id)) {key=id;identity=e.identity;break;}
             if(key.empty())return {};
+            bool live=false;for(const auto& e:hosted.at("entities"))if(e.at("key")==key){live=e.value("alive",true)&&e.at("hp").get<double>()>0;break;}
+            if(!live)return {};
             auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
             auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
             if(!sourceEntity||api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),sourceEntity))return {};
             for(const auto& [peer,actor]:actors)if(actor.entity==sourceEntity)return {};
+            ++guestHitCandidates;
             GuestHit hit{ability,target,identity,key};
             hit.before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
@@ -1972,6 +2378,8 @@ public:
             double restore=(std::max)(1.,hit.before-(std::max)(0.,amount));bool skip=true;
             api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),hit.ability,{&restore,&skip});
             if(amount>0&&session&&session->submitHit(net,hit.key,amount)) {++guestHitsSent;localHitAt[hit.key]=nowMs();}
+            else if(amount<=0)++guestZeroDamage;
+            else ++guestHitSendFailed;
         }catch(const std::exception& e){replicationError=e.what();}
     }
     struct DeathObservation {void* entity=nullptr;NativeIdentity identity;std::string key;};
@@ -2004,28 +2412,74 @@ public:
         while(!diagnosticQueue.empty()) {
             auto command=std::move(diagnosticQueue.front());diagnosticQueue.pop_front();
             const auto action=command.value("action",std::string{});
-            nlohmann::json record={{"action",action},{"at",nowMs()}};
+            nlohmann::json record={{"action",action},{"at",nowMs()},
+                {"command_id",command.value("command_id",std::string{})}};
             try {
                 if(action=="native_owner_probe")record["result"]=pinEnemyOwner(command);
                 else if(action=="native_travel_probe") {queueSelfTravel(command);record["result"]="queued";}
-                else if(action=="native_self_cast_probe")record["result"]=selfCast();
+                else if(action=="native_self_cast_probe")record["result"]=selfCast(command.value("automatic",false));
+                else if(action=="native_feed_lifecycle_probe")record["result"]=feedLifecycleProbe(command);
                 else throw std::runtime_error("unknown diagnostic");
             }catch(const std::exception& e){record["error"]=e.what();}
             if(diagnosticResults.size()>=8)diagnosticResults.erase(diagnosticResults.begin());
             diagnosticResults.push_back(std::move(record));
         }
     }
+    std::set<std::uint64_t> diagnosticFeedIds;
+    nlohmann::json feedLifecycleProbe(const nlohmann::json& command) {
+        auto id=command.at("id").get<std::uint64_t>();
+        if((id>>48)!=0x3000)throw std::runtime_error("diagnostic ID is outside the temporary monster namespace");
+        const auto phase=command.at("phase").get<std::string>();
+        feed.bind(runtime);
+        if(phase=="leave") {
+            if(!diagnosticFeedIds.contains(id))throw std::runtime_error("diagnostic does not own this ID");
+            leaveNative({id});diagnosticFeedIds.erase(id);
+            return {{"id",id},{"left",true}};
+        }
+        if(phase!="enter"||!validVector(command.at("position")))throw std::runtime_error("invalid lifecycle diagnostic");
+        auto klass=api.klass("EntityManager","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
+        auto* field_=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,"s_manager");
+        void* manager=nullptr;if(field_)symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field_,&manager);
+        if(!manager)throw std::runtime_error("native entity manager unavailable");
+        void* data=nullptr;
+        if(api.value<bool>(gm("EntityManager","TryGetEntityData","System.UInt64|Beyond.Gameplay.Core.BaseEntityData&","System.Boolean"),manager,{&id,&data}))
+            throw std::runtime_error("diagnostic ID is already in use");
+        auto* info=staticObject("worldInfo");
+        if(!info||!api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info))throw std::runtime_error("native world is not started");
+        authority::FeedMonster monster;monster.id=id;monster.templateId=command.at("template").get<std::string>();
+        if(monster.templateId.empty()||monster.templateId.size()>128)throw std::runtime_error("invalid native monster template");
+        for(int i=0;i<3;++i)monster.position[i]=command.at("position")[i].get<float>();
+        monster.scene=api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info);
+        monster.hp=100;monster.level=1;
+        // Leaving an untracked diagnostic entity reproduces private withdrawal;
+        // no real private entity is removed or rebuilt for this experiment.
+        if(command.value("track_enter",true))nativeOpPolicy.rememberFed(id);
+        diagnosticFeedIds.insert(id);
+        FeedScope scope(feedOperating);feed.enter({monster});
+        return {{"id",id},{"entered",true}};
+    }
     // Development only: this player's own operator casts its first normal
     // attack at the nearest room enemy, through the game's own cast path (the
     // same TryCastSkill a key press reaches). Exercises local hit resolution.
-    nlohmann::json selfCast() {
+    nlohmann::json selfCast(bool automatic=false) {
         if(!character)throw std::runtime_error("当前角色未就绪");
         auto* caster=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);
         if(!caster)throw std::runtime_error("角色能力组件未就绪");
+        if(automatic) {
+            auto* battle=staticObject("battle");
+            auto* target=battle?api.call(gm("BattleManager","get_mainTarget","","Beyond.Gameplay.Core.AbilitySystem"),battle):nullptr;
+            auto* entity=target?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),target):nullptr;
+            std::string key;for(const auto& [id,e]:enemies)if(e.entity==entity&&currentEnemy(e)){key=id;break;}
+            const bool accepted=api.value<bool>(gm("AbilitySystem","TryCastNormalAttack","","System.Boolean"),caster);
+            return {{"automatic",true},{"accepted",accepted},{"target",key},{"private_target",privateEnemies.contains(entity)},
+                {"casting",anySkillCasting(caster)},
+                {"can_normal_attack",api.value<bool>(gm("AbilitySystem","CanCastNormalAttackAttack","","System.Boolean"),caster)},
+                {"normal_attack_cd",api.value<bool>(gm("AbilitySystem","CheckNormalAttackCd","","System.Boolean"),caster)}};
+        }
         const auto here=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
         std::string key;void* targetEntity=nullptr;double best=1e18;
         for(const auto& [id,e]:enemies) {
-            if(!currentEnemy(e)||!spawnedEnemies.contains(id)||!api.value<bool>(entityAlive,e.entity))continue;
+            if(!currentEnemy(e)||!roomEnemy(id)||!api.value<bool>(entityAlive,e.entity))continue;
             const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
             const double d=double(p.x-here.x)*(p.x-here.x)+double(p.y-here.y)*(p.y-here.y)+double(p.z-here.z)*(p.z-here.z);
             if(d<best){best=d;key=id;targetEntity=e.entity;}
@@ -2069,7 +2523,7 @@ public:
             if(!body)throw std::runtime_error("该玩家没有原生角色");
             const auto from=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),body);double best=1e18;
             for(const auto& [id,e]:enemies) {
-                if(!currentEnemy(e)||!spawnedEnemies.contains(id)||!api.value<bool>(entityAlive,e.entity))continue;
+                if(!currentEnemy(e)||!roomEnemy(id)||!api.value<bool>(entityAlive,e.entity))continue;
                 const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
                 const double d=double(p.x-from.x)*(p.x-from.x)+double(p.y-from.y)*(p.y-from.y)+double(p.z-from.z)*(p.z-from.z);
                 if(d<best){best=d;key=id;}
@@ -2111,7 +2565,7 @@ public:
                 auto* sourceEntity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source);
                 // An enemy we simulate hits this player's operator natively (hit
                 // reaction, dodge, health). Anything else from a replica is a replay.
-                for(const auto& [owned,e]:enemies)if(e.entity==sourceEntity&&spawnedEnemies.contains(owned)) {
+                for(const auto& [owned,e]:enemies)if(e.entity==sourceEntity&&roomEnemy(owned)) {
                     if(ownerOf(owned)!=localPeer||!session->canAct(net.snapshot().localId))return true;
                     if(target==character)return false;
                     // A stand-in for another player: measured and forwarded below.
@@ -2119,7 +2573,11 @@ public:
                     return true;
                 }
             }
-            if(!target||!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),target)) return false;
+            // Resource objects and NPCs can take damage without an enemy
+            // controller. Guests must not mutate those private scene objects.
+            if(!target)return false;
+            if(!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),target))
+                return blockPrivateAction(net,"private_object_damage");
             auto key=entityKey(target);for(const auto& [owned,e]:enemies) if(e.entity==target) {key=owned;break;}
             bool authoritative=false,alive_=false;
             for(const auto& e:hosted.at("entities")) if(e.at("key")==key) {authoritative=true;alive_=e.at("hp").get<double>()>0;break;}
@@ -2135,7 +2593,7 @@ public:
             // This player's own attack on a room replica resolves locally, so it
             // keeps native animation, hit stop and damage numbers; beforeGuestHit
             // reports the result to the host, which owns the enemy's health.
-            return !spawnedEnemies.contains(key);
+            return !roomEnemy(key);
         }catch(const std::exception& e) {replicationError=e.what();return false;}
     }
     // Borrow cursor state only on a menu transition. Never force it every frame;
@@ -2169,6 +2627,9 @@ public:
             if(net.currentRole()!=Role::Offline&&now-lastSample>=33) {lastSample=now;sample(net);}
             localError.clear();
         } catch(const std::exception& e) {localError=e.what();character=nullptr;if(model) {try {dropLocalModel();} catch(...) {}}}
+#ifdef EFLINK_NATIVE_DIAGNOSTICS
+        runDiagnostics(); // lifecycle diagnostics must also execute while offline
+#endif
         if(nowMs()-lastReplication>=50) {
             lastReplication=nowMs();
             const auto started=std::chrono::steady_clock::now();
@@ -2196,11 +2657,19 @@ public:
         avatars.clear();
     }
     void shutdown() {
+#ifdef EFLINK_NATIVE_DIAGNOSTICS
+        if(!diagnosticFeedIds.empty())try {
+            leaveNative({diagnosticFeedIds.begin(),diagnosticFeedIds.end()});diagnosticFeedIds.clear();
+        }catch(...) {}
+#endif
         menu(runtime,false);
         try {restoreBackground();}catch(...) {}
         clear();
         dropActors();
-        dropEnemies();travel.reset();markers=nlohmann::json::array();
+        const bool inHostWorld=nativeFeedAdapter&&guestRealm;
+        dropEnemies();
+        if(inHostWorld)try {restorePrivateWorld();}catch(...) {}
+        travel.reset();markers=nlohmann::json::array();
         try {dropLocalModel();} catch(...) {}
         if(loader) {
             try {api.call(m("SimpleAssetLoader","Dispose","","System.Void","Common.Beyond.dll","Beyond.Resource"),loader);} catch(...) {}
@@ -2213,7 +2682,9 @@ public:
             {"visible",a.visible},{"native_entity",a.native},{"bones_matched",std::count_if(a.bones.begin(),a.bones.end(),[](void* b){return b!=nullptr;})},
             {"poses",a.poses},{"entity_moves",a.entityMoves},{"error",a.error}});
         nlohmann::json spawnStatus=nlohmann::json::array();for(const auto& [key,s]:spawnedEnemies) spawnStatus.push_back({{"key",key},{"submitted",s.data!=nullptr},
-            {"pipeline",s.pipeline},{"resources_complete",s.resourcesComplete},{"in_aoi",s.inAoi},{"preload",s.preload},{"started",s.started},{"initial_state_applied",s.initialStateApplied},{"error",s.error}});
+            {"pipeline",s.pipeline},{"resources_complete",s.resourcesComplete},{"in_aoi",s.inAoi},{"preload",s.preload},{"started",s.started},
+            {"native_data_ready",s.nativeDataReady},{"awaiting_native_entity",s.native&&s.nativeDataReady&&!s.started},
+            {"initial_state_applied",s.initialStateApplied},{"error",s.error}});
         nlohmann::json actorStatus=nlohmann::json::array();for(const auto& [peer,a]:actors)actorStatus.push_back({{"peer",peer},{"entity",a.id},{"template",a.templateId},
             {"registered",a.registered},{"inited",a.inited},{"started",a.started},{"waiting",a.waiting},{"bound",a.bound},
             {"hp",a.hp},{"max_hp",a.maxHp},{"skills",a.skillCount},{"casting",a.casting},{"ability_ticking",a.abilityTicking},
@@ -2223,9 +2694,19 @@ public:
         auto result=nlohmann::json{{"local_model",localModel},{"map_id",mapId},{"level_id",levelId},{"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",remote},{"markers",markers},
             {"world_replication",{{"native_entities",enemies.size()},{"private_enemies_quarantined",privateEnemies.size()},
-                {"room_owned_enemies",spawnedEnemies.size()},{"host_enemy_seeds",hostEnemySeeds.size()},{"matched",matchedEnemies},{"missing",missingEnemies},
+                {"guest_policy",{{"ready",guestGatesReady},{"restricted",guestRestrictionsActive},{"target_isolation_ready",privateTargetIsolationReady},
+                    {"targets_detached",std::count_if(privateEnemies.begin(),privateEnemies.end(),[](const auto& item){return item.second.battleTargetDetached;})},
+                    {"error",guestGateError},{"blocked",blockedGuestActions}}},
+                {"room_owned_enemies",spawnedEnemies.size()},{"host_enemy_seeds",hostEnemySeeds.size()},{"matched",matchedEnemies},{"missing",missingEnemies},{"deferred_native",deferredNativeEnemies},
+                {"native_feed",{{"enabled",nativeFeedAdapter},{"filter_active",feedFilterActive},{"entered",feed.entered},{"left",feed.left},
+                    {"private_recorded",privateRecords.size()},{"withheld",withheldCount},{"withheld_pending",withheldOfficial.size()},
+                    {"fed",std::count_if(spawnedEnemies.begin(),spawnedEnemies.end(),[](const auto& item){return item.second.native;})},
+                    {"ops_suppressed",opsSuppressed},{"known_fed_owners",nativeOpPolicy.fedCount()},{"retired_owners",nativeOpPolicy.retiredCount()},
+                    {"official_cached",officialMonsters.size()},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
+                {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
                 {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
+                    {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
                     {"owned_here",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second==localPeer;})},

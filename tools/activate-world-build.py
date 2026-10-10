@@ -66,6 +66,7 @@ if __name__ == '__main__':
     if room['password']:
         raise RuntimeError('Preserve private room: password is unavailable for automatic restoration')
     # Validate every index and package ID before disabling the running build.
+    old_registered = set()
     for index, record in indexes:
         config = json.loads(index.read_text(encoding='utf-8-sig'))
         existing = [m for m in config['modules'] if m['id'] == args.new]
@@ -75,7 +76,12 @@ if __name__ == '__main__':
             expected = root / 'build/dev' / args.new
             if Path(existing[0]['directory']).resolve() != expected.resolve() or (expected / f'native/windows-x64/{args.new}.dll').read_bytes() != (root / 'build' / (args.new + '.dll')).read_bytes():
                 raise RuntimeError('Registered package changed; preserve the loaded DLL')
-        if sum(m['id'] == args.old for m in config['modules']) != 1:
+        old_count = sum(m['id'] == args.old for m in config['modules'])
+        # The primary AppData file can serve only as RPC credentials while the
+        # framework index owns the loaded module. Do not fabricate an old entry.
+        if old_count == 1:
+            old_registered.add(index)
+        elif old_count != 0 or index != primary:
             raise RuntimeError('Old module is not registered exactly once')
         if record:
             import hashlib
@@ -87,6 +93,8 @@ if __name__ == '__main__':
     if not library.is_file():
         raise RuntimeError('Build the DLL first')
     for index, record in indexes:
+        if index not in old_registered:
+            continue
         command('set-enabled.py', args.old, 'off', '--index', index,
                 *(['--ownership-record', record] if record else []))
     time.sleep(2)
@@ -121,6 +129,8 @@ if __name__ == '__main__':
         # Pinned IDs cannot be reinitialized in every Host version. Preserve old
         # registrations for a normal restart instead of silently spawning processes.
         for index, record in indexes:
+            if index not in old_registered:
+                continue
             command('set-enabled.py', args.old, 'on', '--index', index,
                     *(['--ownership-record', record] if record else []))
         raise

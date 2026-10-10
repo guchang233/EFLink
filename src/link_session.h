@@ -261,7 +261,7 @@ public:
         realm.reconcile(net.snapshot(),epoch,value.at("map").get<std::string>(),value.at("level").get<std::string>());
         value["players"]=realm.json();
         world=std::move(value);seenAt=nowMs();
-        if(!force&&nowMs()-lastPublish<100) return true;
+        if(!force&&nowMs()-lastPublish<50) return true;
         lastPublish=nowMs();++revision;return send(net,{{"kind","snapshot"},{"epoch",epoch},{"revision",revision},{"world",world}});
     }
     void requestTeleport(Net& net,std::uint16_t target) {
@@ -380,6 +380,7 @@ public:
     }
     const Json& snapshot() const {return world;}
     std::uint64_t snapshotTime() const {return seenAt;}
+    std::uint64_t worldRevision() const {return revision;}
     std::uint64_t generation() const {return epoch;}
     Json takeTeleport() {auto out=teleport;teleport=Json::object();return out;}
     std::map<std::uint16_t,Json> takeActorTeleports() {std::map<std::uint16_t,Json> out;out.swap(actorTeleports);return out;}
