@@ -167,7 +167,34 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     const auto result=nextDamage(ability,modifier,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
+    if(!cleanupRequested)world.noteDamage("apply",ability,std::to_string(result));
     return result;
+}
+// Damage a body part passes on to its owner (monsters created with official
+// part data). Guest hits on room monsters are settled by the host here too.
+using ApplyTransferred=int(__fastcall*)(void*,void*,bool,void*);
+ApplyTransferred nextTransferred=nullptr;BE_ResolvedMethodV1 transferredMethod{};bool transferredHooked=false;
+int __fastcall onTransferred(void* ability,void* modifier,bool triggerEvent,void* info) {
+    if(!nextTransferred) return 0;
+    if(info&&info!=transferredMethod.method_info) return nextTransferred(ability,modifier,triggerEvent,info);
+    std::lock_guard lock(worldMutex);
+    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
+    const auto result=nextTransferred(ability,modifier,triggerEvent,info);
+    if(guestHit)world.afterGuestHit(net,*guestHit);
+    if(!cleanupRequested)world.noteDamage("transferred",ability,std::to_string(result));
+    return result;
+}
+// Observation only: whether the client considers the target immune.
+using DamageImmune=bool(__fastcall*)(void*,void*,void*);
+DamageImmune nextImmune=nullptr;BE_ResolvedMethodV1 immuneMethod{};bool immuneHooked=false;
+bool __fastcall onImmune(void* ability,void* modifier,void* info) {
+    if(!nextImmune) return false;
+    const bool immune=nextImmune(ability,modifier,info);
+    if(!info||info==immuneMethod.method_info) {
+        std::lock_guard lock(worldMutex);
+        if(!cleanupRequested)world.noteDamage("immune_check",ability,immune?"immune":"open");
+    }
+    return immune;
 }
 // Exact metadata signatures, shared hook ownership, and a role-dependent gate.
 // No input interception or sticky gameplay/UI-forbid handles are involved.
@@ -416,6 +443,14 @@ BE_Result installHook() {
         if(api->resolve_method(api->context,&damage,&damageMethod)==BE_Result_Ok&&damageMethod.method_pointer) {
             std::uint64_t damageHandle=0;damageHooked=host.hooks->create(host.hooks->context,kId,damageMethod.method_pointer,reinterpret_cast<void*>(onDamage),reinterpret_cast<void**>(&nextDamage),&damageHandle)==BE_Result_Ok;
         }
+        BE_MethodDescriptorV1 transferred{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","AbilitySystem","ApplyTransferredModifier","Beyond.Gameplay.Core.AbilitySystem.Modifier&|System.Boolean","Beyond.Gameplay.Core.AbilitySystem.Modifier.ApplyResult",2};
+        if(api->resolve_method(api->context,&transferred,&transferredMethod)==BE_Result_Ok&&transferredMethod.method_pointer) {
+            std::uint64_t transferredHandle=0;transferredHooked=host.hooks->create(host.hooks->context,kId,transferredMethod.method_pointer,reinterpret_cast<void*>(onTransferred),reinterpret_cast<void**>(&nextTransferred),&transferredHandle)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 immune{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","AbilitySystem","_CheckIsDamageImmune","Beyond.Gameplay.Core.AbilitySystem.Modifier&","System.Boolean",1};
+        if(api->resolve_method(api->context,&immune,&immuneMethod)==BE_Result_Ok&&immuneMethod.method_pointer) {
+            std::uint64_t immuneHandle=0;immuneHooked=host.hooks->create(host.hooks->context,kId,immuneMethod.method_pointer,reinterpret_cast<void*>(onImmune),reinterpret_cast<void**>(&nextImmune),&immuneHandle)==BE_Result_Ok;
+        }
         BE_MethodDescriptorV1 die{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","Entity","Die",nullptr,"System.Void",0};
         if(api->resolve_method(api->context,&die,&dieMethod)==BE_Result_Ok&&dieMethod.method_pointer) {
             std::uint64_t dieHandle=0;dieHooked=host.hooks->create(host.hooks->context,kId,dieMethod.method_pointer,reinterpret_cast<void*>(onDie),reinterpret_cast<void**>(&nextDie),&dieHandle)==BE_Result_Ok;
@@ -523,7 +558,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut}}}};
@@ -633,10 +668,11 @@ json perform(const json& input) {
         createdOps.clear();
         return {{"battle_ops",ops},{"created",created},{"fed",fed},{"diagnostic",true}};
     }
+    else if(action=="feed_option") {std::lock_guard lock(worldMutex);world.setFeedOption(input);}
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census") {
+    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe") {
         std::lock_guard lock(worldMutex);world.queueDiagnostic(input);return {{"queued",true},{"diagnostic",true}};}
     else if(action=="native_skill_probe") {std::lock_guard lock(worldMutex);world.queueNativeCast(input);return {{"queued",true},{"diagnostic",true}};}
 #endif
@@ -723,7 +759,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;
+        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     std::lock_guard lock(lifecycle);std::lock_guard lockWorld(worldMutex);host={};

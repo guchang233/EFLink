@@ -103,14 +103,16 @@ inline bool rawFields(std::string_view b,std::vector<RawField>& out) {
     }
     return true;
 }
-inline std::string officialMonsterForGuest(const std::string& raw,const float position[3],double hp) {
+inline std::string officialMonsterForGuest(const std::string& raw,const float position[3],double hp,bool detachScript=false) {
     std::vector<RawField> top;if(!rawFields(raw,top))throw std::runtime_error("official monster malformed");
     auto wrap=[](int field,const std::string& body){ProtoWriter w;w.key(field,2);w.varint(body.size());return w.bytes()+body;};
     std::string out;bool common=false;
     for(const auto& f:top) {
         if(f.field==1&&f.wire==2) {
             std::vector<RawField> c;if(!rawFields(f.payload,c))throw std::runtime_error("official common info malformed");
-            std::string body;for(const auto& g:c)if(g.field!=4&&g.field!=8)body.append(g.whole);
+            // detachScript (diagnostic): drop belong_level_script_id/slot so the
+            // monster is not bound to a level script inactive on this account.
+            std::string body;for(const auto& g:c)if(g.field!=4&&g.field!=8&&!(detachScript&&(g.field==6||g.field==9)))body.append(g.whole);
             ProtoWriter now;now.msg(4,vector3(position));now.f64(8,hp);body+=now.bytes();
             out+=wrap(1,body);common=true;
         } else if(f.field==5&&f.wire==2) {
@@ -121,6 +123,19 @@ inline std::string officialMonsterForGuest(const std::string& raw,const float po
     }
     if(!common)throw std::runtime_error("official monster has no common info");
     return out;
+}
+// SC_MOVE_OBJECT_MOVE{move_info[{objid, motion_info{position, rotation (Euler
+// degrees), speed, state}, server_time, scene_num_id}], server_notify}.
+struct MoveSample {std::uint64_t id=0;float position[3]{},rotation[3]{},speed[3]{};std::int32_t state=1,scene=0;std::uint32_t serverTime=0;};
+inline std::string moveObjects(const std::vector<MoveSample>& moves,bool serverNotify) {
+    ProtoWriter message;
+    for(const auto& m:moves) {
+        ProtoWriter motion;motion.msg(1,vector3(m.position));motion.msg(2,vector3(m.rotation));motion.msg(3,vector3(m.speed));motion.i32(4,m.state);
+        ProtoWriter info;info.u64(1,m.id);info.msg(2,motion);if(m.serverTime)info.u64(3,m.serverTime);info.i32(4,m.scene);
+        message.msg(1,info);
+    }
+    if(serverNotify)message.u64(2,1);
+    return message.bytes();
 }
 class NativeFeed {
     unity::Api api;const BE_HostApiV1* runtime=nullptr;
@@ -221,6 +236,30 @@ public:
     }
     // Replay a message exactly as the official server sent it (restoring a
     // private world after leaving a room).
+    // Native server-driven movement. The handler name follows the client's
+    // _Handle_<Message> convention; EntityManager.ServerMoveEntity is the
+    // documented receiver behind it.
+    std::uint64_t moved=0;std::string moveRoute;
+    void move(const std::vector<MoveSample>& moves,bool serverNotify) {
+        if(moves.empty())return;
+        const auto bytes=moveObjects(moves,serverNotify);
+        try {handle("SC_MOVE_OBJECT_MOVE","_Handle_MoveObjectMove",bytes);moveRoute="GameplayNetwork";}
+        catch(const std::exception&) {
+            auto* message=parse("SC_MOVE_OBJECT_MOVE",bytes);unity::Api::TemporaryRoot messageRoot(runtime,message);
+            auto klass=api.klass("EntityManager","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
+            auto* field=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,"s_manager");
+            void* manager=nullptr;if(field)symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field,&manager);
+            if(!manager)throw std::runtime_error("EntityManager unavailable");
+            api.call(api.method("EntityManager","ServerMoveEntity","Proto.SC_MOVE_OBJECT_MOVE","System.Void","Gameplay.Beyond.dll","Beyond.Gameplay.Core"),manager,{message});
+            moveRoute="EntityManager";
+        }
+        moved+=moves.size();
+    }
+    // Native battle property push: SC_ENTITY_PROPERTY_CHANGE{inst_id, info{hp}}.
+    void propertyHp(std::uint64_t instId,double hp) {
+        ProtoWriter info;info.f64(1,hp);ProtoWriter message;message.u64(1,instId);message.msg(2,info);
+        handle("SC_ENTITY_PROPERTY_CHANGE","_Handle_EntityPropertyChange",message.bytes());
+    }
     void replay(const std::string& type,const std::string& bytes) {
         if(type=="SC_OBJECT_ENTER_VIEW")handle("SC_OBJECT_ENTER_VIEW","_Handle_ObjectEnterView",bytes);
         else if(type=="SC_OBJECT_LEAVE_VIEW")handle("SC_OBJECT_LEAVE_VIEW","_Handle_ObjectLeaveView",bytes);
