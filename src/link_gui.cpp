@@ -210,6 +210,11 @@ struct Panel {
             const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
             if(ImGui::Combo("菜单快捷键",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
             if(ImGui::Button("保存设置")) save();ImGui::SameLine();ImGui::TextDisabled("收藏、名字与设置自动保存在本机。");
+            {
+                bool invincible=state.value("testing_invincible",false);
+                if(ImGui::Checkbox("测试用：本机角色无敌（不保存，重开游戏自动关闭）",&invincible)) call({{"action","testing_invincible"},{"enabled",invincible}});
+                if(invincible)ImGui::TextColored({1,.75f,.3f,1},"无敌已开启：本机干员受到的伤害被作废。测试完请关闭。");
+            }
             ImGui::Separator();ImGui::Text("房主世界接入");ImGui::TextWrapped("地图和实体加载完成后，还需完成客机世界隔离、逻辑玩家与房主规则接管。入场未完成时禁止客机结算战斗。");
             auto g=state.value("game",json::object());ImGui::Text("游戏接入：%s",state.value("hook_ready",false)?"已连接":"等待终末地场景");
             auto w=state.value("world_session",json::object());auto native=g.value("world_replication",json::object());

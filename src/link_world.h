@@ -148,7 +148,13 @@ class World {
     bool nativeMovePuppets=true,nativeMoveNotify=false,hostOwnsAll=false;
     // A native server move places the entity at once, so it is sent every frame
     // (0 ms): 20 Hz placement reads as stepping.
-    std::uint64_t nativeMoveIntervalMs=0;int feedScene=0;std::uint64_t lastNativeMove=0,nativeMoveErrors=0;std::string nativeMoveError;
+    std::uint64_t nativeMoveIntervalMs=0;
+    bool nativeMoveSpeed=true,nativeMoveState=true; // diagnostic toggles
+    // ServerMoveEntity steers a monster in combat toward the point rather than
+    // placing it; the host's interpolated position is pinned exactly as well.
+    bool nativeMovePin=true;std::vector<std::pair<void*,V3>> nativePins;std::uint64_t pinErrors=0;
+    // Per-frame motion trace of one guest puppet (diagnostic).
+    std::uint64_t traceId=0;int traceFrames=0;nlohmann::json motionTrace=nlohmann::json::array();std::uint64_t traceLastAt=0;int feedScene=0;std::uint64_t lastNativeMove=0,nativeMoveErrors=0;std::string nativeMoveError;
     std::map<std::string,Motion> motions;
     std::uint64_t lastOwnership=0,lastEnemyReport=0,ownershipChanges=0,enemyStatesSent=0,enemyStatesApplied=0,enemyMoves=0,enemyWalks=0,enemySnaps=0;
     bool replayingCast=false;
@@ -1871,6 +1877,20 @@ public:
         hostMapConsent.choose(token,follow);if(follow){travelState="queued";replicationError.clear();}
     }
     void damageHookSeen() {++damageHookCalls;}
+    // Testing aid (menu, not saved): damage to this player's own operators is
+    // discarded. Remote players' stand-ins and monsters are unaffected.
+    bool testingInvincible=false;std::uint64_t invincibleBlocked=0;
+    bool blocksLocalDamage(void* ability) {
+        if(!testingInvincible||!ability)return false;
+        try {
+            auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
+            if(!entity)return false;
+            for(const auto& [peer,actor]:actors)if(actor.entity==entity)return false;
+            auto* root=api.call(gm("Entity","get_rootCom","","Beyond.Gameplay.Core.RootComponent"),entity);
+            if(!root||classOf(root)!="Beyond.Gameplay.Core.CharacterRootComponent")return false;
+            ++invincibleBlocked;return true;
+        }catch(...) {return false;}
+    }
     // Receive filter (guest in a native room): this account's monster enter/leave
     // messages are withheld (kept in order for restoration on leave); messages
     // carrying the player's own characters always pass.
@@ -2239,14 +2259,28 @@ public:
         try {FeedScope scope(feedOperating);feed.bind(runtime);feed.move(nativeMoves,nativeMoveNotify);}
         catch(const std::exception& e) {++nativeMoveErrors;nativeMoveError=e.what();}
         nativeMoves.clear();
+        for(auto& [entity,p]:nativePins)try {
+            if(auto* movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),entity)) {
+                bool warning=false;api.call(gm("MovementComponent","TeleportTo","UnityEngine.Vector3|System.Boolean"),movement,{&p,&warning});
+            }
+        }catch(...) {++pinErrors;}
+        nativePins.clear();
     }
     void updateEnemyMotion() {
         const auto now=nowMs();if(now<100)return;const auto target=now-100;
-        struct Flush {World& w;std::uint64_t now;~Flush(){if(now-w.lastNativeMove>=w.nativeMoveIntervalMs||w.nativeMoves.size()>=64){w.lastNativeMove=now;w.flushNativeMoves();}else w.nativeMoves.clear();}} flush{*this,now};
+        if(traceFrames>0&&!traceId&&character) {
+            // nearest host monster to this player (game thread)
+            double best=1e9;const V3 self=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
+            for(const auto& [key,s]:spawnedEnemies)if(s.native)if(auto e=enemies.find(key);e!=enemies.end()&&currentEnemy(e->second)) {
+                const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e->second.entity);
+                const double d=std::hypot(p.x-self.x,p.z-self.z);if(d<best){best=d;traceId=s.serverId;}
+            }
+        }
+        struct Flush {World& w;std::uint64_t now;~Flush(){if(now-w.lastNativeMove>=w.nativeMoveIntervalMs||w.nativeMoves.size()>=64){w.lastNativeMove=now;w.flushNativeMoves();}else {w.nativeMoves.clear();w.nativePins.clear();}}} flush{*this,now};
         for(auto& [key,m]:motions) {
             if(m.samples.empty())continue;
             auto e=enemies.find(key);if(e==enemies.end()||!currentEnemy(e->second))continue;
-            if(e->second.mirroredCastAt) {
+            if(e->second.mirroredCastAt&&!nativeMovePuppets) {
                 if(now-e->second.mirroredCastAt<50)continue; // Allow the native timeline's first tick.
                 // Preserve actual native skill root motion, then resume as soon
                 // as the cast ends; a fixed timeout stalls short casts and can
@@ -2278,6 +2312,19 @@ public:
                 }
                 const float flatSpeed=std::sqrt(move.speed[0]*move.speed[0]+move.speed[2]*move.speed[2]);
                 move.state=flatSpeed>3.f?4:flatSpeed>.3f?3:1;
+                if(!nativeMoveState)move.state=1;
+                if(!nativeMoveSpeed)move.speed[0]=move.speed[1]=move.speed[2]=0;
+                if(traceFrames>0&&s->second.serverId==traceId) {
+                    // What moved the entity between our placements, and what the camera sees.
+                    const auto actual=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),entity);
+                    auto* component=api.call(entityModel,entity);auto* go=component?api.call(modelGo,component):nullptr;
+                    V3 shown=actual;if(go&&alive(go))shown=api.value<V3>(getPosition,api.call(getTransform,go));
+                    auto r3=[](float v){return std::round(v*1000.f)/1000.f;};
+                    motionTrace.push_back({now-traceLastAt,r3(actual.x-m.last.x),r3(actual.z-m.last.z),r3(shown.x-actual.x),r3(shown.z-actual.z),r3(p.x-m.last.x),r3(p.z-m.last.z)});
+                    traceLastAt=now;--traceFrames;
+                }
+                m.last=p;
+                if(nativeMovePin)nativePins.emplace_back(entity,p);
                 nativeMoves.push_back(move);m.applied=true;++enemyMoves;continue;
             }
             const auto actual=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),entity);
@@ -2495,6 +2542,13 @@ public:
         if(input.contains("native_move"))nativeMovePuppets=input.at("native_move").get<bool>();
         if(input.contains("native_move_notify"))nativeMoveNotify=input.at("native_move_notify").get<bool>();
         if(input.contains("host_owns_all"))hostOwnsAll=input.at("host_owns_all").get<bool>();
+        if(input.contains("native_move_speed"))nativeMoveSpeed=input.at("native_move_speed").get<bool>();
+        if(input.contains("native_move_state"))nativeMoveState=input.at("native_move_state").get<bool>();
+        if(input.contains("native_move_pin"))nativeMovePin=input.at("native_move_pin").get<bool>();
+        if(input.contains("trace_frames")) {
+            traceFrames=(std::min)(600,input.at("trace_frames").get<int>());traceId=input.value("trace_id",std::uint64_t(0));
+            motionTrace=nlohmann::json::array();traceLastAt=nowMs(); // id 0: chosen on the game thread
+        }
         if(input.contains("native_move_interval_ms"))nativeMoveIntervalMs=(std::min)(std::uint64_t(500),input.at("native_move_interval_ms").get<std::uint64_t>());
     }
     bool guestBlocksDeath(Net& net,void* entity) {
@@ -2879,7 +2933,7 @@ public:
                     {"private_recorded",privateRecords.size()},{"withheld",withheldCount},{"withheld_pending",withheldOfficial.size()},
                     {"fed",std::count_if(spawnedEnemies.begin(),spawnedEnemies.end(),[](const auto& item){return item.second.native;})},
                     {"ops_suppressed",opsSuppressed},{"known_fed_owners",nativeOpPolicy.fedCount()},{"retired_owners",nativeOpPolicy.retiredCount()},
-                    {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"detach_scripts",detachFedScripts},{"private_leave_skipped",privateLeaveSkipped},{"feed_waits_for_release",feedWaitsForRelease},{"scene_mode",hostModeId},{"host_owns_all",hostOwnsAll},{"in_subgame",hostInSubGame},{"native_move",nativeMovePuppets},{"native_move_interval_ms",nativeMoveIntervalMs},{"native_moves_sent",feed.moved},{"native_move_route",feed.moveRoute},{"native_move_errors",nativeMoveErrors},{"native_move_error",nativeMoveError},{"damage_census",damageCensus},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
+                    {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"detach_scripts",detachFedScripts},{"private_leave_skipped",privateLeaveSkipped},{"feed_waits_for_release",feedWaitsForRelease},{"scene_mode",hostModeId},{"host_owns_all",hostOwnsAll},{"in_subgame",hostInSubGame},{"native_move",nativeMovePuppets},{"native_move_speed",nativeMoveSpeed},{"native_move_pin",nativeMovePin},{"pin_errors",pinErrors},{"native_move_state",nativeMoveState},{"trace_id",traceId},{"trace_left",traceFrames},{"motion_trace",motionTrace},{"native_move_interval_ms",nativeMoveIntervalMs},{"native_moves_sent",feed.moved},{"native_move_route",feed.moveRoute},{"native_move_errors",nativeMoveErrors},{"native_move_error",nativeMoveError},{"damage_census",damageCensus},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
                 {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
                 {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},

@@ -161,6 +161,7 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     if(info&&info!=damageMethod.method_info) return nextDamage(ability,modifier,info);
     std::lock_guard lock(worldMutex);
     if(!cleanupRequested)world.damageHookSeen();
+    if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
     if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
@@ -178,6 +179,7 @@ int __fastcall onTransferred(void* ability,void* modifier,bool triggerEvent,void
     if(!nextTransferred) return 0;
     if(info&&info!=transferredMethod.method_info) return nextTransferred(ability,modifier,triggerEvent,info);
     std::lock_guard lock(worldMutex);
+    if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
     const auto result=nextTransferred(ability,modifier,triggerEvent,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
@@ -558,7 +560,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut}}}};
@@ -668,6 +670,7 @@ json perform(const json& input) {
         createdOps.clear();
         return {{"battle_ops",ops},{"created",created},{"fed",fed},{"diagnostic",true}};
     }
+    else if(action=="testing_invincible") {std::lock_guard lock(worldMutex);world.testingInvincible=input.at("enabled").get<bool>();}
     else if(action=="feed_option") {std::lock_guard lock(worldMutex);world.setFeedOption(input);}
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
