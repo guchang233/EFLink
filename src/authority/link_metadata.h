@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -70,6 +71,96 @@ public:
             if(!klass.empty()&&std::string(klassName(c)).find(klass)==std::string::npos)return;
             out.push_back(qualified(c,m,true));
         });
+        return out;
+    }
+    // Classes named `name` (any namespace): parents, static fields (with the
+    // class of the object they hold), instance fields.
+    nlohmann::json classInfo(const std::string& name,std::size_t limit=6) const {
+        static auto klassName=symbol<const char*(*)(const void*)>("il2cpp_class_get_name");
+        static auto klassSpace=symbol<const char*(*)(const void*)>("il2cpp_class_get_namespace");
+        static auto parent=symbol<const void*(*)(const void*)>("il2cpp_class_get_parent");
+        static auto fieldsOf=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_fields");
+        static auto fieldName=symbol<const char*(*)(const void*)>("il2cpp_field_get_name");
+        static auto fieldType=symbol<const void*(*)(const void*)>("il2cpp_field_get_type");
+        static auto fieldFlags=symbol<int(*)(const void*)>("il2cpp_field_get_flags");
+        static auto staticValue=symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value");
+        static auto typeKind=symbol<int(*)(const void*)>("il2cpp_type_get_type");
+        static auto objectClass=symbol<const void*(*)(void*)>("il2cpp_object_get_class");
+        static auto classInit=symbol<void(*)(const void*)>("il2cpp_runtime_class_init");
+        nlohmann::json out=nlohmann::json::array();std::set<const void*> seen;
+        auto domainGet=symbol<void*(*)()>("il2cpp_domain_get");
+        auto assemblies=symbol<void**(*)(void*,std::size_t*)>("il2cpp_domain_get_assemblies");
+        auto imageOf=symbol<const void*(*)(const void*)>("il2cpp_assembly_get_image");
+        auto classCount=symbol<std::size_t(*)(const void*)>("il2cpp_image_get_class_count");
+        auto classAt=symbol<const void*(*)(const void*,std::size_t)>("il2cpp_image_get_class");
+        std::size_t count=0;auto** list=assemblies(domainGet(),&count);
+        for(std::size_t a=0;a<count&&out.size()<limit;++a) {
+            const auto* image=imageOf(list[a]);if(!image)continue;
+            for(std::size_t c=0,n=classCount(image);c<n&&out.size()<limit;++c) {
+                const auto* klass=classAt(image,c);if(!klass||name!=klassName(klass)||!seen.insert(klass).second)continue;
+                nlohmann::json info;info["class"]=std::string(klassSpace(klass))+"."+klassName(klass);
+                nlohmann::json parents=nlohmann::json::array();for(auto* p=parent(klass);p;p=parent(p))parents.push_back(std::string(klassSpace(p))+"."+klassName(p));
+                info["parents"]=parents;info["static"]=nlohmann::json::array();info["instance"]=nlohmann::json::array();
+                for(const void* k=klass;k;k=parent(k)) {
+                    void* it=nullptr;
+                    while(const auto* field=fieldsOf(k,&it)) {
+                        const auto* type=fieldType(field);nlohmann::json row={{"name",fieldName(field)},{"type",typeText(type)},{"declared",klassName(k)}};
+                        if(fieldFlags(field)&0x10) {
+                            const int kind=typeKind(type);
+                            if(kind==0x12||kind==0x15||kind==0x1c) { // class, generic instance, object
+                                classInit(k);void* value=nullptr;staticValue(field,&value);
+                                row["holds"]=value?std::string(klassSpace(objectClass(value)))+"."+klassName(objectClass(value)):"null";
+                            }
+                            info["static"].push_back(row);
+                        } else if(info["instance"].size()<80) info["instance"].push_back(row);
+                    }
+                }
+                out.push_back(std::move(info));
+            }
+        }
+        return out;
+    }
+    // Instance field values of an object (primitives and strings; other types by name).
+    nlohmann::json fields(void* object,std::size_t limit=48) const {
+        static auto classOf=symbol<const void*(*)(void*)>("il2cpp_object_get_class");
+        static auto parent=symbol<const void*(*)(const void*)>("il2cpp_class_get_parent");
+        static auto fieldsOf=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_fields");
+        static auto fieldName=symbol<const char*(*)(const void*)>("il2cpp_field_get_name");
+        static auto fieldType=symbol<const void*(*)(const void*)>("il2cpp_field_get_type");
+        static auto fieldOffset=symbol<std::size_t(*)(const void*)>("il2cpp_field_get_offset");
+        static auto fieldFlags=symbol<int(*)(const void*)>("il2cpp_field_get_flags");
+        static auto typeKind=symbol<int(*)(const void*)>("il2cpp_type_get_type");
+        static auto stringLength=symbol<int(*)(void*)>("il2cpp_string_length");
+        static auto stringChars=symbol<const char16_t*(*)(void*)>("il2cpp_string_chars");
+        nlohmann::json out=nlohmann::json::object();if(!object)return out;
+        for(const void* klass=classOf(object);klass&&out.size()<limit;klass=parent(klass)) {
+            void* it=nullptr;
+            while(const auto* field=fieldsOf(klass,&it)) {
+                if(out.size()>=limit)break;
+                if(fieldFlags(field)&0x10)continue; // static
+                const auto* type=fieldType(field);const auto* at=static_cast<const unsigned char*>(object)+fieldOffset(field);
+                nlohmann::json value;
+                switch(typeKind(type)) {
+                    case 0x02:value=*reinterpret_cast<const bool*>(at);break;
+                    case 0x04:case 0x05:value=int(*reinterpret_cast<const std::int8_t*>(at));break;
+                    case 0x06:case 0x07:value=int(*reinterpret_cast<const std::int16_t*>(at));break;
+                    case 0x08:value=*reinterpret_cast<const std::int32_t*>(at);break;
+                    case 0x09:value=*reinterpret_cast<const std::uint32_t*>(at);break;
+                    case 0x0a:value=*reinterpret_cast<const std::int64_t*>(at);break;
+                    case 0x0b:value=*reinterpret_cast<const std::uint64_t*>(at);break;
+                    case 0x0c:value=*reinterpret_cast<const float*>(at);break;
+                    case 0x0d:value=*reinterpret_cast<const double*>(at);break;
+                    case 0x0e: {
+                        void* text=*reinterpret_cast<void* const*>(at);std::string utf8;
+                        if(text){const auto n=stringLength(text);const auto* c=stringChars(text);for(int i=0;i<n&&i<200;++i){const auto ch=c[i];if(ch<0x80)utf8+=char(ch);else if(ch<0x800){utf8+=char(0xC0|(ch>>6));utf8+=char(0x80|(ch&0x3F));}else{utf8+=char(0xE0|(ch>>12));utf8+=char(0x80|((ch>>6)&0x3F));utf8+=char(0x80|(ch&0x3F));}}}
+                        value=text?nlohmann::json(utf8):nlohmann::json(nullptr);break;
+                    }
+                    case 0x11:value="<"+typeText(type)+">";if(typeText(type)=="UnityEngine.Vector3"){const auto* v=reinterpret_cast<const float*>(at);value={v[0],v[1],v[2]};}break;
+                    default:value="<"+typeText(type)+">";
+                }
+                out[fieldName(field)]=value;
+            }
+        }
         return out;
     }
     // Resolve return addresses inside GameAssembly to "Class::Method+offset".

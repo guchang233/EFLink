@@ -210,6 +210,15 @@ struct Panel {
             const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
             if(ImGui::Combo("菜单快捷键",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
             if(ImGui::Button("保存设置")) save();ImGui::SameLine();ImGui::TextDisabled("收藏、名字与设置自动保存在本机。");
+            ImGui::Separator();
+            if(ImGui::Button("应急回到四号谷地")) call({{"action","emergency_home"}});
+            ImGui::SameLine();ImGui::TextDisabled("会先离开房间，再用官方传送回四号谷地的枢纽。");
+            {
+                auto teleport=state.value("game",json::object()).value("world_replication",json::object()).value("official_teleport",json::object());
+                if(teleport.contains("error"))ImGui::TextColored({1,.45f,.4f,1},"官方传送失败：%s",teleport.value("error",std::string{}).c_str());
+                else if(teleport.contains("hub"))ImGui::TextDisabled("最近一次官方传送：%s / %s",teleport.value("map",std::string{}).c_str(),teleport.value("hub",std::string{}).c_str());
+                else if(teleport.value("state",std::string{})=="queued")ImGui::TextDisabled("应急传送已排队：离房并恢复后执行");
+            }
             {
                 bool invincible=state.value("testing_invincible",false);
                 if(ImGui::Checkbox("测试用：本机角色无敌（不保存，重开游戏自动关闭）",&invincible)) call({{"action","testing_invincible"},{"enabled",invincible}});

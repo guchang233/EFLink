@@ -381,6 +381,7 @@ std::uint64_t __fastcall onSend(void* netSession,void* message,void* info) {
                 void* frames[40]{};const auto n=RtlCaptureStackBackTrace(1,40,frames,nullptr);
                 std::vector<std::uintptr_t> stack;for(USHORT i=0;i<n;++i)stack.push_back(reinterpret_cast<std::uintptr_t>(frames[i]));
                 world.recordSendTrace(name,std::move(stack));
+                if(std::strcmp(name,"CS_SCENE_TELEPORT")==0&&world.teleportBodies.size()<8)world.teleportBodies.push_back(officialCodec.serialize(message,64*1024));
             }
 #endif
         }
@@ -680,12 +681,17 @@ json perform(const json& input) {
         createdOps.clear();
         return {{"battle_ops",ops},{"created",created},{"fed",fed},{"diagnostic",true}};
     }
+    else if(action=="emergency_home") {
+        // Leave first; the world teleports once the private world is restored.
+        if(net.currentRole()!=eflink::Role::Offline)net.leave();
+        std::lock_guard lock(worldMutex);world.requestEmergencyHome();
+    }
     else if(action=="testing_invincible") {std::lock_guard lock(worldMutex);world.testingInvincible=input.at("enabled").get<bool>();}
     else if(action=="feed_option") {std::lock_guard lock(worldMutex);world.setFeedOption(input);}
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe"||action=="meta_search"||action=="send_traces") {
+    else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe"||action=="meta_search"||action=="send_traces"||action=="teleport_marks"||action=="class_info") {
         std::lock_guard lock(worldMutex);world.queueDiagnostic(input);return {{"queued",true},{"diagnostic",true}};}
     else if(action=="native_skill_probe") {std::lock_guard lock(worldMutex);world.queueNativeCast(input);return {{"queued",true},{"diagnostic",true}};}
 #endif
