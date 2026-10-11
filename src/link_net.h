@@ -166,7 +166,7 @@ private:
     struct Member {
         std::uint16_t id=0;
         Connection tcp;
-        sockaddr_in udp{};bool udpKnown=false;
+        sockaddr_in udp{};bool udpKnown=false;std::uint64_t joinedAt=0;
         std::uint32_t token=0;
         bool welcomed=false;
         std::string address;
@@ -198,6 +198,9 @@ private:
     std::map<std::uint16_t,PeerView> peers;           // everyone but the local player
     Connection server;sockaddr_in serverUdp{};        // client: link to the host
     bool udpWelcomed=false;std::string joinPassword;std::uint64_t joinStarted=0;
+    // Without a UDP path (TCP-only port forwarding) player states travel over TCP.
+    static constexpr std::uint64_t kUdpGraceMs=3000;
+    bool tcpStates() const {return role.load()==Role::Client&&!udpWelcomed&&joinStarted&&nowMs()-joinStarted>kUdpGraceMs;}
     std::uint64_t lastBeacon=0,lastDiscover=0,lastPing=0,lastUdpHello=0,lastInfoSent=0,discoverReplyAt=0;
     std::uint32_t rtt=0,stateSequence=0;
     std::uint64_t bytesIn=0,bytesOut=0,statesIn=0,statesOut=0;
@@ -434,7 +437,7 @@ private:
         if(proof!=proto::passwordProof(0,options.password)) {reject(m.tcp,"password");return;}
         if(members.size()+1>=options.maxPlayers) {reject(m.tcp,"full");return;}
         std::uint16_t id=2;while(members.contains(id)) ++id;
-        m.id=id;m.token=random();m.welcomed=true;m.udp.sin_port=htons(udpPort);m.udpKnown=false;
+        m.id=id;m.token=random();m.welcomed=true;m.udp.sin_port=htons(udpPort);m.udpKnown=false;m.joinedAt=nowMs();
         proto::Writer welcome;welcome.u16(id).u32(roomId).u32(m.token).str(options.roomName,64).u8(std::uint8_t(options.maxPlayers)).u16(proto::kHostId);
         queue(m.tcp,proto::Tcp::Welcome,welcome);
         // Bring the newcomer up to date with everyone already in the room.
@@ -447,12 +450,27 @@ private:
     void relayFrame(std::uint16_t except,proto::Tcp type,const proto::Writer& payload) {
         for(auto& [id,m]:members) if(id!=except&&m.welcomed) queue(m.tcp,type,payload);
     }
+    // Host: send a player's state to every other member, by UDP when its path is
+    // known, otherwise over TCP once the member is past the UDP grace period.
+    void relayState(std::uint16_t from,const proto::PlayerState& state) {
+        auto datagram=proto::udpHeader(proto::Udp::State,roomId);proto::write(datagram,state);
+        proto::Writer frame;proto::write(frame,state);
+        for(auto& [id,other]:members) {
+            if(id==from)continue;
+            if(other.udpKnown)sendTo(udp,other.udp,datagram.bytes);
+            else if(other.welcomed&&nowMs()-other.joinedAt>kUdpGraceMs)queue(other.tcp,proto::Tcp::State,frame);
+        }
+    }
     void hostFrame(Member& m,proto::Tcp type,proto::Reader& r) {
         switch(type) {
         case proto::Tcp::PlayerInfo: {
             auto info=proto::readPlayerInfo(r);info.id=m.id;
             auto& peer=peers[m.id];peer.id=m.id;peer.info=info;peer.hasInfo=true;peer.address=m.address;
             proto::Writer w;proto::write(w,info);relayFrame(m.id,proto::Tcp::PlayerInfo,w);publishPeers();break;
+        }
+        case proto::Tcp::State: {
+            auto state=proto::readPlayerState(r);state.id=m.id;storeState(state);++statesIn;
+            relayState(m.id,state);break;
         }
         case proto::Tcp::Chat: {
             auto line=r.str(1024);const auto who=peers[m.id].info.name;
@@ -491,8 +509,7 @@ private:
         m->tcp.lastHeard=nowMs();
         if(type==proto::Udp::State) {
             auto state=proto::readPlayerState(r);state.id=m->id;storeState(state);
-            auto w=proto::udpHeader(proto::Udp::State,roomId);proto::write(w,state);
-            for(auto& [id,other]:members) if(id!=m->id&&other.udpKnown) sendTo(udp,other.udp,w.bytes);
+            relayState(m->id,state);
         } else if(type==proto::Udp::Data) {
             r.u16();const auto to=r.u16();const auto channel=r.u32();const auto size=r.u16();
             if(size>proto::kMaxUnreliableData) return;
@@ -533,6 +550,9 @@ private:
                 notice(who+" 离开了房间（"+reason+"）");
             }
             break;
+        }
+        case proto::Tcp::State: {
+            auto state=proto::readPlayerState(r);if(state.id!=localId) {storeState(state);++statesIn;}break;
         }
         case proto::Tcp::Chat: {
             const auto from=r.u16();const auto line=r.str(1024);
@@ -633,8 +653,9 @@ private:
             state.id=localId;state.sequence=++stateSequence;
             auto w=proto::udpHeader(proto::Udp::State,roomId);proto::write(w,state);
             if(w.bytes.size()>proto::kMaxDatagram) return;
-            if(role.load()==Role::Host) {for(auto& [id,m]:members) if(m.udpKnown) sendTo(udp,m.udp,w.bytes);++statesOut;}
+            if(role.load()==Role::Host) {relayState(localId,state);++statesOut;}
             else if(role.load()==Role::Client&&udpWelcomed) {sendTo(udp,serverUdp,w.bytes);++statesOut;}
+            else if(tcpStates()) {proto::Writer frame;proto::write(frame,state);queue(server,proto::Tcp::State,frame);++statesOut;}
             std::lock_guard lock(viewMutex);
             if(!view.peers.empty()&&view.peers.front().local) {
                 view.peers.front().states.push_back({state,now});

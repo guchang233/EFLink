@@ -32,7 +32,8 @@ constexpr std::uint16_t kHostId=1;
 constexpr std::uint16_t kEveryone=0xFFFF;
 
 enum class Udp:std::uint8_t {Beacon=1,Discover=2,Hello=3,Welcome=4,State=5,Data=6,Ping=7,Pong=8};
-enum class Tcp:std::uint8_t {Hello=1,Welcome=2,Reject=3,PlayerInfo=4,PlayerLeave=5,Chat=6,Data=7,Bye=8,KeepAlive=9};
+// State: a player state over TCP when UDP cannot get through (TCP-only port forwarding).
+enum class Tcp:std::uint8_t {Hello=1,Welcome=2,Reject=3,PlayerInfo=4,PlayerLeave=5,Chat=6,Data=7,Bye=8,KeepAlive=9,State=10};
 
 inline std::uint32_t fnv32(std::string_view text) {
     std::uint32_t hash=2166136261u;for(unsigned char c:text) {hash^=c;hash*=16777619u;}return hash;

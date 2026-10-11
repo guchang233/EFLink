@@ -12,6 +12,7 @@
 #include <map>
 #include <deque>
 #include "link_settings.h"
+#include "link_version.h"
 #include "authority/native_proto_codec.h"
 
 using nlohmann::json;
@@ -20,7 +21,7 @@ namespace {
 #define EFLINK_MODULE_ID "eflink.core"
 #endif
 constexpr char kId[]=EFLINK_MODULE_ID;
-constexpr char kVersion[]="1.2.0-dev";
+constexpr char kVersion[]=EFLINK_VERSION;
 
 BE_ThirdPartyHostV1 host{};
 std::recursive_mutex lifecycle;

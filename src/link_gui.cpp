@@ -1,3 +1,4 @@
+#include "link_version.h"
 #include "link_gui.h"
 #include "link_settings.h"
 #include <windows.h>
@@ -122,7 +123,7 @@ struct Panel {
         ImGui::Separator();
         ImGui::BeginChild("navigation",{164,-42},false);const char* labels[]={"局域网房间","直接连接 / 收藏","开放房间","房间玩家","房间聊天","设置 / 诊断"};
         for(int i=0;i<6;++i) {if(ImGui::Selectable(labels[i],tab==i,0,{0,36})) tab=i;}
-        ImGui::Spacing();ImGui::Separator();ImGui::TextDisabled("菜单：F%d",key-VK_F1+1);ImGui::TextWrapped("连接后可关闭菜单，联机继续运行。");
+        ImGui::Spacing();ImGui::Separator();if(key==VK_OEM_PLUS)ImGui::TextDisabled("菜单：=");else ImGui::TextDisabled("菜单：F%d",key-VK_F1+1);ImGui::TextWrapped("连接后可关闭菜单，联机继续运行。");
         ImGui::EndChild();ImGui::SameLine();ImGui::BeginChild("content",{0,-42},false);
         if(tab==0) {
             ImGui::Text("局域网房间");ImGui::SameLine();if(ImGui::Button("刷新列表")) call({{"action","refresh"}});
@@ -253,11 +254,12 @@ struct Panel {
                 auto traffic=state.value("traffic",json::object());
                 if(role=="client") {
                     if(traffic.value("udp_pongs",std::uint64_t(0))>0)ImGui::TextDisabled("UDP 已连通  ·  收到状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-                    else ImGui::TextColored({1,.6f,.3f,1},"UDP 未连通：位置与动作无法同步。端口转发需同时开 TCP 和 UDP，且远程端口相同。");
+                    else if(traffic.value("states_in",std::uint64_t(0))>0)ImGui::TextColored({.9f,.8f,.3f,1},"UDP 未连通，已改用 TCP 同步（收到状态 %llu）",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
+                    else ImGui::TextColored({1,.6f,.3f,1},"UDP 未连通，正在改用 TCP 同步……");
                 } else if(role=="host")ImGui::TextDisabled("收到玩家状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
             }
             if(auto error=g.value("error",std::string{});!error.empty()) ImGui::TextWrapped("游戏接入：%s",error.c_str());
-            ImGui::TextDisabled("EF Link 1.2.0-dev  /  Windows x64  /  Better-Endfield 模块");
+            ImGui::TextDisabled("EF Link %s  /  Windows x64  /  Better-Endfield 模块",EFLINK_VERSION);
         }
         auto error=state.value("last_error",std::string{});if(!feedback.empty()||!error.empty()) {ImGui::Separator();ImGui::TextColored({1,.65f,.4f,1},"%s",(!feedback.empty()?feedback:error).c_str());}
         ImGui::EndChild();ImGui::Separator();

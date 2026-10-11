@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 MANIFEST = json.loads((ROOT / "module.json").read_text(encoding="utf-8"))
 VERSION = MANIFEST["version"]
+_HEADER = (ROOT / "src/link_version.h").read_text(encoding="utf-8")
+if f'"{VERSION}"' not in _HEADER:
+    raise SystemExit(f"src/link_version.h does not match module.json version {VERSION}")
 
 def archive(name, files):
     target = DIST / name
