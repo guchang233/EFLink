@@ -263,12 +263,23 @@ struct Panel {
         const auto token=change.value("token",std::uint64_t(0));
         auto blockers=state.value("world_session",json::object()).value("entry",json::object()).value("blockers",json::array());
         const bool supported=std::find(blockers.begin(),blockers.end(),json("host_scene_rules"))==blockers.end();
+        {
+            // Travel failures (follow / teleport to a player) are shown, not only logged.
+            auto native=state.value("game",json::object()).value("world_replication",json::object());
+            if(native.value("teleport",std::string{})=="failed"&&!native.value("error",std::string{}).empty())
+                ImGui::TextColored({1,.45f,.4f,1},"传送失败：%s",native.value("error",std::string{}).c_str());
+        }
         if(pending) {
             ImGui::TextColored({.85f,.93f,.35f,1},"房主已切换地图：%s",change.value("level",std::string{}).c_str());
             if(change.value("deferred",false)) {
                 ImGui::TextDisabled("已暂不跟随，联机战斗暂停；可稍后跟随或离开房间。");
                 ImGui::BeginDisabled(!supported);if(ImGui::Button("现在跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
-            }else if(token!=lastMapPrompt) {lastMapPrompt=token;ImGui::OpenPopup("房主切换地图");}
+            }else {
+                // Always offer the choice inline: the reminder popup closes with the menu.
+                ImGui::BeginDisabled(!supported);if(ImGui::Button("跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
+                ImGui::SameLine();if(ImGui::Button("暂不跟随"))call({{"action","host_map_choice"},{"token",token},{"follow",false}});
+                if(token!=lastMapPrompt) {lastMapPrompt=token;ImGui::OpenPopup("房主切换地图");}
+            }
         }
         if(ImGui::BeginPopupModal("房主切换地图",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {
             if(!pending)ImGui::CloseCurrentPopup();

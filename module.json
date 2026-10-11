@@ -3,7 +3,7 @@
   "id": "eflink.core",
   "name": "EF Link · 终末地联机",
   "author": "EF Link contributors",
-  "version": "1.4.1-dev",
+  "version": "1.5.0",
   "abi": 1,
   "libraries": {"windows-x64": "native/windows-x64/eflink.core.dll"},
   "default_configuration": {

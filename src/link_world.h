@@ -1430,7 +1430,7 @@ class World {
             if(travel->dungeonStage==1) {if(inDungeon) {travelState="leaving_dungeon";return;}travel->dungeonStage=0;travel->started=false;}
             if(travel->dungeonStage==2) {if(current!=travel->dungeon||!started) {travelState="entering_dungeon";return;}travel->dungeonStage=0;travel->started=false;travel->observedLoading=false;}
             if(inDungeon&&current!=travel->dungeon) {
-                api.call(gm("DungeonManager","LeaveDungeon"),dungeon);
+                {OwnOfficial own(ownOfficialAction);api.call(gm("DungeonManager","LeaveDungeon"),dungeon);}
                 travel->dungeonStage=1;travelState="leaving_dungeon";return;
             }
             if(!travel->dungeon.empty()&&!inDungeon) {
@@ -1443,6 +1443,7 @@ class World {
                 auto* bag=player?readField<void*>(player,"GamePlayer","charBag","Beyond.Gameplay"):nullptr;
                 int team=bag?api.value<int>(gm("CharBagSystem","get_curTeamIndex","","System.Int32","Beyond.Gameplay"),bag):0;
                 auto* preset=api.string("");
+                OwnOfficial own(ownOfficialAction);
                 const bool requested=api.value<bool>(gm("DungeonManager","TryReqEnterDungeon","System.String|System.String|System.Int32","System.Boolean"),dungeon,{id,preset,&team});
                 if(!requested)throw std::runtime_error("游戏拒绝了进入副本 "+travel->dungeon+" 的请求（条件不满足）");
                 officialTeleportStatus={{"purpose","follow_dungeon"},{"dungeon",travel->dungeon},{"team",team},{"at",nowMs()}};
@@ -1561,6 +1562,7 @@ class World {
         // scene number from it) and the default teleport UI (with its loading view).
         int ui=enumValue<int>("TeleportUIType","Default","Beyond.Gameplay");int options=0;
         V3 position=best->position,rotation=best->rotation;std::uint32_t node=std::uint32_t(best->node);
+        OwnOfficial own(ownOfficialAction);
         api.call(gm("GameAction","TeleportToPosition","Beyond.GEnums.C2STeleportReason|System.String|UnityEngine.Vector3|UnityEngine.Vector3|Beyond.Gameplay.TeleportUIType|Beyond.Gameplay.TeleportOptions|System.Action|System.UInt32","System.Void","Beyond.Gameplay.Actions"),
             nullptr,{&reason,api.string(best->level),&position,&rotation,&ui,&options,nullptr,&node});
         ++officialTeleports;
@@ -2107,7 +2109,12 @@ public:
         }
         return true;
     }
+    // EF Link's own official moves (follow, teleport to a player, emergency home)
+    // pass the guest restrictions; the player's own private ones stay blocked.
+    int ownOfficialAction=0;
+    struct OwnOfficial {int& depth;explicit OwnOfficial(int& d):depth(d){++depth;}~OwnOfficial(){--depth;}};
     bool blockPrivateAction(Net& net,const char* action) {
+        if(ownOfficialAction>0)return false;
         if(!privateActionsRestricted(net))return false;
         ++blockedGuestActions[action];return true;
     }

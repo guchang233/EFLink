@@ -86,6 +86,10 @@ class Session {
         if(auto state=nativeState(target);state&&p->info.mapId==world.value("map",std::string{})&&p->info.levelId==world.value("level",std::string{}))
             request["position"]=state->position;
         if(target==proto::kHostId&&!world.empty()) request["level_num"]=world.value("level_num",0);
+        // The target's dungeon (the room world's, when the target is in it): the
+        // traveller enters it through the official dungeon flow.
+        if(!world.empty()&&p->info.mapId==world.value("map",std::string{})&&p->info.levelId==world.value("level",std::string{}))
+            request["dungeon"]=world.value("dungeon",std::string{});
         else if(auto it=locations.find(target);it!=locations.end()&&it->second.value("map",std::string{})==p->info.mapId&&it->second.value("level",std::string{})==p->info.levelId) request["level_num"]=it->second.value("level_num",0);
         if(actor==s.localId) teleport=request;
         else if(send(net,request,actor)&&role==Role::Host&&request.at("map")==world.value("map",std::string{})&&request.at("level")==world.value("level",std::string{}))
@@ -168,6 +172,7 @@ public:
                     sequences[packet.from]=seq;routeTeleport(net,s,packet.from,b.at("target").get<std::uint16_t>(),seq);
                 } else if(kind=="teleport"&&role==Role::Client&&packet.from==proto::kHostId) {
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!validVector(b.at("position"))||b.at("map").get<std::string>().size()>64||b.at("level").get<std::string>().size()>64) {++rejected;continue;}
+                    if(b.contains("dungeon")&&(!b.at("dungeon").is_string()||b.at("dungeon").get<std::string>().size()>96)) {++rejected;continue;}
                     teleport=b;teleport["issued"]=nowMs();
                 } else if(kind=="teleport_error"&&role==Role::Client&&packet.from==proto::kHostId) error=b.at("message").get<std::string>().substr(0,512);
                 else if(kind=="skill_intent"&&role==Role::Host&&combat) {
