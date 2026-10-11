@@ -123,6 +123,7 @@ class World {
         bool official=false; // an official hub teleport to the target map is in flight
         std::string dungeon; // host's dungeon ID ("" = overworld)
         int dungeonStage=0;  // 1 leaving this account's dungeon, 2 entering the host's
+        int inMapLoads=0;    // same-map loads tried (bounded: never loop)
     };
     // Official teleports (the map screen's own GameAction.TeleportToPosition to one
     // of this account's factory hubs). The official server validates the hub.
@@ -1436,8 +1437,6 @@ class World {
             if(!travel->dungeon.empty()&&!inDungeon) {
                 if(!dungeon)throw std::runtime_error("副本管理器尚未就绪");
                 auto* id=api.string(travel->dungeon);
-                if(!api.value<bool>(gm("DungeonManager","IsDungeonUnlocked","System.String","System.Boolean"),dungeon,{id}))
-                    throw std::runtime_error("本账号尚未解锁副本 "+travel->dungeon+"，无法跟随进入");
                 auto* instance_=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
                 auto* player=instance_?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance_):nullptr;
                 auto* bag=player?readField<void*>(player,"GamePlayer","charBag","Beyond.Gameplay"):nullptr;
@@ -1445,7 +1444,7 @@ class World {
                 auto* preset=api.string("");
                 OwnOfficial own(ownOfficialAction);
                 const bool requested=api.value<bool>(gm("DungeonManager","TryReqEnterDungeon","System.String|System.String|System.Int32","System.Boolean"),dungeon,{id,preset,&team});
-                if(!requested)throw std::runtime_error("游戏拒绝了进入副本 "+travel->dungeon+" 的请求（条件不满足）");
+                if(!requested)throw std::runtime_error("游戏未允许进入副本 "+travel->dungeon+"（未解锁或条件不满足，见游戏内提示）");
                 officialTeleportStatus={{"purpose","follow_dungeon"},{"dungeon",travel->dungeon},{"team",team},{"at",nowMs()}};
                 travel->dungeonStage=2;travelState="entering_dungeon";return;
             }
@@ -1461,7 +1460,8 @@ class World {
         // The loader queues a pipeline; wait until it has actually begun before
         // treating "not loading" as finished.
         if(travel->started&&!travel->observedLoading&&nowMs()-travel->startedAt<3000) {travelState="loading_requested";return;}
-        if(targetLoaded&&!started&&travel->started) {
+        const bool sameMap=mapId==travel->map;
+        if(sameMap&&!started&&travel->started) {
             // LoadAtPos can leave a loaded world awaiting StartWorld. Use the
             // idempotent native lifecycle, including delayed mode activation;
             // never write isStarted or clear arbitrary UI-forbid handles.
@@ -1470,11 +1470,12 @@ class World {
             travelState="starting_world";return;
         }
         if(!started||delayed) {travelState="waiting_world_start";return;}
-        if(targetLoaded&&(travel->started||!overworld)) {
+        if(sameMap&&(travel->started||!overworld)) {
             teleportTo(travel->position);
             auto actual=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
             auto p=travel->position;float d=(actual.x-p.x)*(actual.x-p.x)+(actual.y-p.y)*(actual.y-p.y)+(actual.z-p.z)*(actual.z-p.z);
             if(d<9) {travelState="complete";++completedTeleports;travel.reset();}
+            else if(travel->started) {travel->started=false;travel->observedLoading=false;} // load once more, bounded below
             return;
         }
         // Entering or leaving a room is a world change: run it through the game's
@@ -1493,6 +1494,7 @@ class World {
         auto* raw=runtime->object_unbox(runtime->context,parameter);if(!raw) throw std::runtime_error("地图传送参数 ABI 不可用");
         travel->started=true;travel->observedLoading=false;travel->startedAt=nowMs();travelState="loading";
         if(mapId==travel->map) {
+            if(++travel->inMapLoads>2)throw std::runtime_error("同图加载两次仍未到达目标位置，已停止传送");
             try {
                 api.call(gm("GameLevelLoader","LoadAtPosInCurrentMap","UnityEngine.Vector3|Beyond.Gameplay.TeleportParam&|System.Action|System.Action"),levelLoader,{&travel->position,raw,nullptr,nullptr});
             }catch(const std::exception& e) {
