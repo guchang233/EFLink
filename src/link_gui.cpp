@@ -249,6 +249,13 @@ struct Panel {
             for(auto err:{w.value("error",std::string{}),native.value("error",std::string{})}) if(!err.empty()) ImGui::TextWrapped("%s",err.c_str());
             ImGui::Text("地图：%s   骨骼：%d",g.value("map_id",std::string{}).c_str(),g.value("local_bones",0));
             ImGui::Text("与房主延迟：%u ms",state.value("rtt_ms",0u));
+            {
+                auto traffic=state.value("traffic",json::object());
+                if(role=="client") {
+                    if(traffic.value("udp_pongs",std::uint64_t(0))>0)ImGui::TextDisabled("UDP 已连通  ·  收到状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
+                    else ImGui::TextColored({1,.6f,.3f,1},"UDP 未连通：位置与动作无法同步。端口转发需同时开 TCP 和 UDP，且远程端口相同。");
+                } else if(role=="host")ImGui::TextDisabled("收到玩家状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
+            }
             if(auto error=g.value("error",std::string{});!error.empty()) ImGui::TextWrapped("游戏接入：%s",error.c_str());
             ImGui::TextDisabled("EF Link 1.2.0-dev  /  Windows x64  /  Better-Endfield 模块");
         }

@@ -548,8 +548,13 @@ private:
         }
     }
     void clientDatagram(const sockaddr_in& from,proto::Reader& r,proto::Udp type,std::uint32_t session) {
-        if(from.sin_addr.s_addr!=serverUdp.sin_addr.s_addr||from.sin_port!=serverUdp.sin_port||session!=roomId) return;
-        if(type==proto::Udp::Welcome) {udpWelcomed=true;serverUdp.sin_port=from.sin_port;return;}
+        if(session!=roomId) return;
+        // Behind a relay (frp and similar) the reply can come from another address
+        // than the one connected to. The room's random ID identifies the host's
+        // welcome; its source becomes the UDP path from then on.
+        if(type==proto::Udp::Welcome&&!udpWelcomed) {udpWelcomed=true;serverUdp=from;return;}
+        if(from.sin_addr.s_addr!=serverUdp.sin_addr.s_addr||from.sin_port!=serverUdp.sin_port) return;
+        if(type==proto::Udp::Welcome) return;
         if(type==proto::Udp::Pong) {const auto sent=r.u64();const auto now=nowMs();if(now>=sent&&now-sent<10000) {rtt=std::uint32_t(now-sent);++pongs;}return;}
         if(type==proto::Udp::State) {auto state=proto::readPlayerState(r);if(state.id!=localId) storeState(state);return;}
         if(type==proto::Udp::Data) {
