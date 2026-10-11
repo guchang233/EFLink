@@ -1,5 +1,7 @@
 name: Build Windows module
 on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -10,11 +12,14 @@ jobs:
         run: tools\build.cmd
       - name: Package
         run: python tools/package.py
-      # Packages are kept only for version tags and manual runs: uploading one
-      # per push filled the account's artifact storage and failed every run.
-      - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      # Version tags become GitHub Releases with the packages attached. Release
+      # assets do not use the Actions artifact storage quota (which is full).
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
         with:
-          name: EFLink-Windows-x64
-          path: dist/*
-          retention-days: 14
+          files: |
+            dist/EFLink-*.zip
+            dist/SHA256SUMS.txt
+          prerelease: ${{ contains(github.ref_name, '-dev') }}
+          generate_release_notes: true
