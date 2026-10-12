@@ -37,4 +37,16 @@ int main() try {
     check(malformed,"malformed lengths refuse partial partitioning");
     check(!splitOfficialView("SC_OTHER_MESSAGE",msg(1,msg(2,monster))).changed,
         "other gameplay messages remain outside this view-only adapter");
+    DeferredOfficialMessages journal(3,9);std::vector<std::string> dispatched;
+    check(journal.append("enter","aaa")&&journal.append("leave","bbb")&&journal.append("enter","ccc")&&
+        !journal.append("overflow","d")&&journal.size()==3&&journal.byteSize()==9,
+        "a bounded restoration queue refuses overflow without discarding prior messages");
+    bool failed=false;try {journal.replay([&](const auto&,const auto& bytes){if(bytes=="bbb")throw std::runtime_error("native failure");dispatched.push_back(bytes);});}
+    catch(...) {failed=true;}
+    check(failed&&dispatched==std::vector<std::string>{"aaa"}&&journal.size()==2&&journal.byteSize()==6,
+        "native replay failure retains the failed and later messages in their original order");
+    journal.replay([&](const auto&,const auto& bytes){dispatched.push_back(bytes);});
+    journal.replay([&](const auto&,const auto& bytes){dispatched.push_back(bytes);});
+    check(journal.empty()&&journal.byteSize()==0&&dispatched==std::vector<std::string>{"aaa","bbb","ccc"},
+        "retry finishes recovery without replaying already committed messages twice");
 } catch(const std::exception& error) {std::cerr<<"FAIL unexpected exception: "<<error.what()<<'\n';return 1;}

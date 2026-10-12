@@ -11,6 +11,9 @@
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
+#include "link_ui_theme.h"
+#include "link_ui_widgets.h"
+#include "link_ui_panel.h"
 #include "link_native_gui.h"
 #include "link_input_ownership.h"
 #include <commctrl.h>
@@ -34,6 +37,8 @@ HWND findGame() {
     },reinterpret_cast<LPARAM>(&result));
     return result;
 }
+// Standalone preview only: a real D3D11 window that hosts the same menu the
+// game shows on its Unity canvas. Never used inside the game.
 struct Renderer {
     HWND window=nullptr;bool closing=false,toggle=false,interactive=true;unsigned width=0,height=0;
     ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
@@ -84,255 +89,69 @@ struct Renderer {
         out.write(reinterpret_cast<char*>(&f),sizeof(f));out.write(reinterpret_cast<char*>(&info),sizeof(info));out.write(reinterpret_cast<char*>(pixels.data()),std::streamsize(pixels.size()));
     }
 };
-void theme() {
-    ImGui::StyleColorsDark();auto& s=ImGui::GetStyle();s.WindowRounding=8;s.ChildRounding=5;s.FrameRounding=3;s.WindowBorderSize=1;
-    s.WindowPadding={24,20};s.FramePadding={12,9};s.ItemSpacing={12,12};s.ScrollbarSize=10;
-    auto* c=s.Colors;c[ImGuiCol_WindowBg]={.065f,.075f,.082f,1};c[ImGuiCol_ChildBg]={.085f,.098f,.108f,1};
-    c[ImGuiCol_FrameBg]={.12f,.145f,.16f,1};c[ImGuiCol_Button]={.18f,.22f,.23f,1};c[ImGuiCol_ButtonHovered]={.29f,.35f,.35f,1};
-    c[ImGuiCol_Header]={.28f,.33f,.16f,1};c[ImGuiCol_HeaderHovered]={.34f,.39f,.20f,1};c[ImGuiCol_CheckMark]={.85f,.93f,.35f,1};
-    c[ImGuiCol_SliderGrab]=c[ImGuiCol_CheckMark];c[ImGuiCol_Separator]={.22f,.27f,.29f,1};
+
+// ---- standalone preview fixtures -------------------------------------------
+// `--demo` replaces the module reply with a realistic room so the layout can be
+// reviewed without a second client. Nothing here reaches the network stack.
+json demoStatus(const std::string& role) {
+    const bool host=role=="host",client=role=="client";
+    const bool offline=!(host||client);
+    json peers=json::array();
+    if(host||client) {
+        peers.push_back({{"id",1},{"name",host?"管理员":"Yvonne"},{"host",host},{"local",true},{"map","map01"},
+            {"level","map01_lv001"},{"address","192.168.2.3:47615"},{"rtt_ms",0},{"valid",true},{"same_map",true},{"state_age_ms",40}});
+        peers.push_back({{"id",2},{"name",host?"Yvonne":"管理员"},{"host",client},{"local",false},{"map","map01"},
+            {"level","map01_lv001"},{"address",host?"192.168.2.9:51967":"192.168.2.3:47615"},{"rtt_ms",18},{"valid",true},{"same_map",true},{"state_age_ms",120},{"distance",12.4f}});
+        peers.push_back({{"id",3},{"name","拖进来看风景"},{"host",false},{"local",false},{"map","map02"},
+            {"level","map02_lv001"},{"address",host?"192.168.2.11:51002":"192.168.2.3:47615"},{"rtt_ms",64},{"valid",true},{"same_map",false},{"state_age_ms",2100}});
+    }
+    json rooms=json::array();
+    if(offline) {
+        rooms.push_back({{"room_id",763792363},{"name","EF Link 测试房间"},{"host","管理员"},{"players",3},{"max_players",8},
+            {"password",false},{"map","map01"},{"address","192.168.2.3:47615"}});
+        rooms.push_back({{"room_id",918273645},{"name","好友的房间"},{"host","Yvonne"},{"players",2},{"max_players",4},
+            {"password",true},{"map","map01"},{"address","192.168.2.9:47615"}});
+        rooms.push_back({{"room_id",118273645},{"name","四号谷地跑图"},{"host","Ash"},{"players",1},{"max_players",16},
+            {"password",false},{"map","map03"},{"address","192.168.2.21:47700"}});
+    }
+    json chat=json::array();
+    if(host||client) {
+        chat.push_back({{"serial",1},{"name",""},{"text","Yvonne 加入了房间"},{"system",true}});
+        chat.push_back({{"serial",2},{"name","管理员"},{"text","来了，我在四号谷地枢纽这边"},{"system",false}});
+        chat.push_back({{"serial",3},{"name","Yvonne"},{"text","好，我先把怪拉过去，你跟上传送就行"},{"system",false}});
+        chat.push_back({{"serial",4},{"name",""},{"text","房主已切换到 map01_lv001"},{"system",true}});
+    }
+    return {
+        {"module","eflink.core"},{"version",EFLINK_VERSION},{"name",offline?"管理员":(host?"管理员":"Yvonne")},
+        {"role",offline?"offline":role},{"local_id",1},
+        {"room",{{"id",763792363},{"name","EF Link 测试房间"},{"max_players",8},{"password",false},{"port",47615},{"address",host?"0.0.0.0":""}}},
+        {"rtt_ms",18},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",4},{"last_error",""},
+        {"addresses",json::array({{{"ip","192.168.2.3"},{"adapter","以太网"}},{{"ip","10.4.0.7"},{"adapter","Wintun"}}})},
+        {"game",{{"map_id","map01"},{"level_id","map01_lv001"},{"local_bones",64},{"error",""},
+            {"world_replication",{{"matched",12},{"missing",1},{"teleport","idle"},{"error",""},
+                {"guest_policy",{{"restricted",true},{"ready",true},{"error",""}}},
+                {"official_teleport",{{"map","map04"},{"hub","hub_04_a"}}},
+                {"host_map_change",{{"pending",false},{"level",""},{"deferred",false},{"token",0}}}}}}},
+        {"world_session",{{"ready",true},{"epoch",4211},{"error",""},
+            {"entry",{{"active",false},{"phase","awaiting_host_world"},
+                {"blockers",json::array({"host_world_isolation","guest_logical_players","host_combat_settlement"})}}}}},
+        {"hook_ready",!offline},{"testing_invincible",false},
+        {"configuration",{{"player_name",offline?"管理员":"Yvonne"},{"room_name","EF Link 测试房间"},{"port",47615},{"max_players",8},
+            {"menu_key",VK_OEM_PLUS},{"show_remote_players",true},{"show_player_markers",true},{"follow_host_world",true},{"sync_combat",false},
+            {"saved_servers",json::array({{{"address","192.168.2.3:47615"},{"name","客厅主机"}},{{"address","10.4.0.7:47615"},{"name","内网穿透"}}})}}},
+        {"traffic",{{"bytes_in",184320},{"bytes_out",96256},{"states_in",client?142:0},{"states_out",host?142:0},{"udp_pongs",client?9:0}}}};
 }
-void copyText(char* dst,std::size_t capacity,const std::string& text) {strncpy_s(dst,capacity,text.c_str(),_TRUNCATE);}
-struct Panel {
-    Gui::Request request;json state;std::string feedback;int tab=0;bool close=false,initialized=false;std::uint64_t lastMapPrompt=0;
-    char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
-    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,markers=true,follow=true,combat=true;std::uint64_t lastRefresh=0,lastChat=0;
-    json call(const json& input) {
-        try {auto result=request(input);if(result.contains("error")) feedback=result["error"].get<std::string>();else {state=std::move(result);if(input.value("action",std::string{})!="status") feedback.clear();}return state;}
-        catch(const std::exception& e) {feedback=e.what();return state;}
-    }
-    void refresh() {
-        if(GetTickCount64()-lastRefresh<250) return;lastRefresh=GetTickCount64();call({{"action","status"}});
-        if(!initialized&&!state.empty()) {
-            initialized=true;copyText(name,sizeof(name),state.value("name",std::string{}));
-            auto c=state.value("configuration",json::object());copyText(room,sizeof(room),c.value("room_name",std::string{}));
-            port=c.value("port",47615);limit=c.value("max_players",8);key=c.value("menu_key",kDefaultMenuKey);remote=c.value("show_remote_players",true);
-            markers=c.value("show_player_markers",true);follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);
-        }
-    }
-    void join() {if(*address) call({{"action","join"},{"address",address},{"password",joinPassword}});else feedback="请输入房主地址";}
-    void save() {call({{"action","settings"},{"configuration",{{"player_name",name},{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},{"show_remote_players",remote},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});}
-    void draw() {
-        refresh();auto role=state.value("role",std::string("offline"));bool online=role=="host"||role=="client",offline=role=="offline",requestLeave=false;
-        auto display=ImGui::GetIO().DisplaySize;ImGui::SetNextWindowPos({display.x*.5f,display.y*.5f},ImGuiCond_Always,{.5f,.5f});
-        ImGui::SetNextWindowSize({(std::min)(1020.f,display.x-24),(std::min)(700.f,display.y-24)},ImGuiCond_Always);
-        ImGui::Begin("EF Link",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings);
-        ImGui::TextColored({.85f,.93f,.35f,1},"EF LINK   /   终末地联机");ImGui::SameLine(ImGui::GetWindowWidth()-145);
-        if(ImGui::SmallButton("返回游戏  ×")) close=true;
-        ImGui::TextDisabled("%s  ·  %s",role=="host"?"房主":role=="client"?"已连接":role=="connecting"?"连接中":"离线",state.value("name",std::string("管理员")).c_str());
-        ImGui::Separator();
-        ImGui::BeginChild("navigation",{164,-42},false);const char* labels[]={"局域网房间","直接连接 / 收藏","开放房间","房间玩家","房间聊天","设置 / 诊断"};
-        for(int i=0;i<6;++i) {if(ImGui::Selectable(labels[i],tab==i,0,{0,36})) tab=i;}
-        ImGui::Spacing();ImGui::Separator();if(key==VK_OEM_PLUS)ImGui::TextDisabled("菜单：=");else ImGui::TextDisabled("菜单：F%d",key-VK_F1+1);ImGui::TextWrapped("连接后可关闭菜单，联机继续运行。");
-        ImGui::EndChild();ImGui::SameLine();ImGui::BeginChild("content",{0,-42},false);
-        if(tab==0) {
-            ImGui::Text("局域网房间");ImGui::SameLine();if(ImGui::Button("刷新列表")) call({{"action","refresh"}});
-            ImGui::TextDisabled("自动寻找同一局域网中的房间；也可以直接输入好友地址。");
-            ImGui::BeginDisabled(!offline);
-            auto rooms=state.value("rooms",json::array());if(rooms.empty()) {ImGui::Spacing();ImGui::TextWrapped("暂时没有发现房间。让好友先开放房间，或在“直接连接”中输入 IP:端口。");}
-            for(const auto& r:rooms) {
-                ImGui::PushID(r.value("address",std::string{}).c_str());ImGui::Separator();
-                ImGui::Text("%s  %s",r.value("name",std::string{}).c_str(),r.value("password",false)?"[密码]":"");
-                ImGui::TextDisabled("%s  ·  %d/%d 人  ·  %s",r.value("host",std::string{}).c_str(),r.value("players",0),r.value("max_players",0),r.value("address",std::string{}).c_str());
-                if(ImGui::Button("加入房间")) {copyText(address,sizeof(address),r.value("address",std::string{}));joinPassword[0]=0;if(r.value("password",false)) tab=1;else join();}
-                ImGui::PopID();
-            }
-            ImGui::EndDisabled();
-        } else if(tab==1) {
-            ImGui::Text("连接好友");ImGui::TextDisabled("地址示例：192.168.1.20:47615");
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##address","房主的 IP 或 IP:端口",address,sizeof(address));
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##password","房间密码（可留空）",joinPassword,sizeof(joinPassword),ImGuiInputTextFlags_Password);
-            ImGui::BeginDisabled(!offline);if(ImGui::Button("连接",{140,0})) join();ImGui::EndDisabled();
-            ImGui::SameLine();if(ImGui::Button("收藏此地址")) {call({{"action","save_server"},{"address",address},{"name",*serverName?serverName:address}});}
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##serverName","收藏名称（可留空）",serverName,sizeof(serverName));
-            ImGui::Separator();ImGui::Text("收藏的服务器");
-            for(const auto& s:state.value("configuration",json::object()).value("saved_servers",json::array())) {
-                auto a=s.value("address",std::string{});ImGui::PushID(a.c_str());
-                if(ImGui::Selectable((s.value("name",a)+"  /  "+a).c_str())) {copyText(address,sizeof(address),a);joinPassword[0]=0;}
-                if(ImGui::SmallButton("移除收藏")) call({{"action","remove_server"},{"address",a}});ImGui::PopID();
-            }
-        } else if(tab==2) {
-            ImGui::Text("将房间开放到局域网");ImGui::TextDisabled("当前为实验版本：支持连接与角色显示，完整房主世界接管尚未完成。");
-            if(!offline) {
-                ImGui::Spacing();
-                if(role=="host") {
-                    ImGui::TextColored({.85f,.93f,.35f,1},"当前房间已开放：%s",state.value("room",json::object()).value("name",std::string{}).c_str());
-                    ImGui::TextWrapped("开房设置暂时锁定。要修改名称、密码、人数或端口，请先关闭当前房间；已连接的玩家会断开。");
-                    if(ImGui::Button("关闭当前房间以修改设置")) requestLeave=true;
-                } else {
-                    ImGui::TextWrapped("%s",role=="connecting"?"正在连接房间。请先取消连接，再设置自己的房间。":"你已加入其他房间。请先断开连接，再设置自己的房间。");
-                    if(ImGui::Button(role=="connecting"?"取消当前连接":"断开当前连接以开放房间")) requestLeave=true;
-                }
-                ImGui::Separator();
-            }
-            ImGui::BeginDisabled(!offline);ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##room","房间名称",room,sizeof(room));
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##roomPassword","房间密码（可留空）",hostPassword,sizeof(hostPassword),ImGuiInputTextFlags_Password);
-            ImGui::SliderInt("人数上限",&limit,2,16);ImGui::InputInt("连接端口",&port,0);
-            if(ImGui::Button("开放房间",{180,0})) {save();if(feedback.empty()) call({{"action","host"},{"room_name",room},{"password",hostPassword},{"port",port},{"max_players",limit}});hostPassword[0]=0;}
-            ImGui::EndDisabled();
-            if(role=="host") {
-                ImGui::Separator();ImGui::Text("房间已开放：%s",state["room"].value("name",std::string{}).c_str());
-                for(const auto& a:state.value("addresses",json::array())) {
-                    auto endpoint=a.value("ip",std::string{})+":"+std::to_string(state["room"].value("port",47615));
-                    ImGui::PushID(endpoint.c_str());ImGui::Text("%s",endpoint.c_str());ImGui::SameLine();if(ImGui::SmallButton("复制地址")) ImGui::SetClipboardText(endpoint.c_str());ImGui::TextDisabled("%s",a.value("adapter",std::string{}).c_str());ImGui::PopID();
-                }
-            }
-        } else if(tab==3) {
-            ImGui::Text("房间玩家   /   %s",state.value("room",json::object()).value("name",std::string{}).c_str());
-            auto entry=state.value("world_session",json::object()).value("entry",json::object());
-            if(online&&!entry.value("active",false)) ImGui::TextWrapped("已连接房间，世界接管尚未完成。当前无法共同结算战斗。");
-            if(!online) ImGui::TextWrapped("加入或开放房间后，这里会显示玩家和同步状态。");
-            for(const auto& p:state.value("peers",json::array())) {
-                ImGui::PushID(p.value("id",0));ImGui::Separator();ImGui::Text("%s  %s %s",p.value("name",std::string{}).c_str(),p.value("host",false)?"[房主]":"",p.value("local",false)?"[你]":"");
-                ImGui::TextDisabled("地图 %s  ·  %s",p.value("map",std::string("读取中")).c_str(),p.value("local",false)?"本机":!p.value("valid",false)||p.value("state_age_ms",4000)>3000?"等待角色状态":p.value("same_map",false)?"同地图 · 同步中":"在其他地图");
-                if(p.contains("distance")) {ImGui::SameLine();ImGui::TextDisabled("· %.1f 米",p["distance"].get<float>());}
-                if(!p.value("local",false)) {
-                    ImGui::BeginDisabled(!online||!p.value("valid",false)||p.value("state_age_ms",4000)>3000);
-                    if(ImGui::Button("传送到这位玩家")) call({{"action","teleport_to_player"},{"id",p["id"]}});
-                    ImGui::EndDisabled();
-                }
-                if(role=="host"&&!p.value("local",false)) {if(ImGui::Button("移出玩家")) {state["kick_id"]=p["id"];ImGui::OpenPopup("确认移出");}
-                    if(ImGui::BeginPopupModal("确认移出",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {ImGui::Text("将这位玩家移出当前房间？");if(ImGui::Button("确认")) {call({{"action","kick"},{"id",p["id"]}});ImGui::CloseCurrentPopup();}ImGui::SameLine();if(ImGui::Button("取消")) ImGui::CloseCurrentPopup();ImGui::EndPopup();}}
-                ImGui::PopID();
-            }
-        } else if(tab==4) {
-            ImGui::Text("房间聊天");ImGui::BeginChild("messages",{0,-100},true);
-            std::uint64_t newest=0;for(const auto& line:state.value("chat",json::array())) {
-                newest=(std::max)(newest,line.value("serial",std::uint64_t(0)));
-                auto text=(line.value("system",false)?std::string("· "):line.value("name",std::string{})+"：")+line.value("text",std::string{});ImGui::TextWrapped("%s",text.c_str());
-            }
-            if(newest!=lastChat) {ImGui::SetScrollHereY(1);lastChat=newest;}ImGui::EndChild();
-            ImGui::BeginDisabled(!online);ImGui::SetNextItemWidth(-86);bool send=ImGui::InputTextWithHint("##chat","输入消息，按 Enter 发送",chat,sizeof(chat),ImGuiInputTextFlags_EnterReturnsTrue);ImGui::SameLine();send|=ImGui::Button("发送");
-            if(send&&*chat) {call({{"action","chat"},{"text",chat}});chat[0]=0;}ImGui::EndDisabled();
-        } else {
-            ImGui::Text("玩家设置");ImGui::InputText("玩家名称",name,sizeof(name));ImGui::Checkbox("在游戏中显示其他玩家",&remote);
-            ImGui::Checkbox("屏幕显示玩家位置与距离",&markers);
-            ImGui::TextWrapped("真实共享世界正在实现，地图跟随和联机战斗尚未开放。旧场景复制已停用。");
-            const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
-            if(ImGui::Combo("菜单快捷键",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
-            if(ImGui::Button("保存设置")) save();ImGui::SameLine();ImGui::TextDisabled("收藏、名字与设置自动保存在本机。");
-            ImGui::Separator();
-            if(ImGui::Button("应急回到四号谷地")) call({{"action","emergency_home"}});
-            ImGui::SameLine();ImGui::TextDisabled("会先离开房间，再用官方传送回四号谷地的枢纽。");
-            {
-                auto teleport=state.value("game",json::object()).value("world_replication",json::object()).value("official_teleport",json::object());
-                if(teleport.contains("error"))ImGui::TextColored({1,.45f,.4f,1},"官方传送失败：%s",teleport.value("error",std::string{}).c_str());
-                else if(teleport.contains("hub"))ImGui::TextDisabled("最近一次官方传送：%s / %s",teleport.value("map",std::string{}).c_str(),teleport.value("hub",std::string{}).c_str());
-                else if(teleport.value("state",std::string{})=="queued")ImGui::TextDisabled("应急传送已排队：离房并恢复后执行");
-            }
-            {
-                bool invincible=state.value("testing_invincible",false);
-                if(ImGui::Checkbox("测试用：本机角色无敌（不保存，重开游戏自动关闭）",&invincible)) call({{"action","testing_invincible"},{"enabled",invincible}});
-                if(invincible)ImGui::TextColored({1,.75f,.3f,1},"无敌已开启：本机干员受到的伤害被作废。测试完请关闭。");
-            }
-            ImGui::Separator();ImGui::Text("房主世界接入");ImGui::TextWrapped("地图和实体加载完成后，还需完成客机世界隔离、逻辑玩家与房主规则接管。入场未完成时禁止客机结算战斗。");
-            auto g=state.value("game",json::object());ImGui::Text("游戏接入：%s",state.value("hook_ready",false)?"已连接":"等待终末地场景");
-            auto w=state.value("world_session",json::object());auto native=g.value("world_replication",json::object());
-            auto policy=native.value("guest_policy",json::object());
-            if(policy.value("restricted",false)) {
-                ImGui::TextWrapped("房客模式：地图机关、采集、资源破坏和私人副本入口已禁用。切图和传送由房主世界管理，离开房间后恢复。");
-                if(!policy.value("ready",false))ImGui::TextWrapped("交互隔离未就绪：%s",policy.value("error",std::string{}).c_str());
-            }
-            ImGui::Text("世界状态：%s  /  地图版本 %llu",w.value("ready",false)?"已收到":"等待房主",static_cast<unsigned long long>(w.value("epoch",std::uint64_t(0))));
-            auto entry=w.value("entry",json::object());
-            ImGui::Text("房主世界：%s",entry.value("active",false)?"已完成入场":"接管未完成");
-            ImGui::TextDisabled("%s",entry.value("phase",std::string("offline")).c_str());
-            for(const auto& block:entry.value("blockers",json::array())) {
-                auto blocker=block.get<std::string>();const char* description=
-                    blocker=="host_world_isolation"?"房主世界隔离":blocker=="host_logical_players"?"房主逻辑玩家":
-                    blocker=="host_combat_settlement"?"房主战斗结算":blocker=="host_scene_rules"?"房主地图与副本规则":
-                    blocker=="guest_map_loading"?"客机地图加载":blocker=="guest_entity_replicas"?"客机实体重建":
-                    blocker=="guest_world_isolation"?"客机世界隔离":blocker=="guest_logical_players"?"客机逻辑玩家":blocker.c_str();
-                ImGui::TextDisabled("待完成：%s",description);
-            }
-            ImGui::Text("敌人：已匹配 %u / 缺失 %u",native.value("matched",0u),native.value("missing",0u));
-            ImGui::Text("传送状态：%s",native.value("teleport",std::string("idle")).c_str());
-            for(auto err:{w.value("error",std::string{}),native.value("error",std::string{})}) if(!err.empty()) ImGui::TextWrapped("%s",err.c_str());
-            ImGui::Text("地图：%s   骨骼：%d",g.value("map_id",std::string{}).c_str(),g.value("local_bones",0));
-            ImGui::Text("与房主延迟：%u ms",state.value("rtt_ms",0u));
-            {
-                auto traffic=state.value("traffic",json::object());
-                if(role=="client") {
-                    if(traffic.value("udp_pongs",std::uint64_t(0))>0)ImGui::TextDisabled("UDP 已连通  ·  收到状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-                    else if(traffic.value("states_in",std::uint64_t(0))>0)ImGui::TextColored({.9f,.8f,.3f,1},"UDP 未连通，已改用 TCP 同步（收到状态 %llu）",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-                    else ImGui::TextColored({1,.6f,.3f,1},"UDP 未连通，正在改用 TCP 同步……");
-                } else if(role=="host")ImGui::TextDisabled("收到玩家状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-            }
-            if(auto error=g.value("error",std::string{});!error.empty()) ImGui::TextWrapped("游戏接入：%s",error.c_str());
-            ImGui::TextDisabled("EF Link %s  /  Windows x64  /  Better-Endfield 模块",EFLINK_VERSION);
-        }
-        auto error=state.value("last_error",std::string{});if(!feedback.empty()||!error.empty()) {ImGui::Separator();ImGui::TextColored({1,.65f,.4f,1},"%s",(!feedback.empty()?feedback:error).c_str());}
-        ImGui::EndChild();ImGui::Separator();
-        if(!offline) {if(ImGui::Button(role=="connecting"?"取消连接":role=="host"?"关闭房间":"断开连接")) requestLeave=true;
-            if(requestLeave) ImGui::OpenPopup("离开房间");
-            if(ImGui::BeginPopupModal("离开房间",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {ImGui::Text("%s",role=="host"?"关闭房间会断开所有玩家。":"确定结束当前连接？");if(ImGui::Button("确认")) {call({{"action","leave"}});joinPassword[0]=0;ImGui::CloseCurrentPopup();}ImGui::SameLine();if(ImGui::Button("返回")) ImGui::CloseCurrentPopup();ImGui::EndPopup();}}
-        else ImGui::TextDisabled("局域网连接  ·  同一地图显示玩家");
-        auto change=state.value("game",json::object()).value("world_replication",json::object()).value("host_map_change",json::object());
-        const bool pending=role=="client"&&change.value("pending",false);
-        const auto token=change.value("token",std::uint64_t(0));
-        auto blockers=state.value("world_session",json::object()).value("entry",json::object()).value("blockers",json::array());
-        const bool supported=std::find(blockers.begin(),blockers.end(),json("host_scene_rules"))==blockers.end();
-        {
-            // Travel failures (follow / teleport to a player) are shown, not only logged.
-            auto native=state.value("game",json::object()).value("world_replication",json::object());
-            if(native.value("teleport",std::string{})=="failed"&&!native.value("error",std::string{}).empty())
-                ImGui::TextColored({1,.45f,.4f,1},"传送失败：%s",native.value("error",std::string{}).c_str());
-        }
-        if(pending) {
-            ImGui::TextColored({.85f,.93f,.35f,1},"房主已切换地图：%s",change.value("level",std::string{}).c_str());
-            if(change.value("deferred",false)) {
-                ImGui::TextDisabled("已暂不跟随，联机战斗暂停；可稍后跟随或离开房间。");
-                ImGui::BeginDisabled(!supported);if(ImGui::Button("现在跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
-            }else {
-                // Always offer the choice inline: the reminder popup closes with the menu.
-                ImGui::BeginDisabled(!supported);if(ImGui::Button("跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
-                ImGui::SameLine();if(ImGui::Button("暂不跟随"))call({{"action","host_map_choice"},{"token",token},{"follow",false}});
-                if(token!=lastMapPrompt) {lastMapPrompt=token;ImGui::OpenPopup("房主切换地图");}
-            }
-        }
-        if(ImGui::BeginPopupModal("房主切换地图",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {
-            if(!pending)ImGui::CloseCurrentPopup();
-            else {
-                ImGui::Text("房主已前往：%s",change.value("level",std::string{}).c_str());
-                ImGui::Text("是否跟随房主切换地图？");
-                ImGui::TextDisabled("暂不跟随会留在当前地图，并暂停联机战斗。");
-                if(!supported)ImGui::TextWrapped("房主当前场景尚未开放联机入场，请等待其回到大世界。");
-                ImGui::BeginDisabled(!supported);
-                if(ImGui::Button("跟随切换",{150,0})) {call({{"action","host_map_choice"},{"token",token},{"follow",true}});if(feedback.empty())ImGui::CloseCurrentPopup();}
-                ImGui::EndDisabled();ImGui::SameLine();
-                if(ImGui::Button("暂不跟随",{150,0})) {call({{"action","host_map_choice"},{"token",token},{"follow",false}});if(feedback.empty())ImGui::CloseCurrentPopup();}
-            }
-            ImGui::EndPopup();
-        }
-        ImGui::End();
-    }
-};
-void drawMarkers(const json& data) {
-    const auto size=ImGui::GetIO().DisplaySize;auto* draw=ImGui::GetForegroundDrawList();float otherY=20;
-    for(const auto& marker:data.value("markers",json::array())) {
-        std::string label=marker.value("name",std::string{});
-        if(marker.value("other_map",false)) {
-            label+=" · "+marker.value("map",std::string{});draw->AddText({20,otherY},IM_COL32(190,205,216,240),label.c_str());otherY+=25;continue;
-        }
-        float x=marker.value("x",.5f)*size.x,y=marker.value("y",.5f)*size.y;
-        if(!std::isfinite(x)||!std::isfinite(y)) continue;
-        bool off=marker.value("behind",false)||x<30||y<30||x>size.x-30||y>size.y-30;
-        if(off) {
-            float dx=x-size.x*.5f,dy=y-size.y*.5f;if(marker.value("behind",false)) {dx=-dx;dy=-dy;}
-            if(std::abs(dx)+std::abs(dy)<.001f) dy=-1;
-            const float scale=1.f/(std::max)(std::abs(dx)/((std::max)(1.f,size.x*.5f-65)),std::abs(dy)/((std::max)(1.f,size.y*.5f-65)));
-            x=size.x*.5f+dx*scale;y=size.y*.5f+dy*scale;
-        }
-        char distance[40];std::snprintf(distance,sizeof distance," · %.1f m",marker.value("distance",0.f));label+=distance;
-        auto text=ImGui::CalcTextSize(label.c_str());float tx=(std::clamp)(x-text.x*.5f,8.f,(std::max)(8.f,size.x-text.x-8));float ty=y+12;
-        draw->AddRectFilled({tx-6,ty-4},{tx+text.x+6,ty+text.y+4},IM_COL32(10,17,21,195),4);
-        draw->AddText({tx,ty},IM_COL32(227,244,145,255),label.c_str());
-        draw->AddCircle({x,y},off?6.f:4.f,IM_COL32(227,244,145,255),12,2);
-    }
+json demoHud() {
+    return {{"markers",json::array({
+        {{"name","Yvonne"},{"x",.42f},{"y",.36f},{"distance",12.4}},
+        {{"name","拖进来看风景"},{"x",.72f},{"y",.58f},{"distance",48.1}},
+        {{"name","Ash"},{"x",.5f},{"y",.5f},{"behind",true},{"distance",31.7}},
+        {{"name","异地图玩家"},{"other_map",true},{"map","map02"}}})}};
 }
 }
+
 struct Gui::NativeState {
-    Panel panel;NativeGuiCanvas canvas;unity::Api api;ImGuiContext* context=nullptr;HWND window=nullptr;
+    eflink::UiPanel panel;NativeGuiCanvas canvas;unity::Api api;ImGuiContext* context=nullptr;HWND window=nullptr;
     std::atomic<bool> visible=false,accepting=true,textInput=false;std::atomic<int> menuKey=kDefaultMenuKey;
     bool installed=false,failed=false,lastVisible=false,warmed=false;std::uint64_t lastFrame=0,retryAt=0,lastCheck=0;int failures=0;
     std::mutex eventsMutex;struct Event {UINT message;WPARAM value;};std::vector<Event> events;
@@ -399,16 +218,20 @@ struct Gui::NativeState {
         if(paired&&!forward)return 0;
         return DefSubclassProc(window,message,a,b);
     }
+    // Font size and style metrics follow the render target, so a 1440p or 4K
+    // session gets a proportionally larger menu instead of a tiny one.
     void init(const BE_HostApiV1* host) {
         api.bind(host);canvas.bind(host);accepting=true;warmed=false;window=findGame();if(!window) throw std::runtime_error("Native ImGui: game window unavailable");
         if(GetWindowThreadProcessId(window,nullptr)!=GetCurrentThreadId()) throw std::runtime_error("Native ImGui: Canvas callback is not the window owner thread");
-        IMGUI_CHECKVERSION();context=ImGui::CreateContext();auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
+        const auto height=api.value<int>(api.method("Screen","get_height","","System.Int32"));
+        // Theme and fonts are applied by createContext(): applyTheme() needs the
+        // context that CreateContext() returns, so the two cannot be reordered.
+        context=ui::createContext(float(height>0?height:1080));
+        auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
         io.BackendRendererName="eflink_unity_canvas";io.BackendPlatformName="eflink_game_input";
         io.BackendFlags|=ImGuiBackendFlags_RendererHasVtxOffset;io.ConfigFlags|=ImGuiConfigFlags_NoMouseCursorChange;
         ImGui::GetMainViewport()->PlatformHandleRaw=window;
-        wchar_t winDir[MAX_PATH]{};GetWindowsDirectoryW(winDir,MAX_PATH);auto font=std::filesystem::path(winDir)/L"Fonts"/L"msyh.ttc";
-        if(std::filesystem::is_regular_file(font)) io.Fonts->AddFontFromFileTTF(font.string().c_str(),18,nullptr,io.Fonts->GetGlyphRangesChineseFull());
-        theme();canvas.init(io.Fonts);
+        canvas.init(io.Fonts);
         if(!SetWindowSubclass(window,input,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this))) throw std::runtime_error("Native ImGui: input subclass unavailable");
         installed=true;panel.refresh();lastFrame=GetTickCount64();
         // A module can be loaded while a physical button is already held.
@@ -468,18 +291,29 @@ void Gui::tickGame(const BE_HostApiV1* host) {
             io.DeltaTime=.016f;ImGui::NewFrame();state.panel.draw();ImGui::Render();state.canvas.render(ImGui::GetDrawData(),false);state.warmed=true;
         }
         const bool focused=state.window&&GetForegroundWindow()==state.window&&!IsIconic(state.window);
+        // The menu is an overlay drawn onto the game's own canvas, not an OS
+        // window: alt-tabbing, a launcher stealing focus, or the game being
+        // minimised must not close it. Only the menu key, Escape and the
+        // 返回游戏 button do. Input still follows focus -- feedInput() drops
+        // every event while the game is in the background -- so a lingering menu
+        // cannot swallow the player's clicks.
         if(focused&&openRequested.exchange(false)) state.visible=true;
-        if(!focused) state.visible=false;
         const bool show=state.visible.load();menuVisible=show;
         if(!show&&state.lastVisible) {ImGui::GetIO().ClearInputKeys();ImGui::GetIO().ClearInputMouse();}
         state.lastVisible=show;state.panel.refresh();state.menuKey=state.panel.state.value("configuration",json::object()).value("menu_key",kDefaultMenuKey);
         const auto hud=state.panel.request({{"action","hud"}});
         if(!show&&(!focused||hud.value("markers",json::array()).empty())) {state.canvas.hide();return;}
         auto& io=ImGui::GetIO();state.api.bind(host);
-        io.DisplaySize={float(state.api.value<int>(state.api.method("Screen","get_width","","System.Int32"))),float(state.api.value<int>(state.api.method("Screen","get_height","","System.Int32")))};
+        // A minimised game window can report a zero-sized render target. Pushing
+        // that into ImGui would give the main viewport an inverted visibility rect
+        // and drag the menu into the top-left corner, so keep the last known size
+        // while the window is minimised -- the menu now stays open through that.
+        const float width=float(state.api.value<int>(state.api.method("Screen","get_width","","System.Int32")));
+        const float height=float(state.api.value<int>(state.api.method("Screen","get_height","","System.Int32")));
+        if(width>1.f&&height>1.f) io.DisplaySize={width,height};
         auto now=GetTickCount64();io.DeltaTime=(std::clamp)(float(now-state.lastFrame)/1000,.001f,.1f);state.lastFrame=now;
         state.feedInput(io,show&&focused);io.MouseDrawCursor=show;
-        ImGui::NewFrame();if(show) state.panel.draw();else drawMarkers(hud);
+        ImGui::NewFrame();if(show) state.panel.draw();else drawHud(hud);
         if(show&&ImGui::IsKeyPressed(ImGuiKey_Escape)&&!io.WantTextInput) state.panel.close=true;
         if(state.panel.close) {state.visible=false;menuVisible=false;state.panel.close=false;}
         state.textInput=show&&io.WantTextInput;
@@ -504,17 +338,25 @@ void Gui::start(Request request,const json& options) {
 }
 void Gui::stop() {stopping=true;if(native) {native->accepting=false;native->visible=false;}if(thread.joinable()) thread.join();menuVisible=false;uiReady=false;}
 void Gui::run(Request request,json options) {
-    if(!options.value("preview_mode",false)) throw std::runtime_error("The Win32 GUI is only available in standalone preview mode");
-    auto instance=GetModuleHandleW(nullptr);std::wstring className=L"EFLink.Preview."+std::to_wstring(GetCurrentProcessId());
+    if(!options.value("preview_mode",false)) throw std::runtime_error("The preview renderer is only available in standalone preview mode");
+    const std::string demo=options.value("preview_demo",std::string{});
+    // In demo mode the module is never asked for state: every menu action is
+    // answered from a fixed room so the layout is stable while reviewing it.
+    Request send=demo.empty()?request:Request{[request,demo](const json& input)->json {
+        const auto action=input.value("action",std::string{});
+        if(action=="hud") return demoHud();
+        return demoStatus(demo);
+    }};
+    auto instance=GetModuleHandleW(nullptr);
+    const auto className=previewWindowClass(GetCurrentProcessId());
     WNDCLASSEXW wc{sizeof(wc),0,Renderer::proc,0,0,instance,nullptr,LoadCursorW(nullptr,IDC_ARROW),nullptr,nullptr,className.c_str(),nullptr};
     if(!RegisterClassExW(&wc)) throw std::runtime_error("Cannot register standalone preview");
     Renderer r;r.window=CreateWindowExW(0,className.c_str(),L"EF Link preview",WS_OVERLAPPEDWINDOW,100,80,1280,800,nullptr,nullptr,instance,&r);
     if(!r.window||FAILED(r.create())) {if(r.window) DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);throw std::runtime_error("Cannot create standalone preview renderer");}
-    IMGUI_CHECKVERSION();ImGui::CreateContext();auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
-    wchar_t winDir[MAX_PATH]{};GetWindowsDirectoryW(winDir,MAX_PATH);auto fontPath=std::filesystem::path(winDir)/L"Fonts"/L"msyh.ttc";
-    if(std::filesystem::is_regular_file(fontPath)) io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(),18,nullptr,io.Fonts->GetGlyphRangesChineseFull());
-    theme();ImGui_ImplWin32_Init(r.window);ImGui_ImplDX11_Init(r.device.Get(),r.context.Get());
-    Panel panel;panel.request=std::move(request);panel.tab=options.value("preview_tab",0);panel.refresh();uiReady=true;menuVisible=true;
+    ImGuiContext* context=ui::createContext(0.f);
+    auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
+    ImGui_ImplWin32_Init(r.window);ImGui_ImplDX11_Init(r.device.Get(),r.context.Get());
+    eflink::UiPanel panel;panel.request=send;panel.tab=options.value("preview_tab",0);panel.refresh();uiReady=true;menuVisible=true;
     const auto capture=options.value("preview_capture",std::string{});if(capture.empty()) ShowWindow(r.window,SW_SHOWNA);
     auto started=GetTickCount64();
     while(!stopping&&!r.closing) {
@@ -522,14 +364,17 @@ void Gui::run(Request request,json options) {
         if(r.width&&r.height) {r.target.Reset();r.swap->ResizeBuffers(0,r.width,r.height,DXGI_FORMAT_UNKNOWN,0);r.width=r.height=0;r.makeTarget();}
         if(!r.target) {std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;}
         ImGui_ImplDX11_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
-        if(options.value("preview_hud",false)) drawMarkers({{"markers",json::array({{{"name","房主 · Yvonne"},{"x",.51},{"y",.37},{"distance",12.4}},{{"name","好友"},{"x",1.5},{"y",.25},{"distance",118.7}},{{"name","异地图玩家"},{"other_map",true},{"map","map02"}}})}});
+        if(options.value("preview_hud",false)) drawHud(demoHud());
         else panel.draw();
         ImGui::Render();const float clear[]={.025f,.032f,.04f,1.f};auto* target=r.target.Get();
         r.context->OMSetRenderTargets(1,&target,nullptr);r.context->ClearRenderTargetView(target,clear);ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        if(!capture.empty()&&GetTickCount64()-started>1200) {r.capture(std::filesystem::path(std::u8string(capture.begin(),capture.end())));break;}
+        if(!capture.empty()&&GetTickCount64()-started>1200) {
+            r.capture(std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(capture.data()),capture.size())));
+            break;
+        }
         if(panel.close) break;r.swap->Present(1,0);
     }
-    menuVisible=false;uiReady=false;ImGui_ImplDX11_Shutdown();ImGui_ImplWin32_Shutdown();ImGui::DestroyContext();
+    menuVisible=false;uiReady=false;ImGui_ImplDX11_Shutdown();ImGui_ImplWin32_Shutdown();ImGui::DestroyContext(context);
     DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);
 }
 }

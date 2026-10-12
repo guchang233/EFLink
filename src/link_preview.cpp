@@ -1,5 +1,6 @@
-// A real native menu using the shipping DLL and transport, without loading game assets.
+// A real menu using the shipping DLL and transport, without loading game assets.
 #include "BetterEndfield/ThirdPartyModule.h"
+#include "link_gui.h"
 #include "nlohmann/json.hpp"
 #include <windows.h>
 #include <filesystem>
@@ -23,11 +24,18 @@ int wmain(int argc,wchar_t** argv) {
         else if(arg==L"--tab"&&i+1<argc) tab=_wtoi(argv[++i]);
         else if(arg==L"--host") autoHost=true;
         else if(arg==L"--hud") config["preview_hud"]=true;
+        else if(arg==L"--demo"&&i+1<argc) {
+            std::wstring role=argv[++i];
+            if(role!=L"host"&&role!=L"client"&&role!=L"offline") {std::puts("--demo takes host, client or offline");return 2;}
+            std::string name;for(auto value:role) name.push_back(static_cast<char>(value));
+            config["preview_demo"]=name;
+        }
         else if(arg==L"--module"&&i+1<argc) ++i;
-        else {std::puts("EFLink.Preview.exe [--module eflink.core] [--capture path.bmp] [--tab 0..5] [--host] [--hud]");return 2;}
+        else {std::puts("EFLink.Preview.exe [--module eflink.core] [--capture path.bmp] [--tab 0..5] [--demo host|client|offline] [--host] [--hud]");return 2;}
     }
     config["preview_tab"]=tab;if(autoHost) {config["auto_host"]=true;config["room_name"]="EF Link 测试房间";config["port"]=47735;}
     if(module->initialize(&host,config.dump().c_str())!=BE_Result_Ok) return 1;
+    const auto windowClass=eflink::previewWindowClass(GetCurrentProcessId());
     if(capture) {
         const auto utf8=config["preview_capture"].get<std::string>();
         const auto path=std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(utf8.data()),utf8.size()));
@@ -36,7 +44,7 @@ int wmain(int argc,wchar_t** argv) {
         if(!std::filesystem::exists(path)) {module->shutdown();std::puts("Native menu capture timed out.");return 1;}
     }
     else {std::puts("Native menu active. Close the window to finish; Ctrl+C also exits.");
-        while(!FindWindowW((L"EFLink.NativeMenu."+std::to_wstring(GetCurrentProcessId())).c_str(),nullptr)) Sleep(50);
-        while(FindWindowW((L"EFLink.NativeMenu."+std::to_wstring(GetCurrentProcessId())).c_str(),nullptr)) Sleep(100);}
+        while(FindWindowW(windowClass.c_str(),nullptr)==nullptr) Sleep(50);
+        while(FindWindowW(windowClass.c_str(),nullptr)!=nullptr) Sleep(100);}
     module->shutdown();return 0;
 }

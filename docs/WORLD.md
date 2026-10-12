@@ -4,6 +4,11 @@
 > world. The current requirement is [SERVER_GOAL.md](SERVER_GOAL.md). Admission
 > flags below certify only the old bounded experiment, never real world authority.
 
+Current development uses schema 3, build/game-version negotiation, entity lifetimes
+and control leases, keyed field deltas, and scoped player cast observations. See
+[the official-online Stage 1 acceptance record](COOPERATION_STAGE1.md). The sections
+below retain the earlier experiment's history and are not the current release checklist.
+
 EF Link 1.2.0-dev adds a host-owned world session. The game thread samples and applies
 native state; the network thread only copies bounded packets. The `eflink.world.v1`
 channel is reserved by the core and cannot be opened by third-party modules.

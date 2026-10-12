@@ -22,4 +22,16 @@ inline bool validCharacterGrowth(const nlohmann::json& value,const std::string& 
         return level>=1&&level<=1000&&stage>=0&&stage<=64&&potential>=0&&potential<=64;
     }catch(...) {return false;}
 }
+// Presentation only: public weapon template, never an account instance ID or
+// claimed combat stats. Zero means an observed unequipped character; null means
+// no complete official data. This does not grant native readiness or admission.
+inline bool validCharacterAppearance(const nlohmann::json& value,const std::string& model) {
+    try {
+        if(!value.is_object()||value.size()!=2||characterTemplate(model).empty()||
+           !value.at("template").is_string()||value.at("template").get<std::string>()!=characterTemplate(model)||
+           !value.at("weapon_template").is_number_integer())return false;
+        const auto weapon=value.at("weapon_template").get<std::int64_t>();
+        return weapon>=0&&weapon<=2147483647;
+    }catch(...) {return false;}
+}
 }

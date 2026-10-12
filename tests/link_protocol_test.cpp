@@ -12,6 +12,11 @@ int main() {
     rejected=false;try {validateSettings({{"port",47616}});} catch(...) {rejected=true;}check(rejected,"connection port cannot collide with discovery");
     rejected=false;try {validateSettings({{"saved_servers",nlohmann::json::array({"bad"})}});} catch(...) {rejected=true;}check(rejected,"malformed saved servers rejected");
     check(proto::quantize(2)==32767&&proto::quantize(-2)==-32767,"bone rotations are bounded");
+    proto::PlayerState visual;visual.flags=std::uint8_t(proto::StateValid|proto::StateAlive|proto::StateWeaponValid|(5<<5));
+    proto::Writer visualBytes;proto::write(visualBytes,visual);proto::Reader visualReader(visualBytes.bytes.data(),visualBytes.bytes.size());
+    auto decoded=proto::readPlayerState(visualReader);
+    check((decoded.flags&proto::StateValid)&&(decoded.flags&proto::StateAlive)&&(decoded.flags&proto::StateWeaponValid)&&proto::weaponState(decoded.flags)==5,
+        "optional weapon view state preserves life flags and the existing pose layout");
     SetEnvironmentVariableW(L"EFLINK_PROFILE_DIR",L"D:\\EF Link\\tests\\isolated");
     check(settingsPath()==std::filesystem::path(L"D:\\EF Link\\tests\\isolated\\settings.json"),"isolated instance preferences use the explicit profile");
     SetEnvironmentVariableW(L"EFLINK_PROFILE_DIR",L"relative");rejected=false;

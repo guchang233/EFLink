@@ -8,6 +8,7 @@ its room open, the mirror shows up in the game exactly like a friend from anothe
     python tools/link-mirror.py --offset 0 0 3 --delay 0.5 --name 镜像
 """
 import argparse
+import json
 import socket
 import struct
 import threading
@@ -23,6 +24,13 @@ def fnv64(text):
     for byte in text.encode('utf-8'):
         value = ((value ^ byte) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return value
+
+
+def fnv32(value):
+    result = 2166136261
+    for byte in value.encode('utf-8'):
+        result = ((result ^ byte) * 16777619) & 0xFFFFFFFF
+    return result
 
 
 class Reader:
@@ -72,7 +80,28 @@ def main():
                         help='world offset from the host in Endfield units (metres)')
     parser.add_argument('--delay', type=float, default=0.3, help='seconds the mirror lags behind the host')
     parser.add_argument('--duration', type=float, default=0, help='leave after this many seconds (0 = until Ctrl+C)')
+    parser.add_argument('--cooperation-metadata', action='store_true',
+                        help='negotiate schema 3 and copy public growth/weapon metadata; never claims actual client readiness')
+    parser.add_argument('--weapon-template', type=int, help='override the public weapon template for native visual diagnostics (0 = unequip)')
+    parser.add_argument('--weapon-sequence', nargs='+', metavar='SECONDS:TEMPLATE',
+                        help='change this same auxiliary actor equipment on a timed schedule, e.g. 0:0 8:3265 16:0')
+    parser.add_argument('--weapon-state', type=int, choices=range(6),help='override only this diagnostic actor weapon view state (0..5)')
     args = parser.parse_args()
+    weapon_sequence = []
+    if args.weapon_sequence:
+        if args.weapon_template is not None or not args.cooperation_metadata:
+            parser.error('--weapon-sequence requires --cooperation-metadata and cannot be combined with --weapon-template')
+        try:
+            for entry in args.weapon_sequence:
+                seconds, template = entry.split(':')
+                seconds, template = float(seconds), int(template)
+                if not 0 <= seconds < float('inf') or not 0 <= template <= 2**31 - 1:
+                    raise ValueError()
+                weapon_sequence.append((seconds, template))
+            if weapon_sequence != sorted(weapon_sequence) or len({t for t, _ in weapon_sequence}) != len(weapon_sequence):
+                raise ValueError()
+        except ValueError:
+            parser.error('use unique increasing nonnegative SECONDS:TEMPLATE entries with bounded integer templates')
     host, _, port = args.address.partition(':')
     port = int(port or 47615)
 
@@ -85,9 +114,10 @@ def main():
     tcp.sendall(frame(T_HELLO, hello))
     tcp.settimeout(0.05)
 
-    state = {'id': 0, 'room': 0, 'token': 0, 'udp_ok': False, 'source': None, 'running': True}
+    state = {'id': 0, 'room': 0, 'token': 0, 'udp_ok': False, 'source': None, 'running': True, 'info': None, 'world': None, 'epoch': 0}
     pending, buffer = [], b''
     sequence, last_keepalive, last_hello, started = 0, 0, 0, time.time()
+    last_metadata = 0
     target = (socket.gethostbyname(host), port)
     print(f'connecting to {host}:{port} as {args.name} …')
 
@@ -121,6 +151,7 @@ def main():
             elif kind == T_INFO:
                 info = read_info(r)
                 if info['id'] == 1:
+                    state['info'] = info
                     print(f'host model: {info["model"]} map {info["map"]} bones {len(info["bones"])}')
                     tcp.sendall(frame(T_INFO, write_info(info, args.name)))
             elif kind == T_CHAT:
@@ -129,6 +160,35 @@ def main():
             elif kind == T_BYE:
                 print('room closed')
                 state['running'] = False
+            elif kind == T_DATA and args.cooperation_metadata:
+                sender, receiver, channel, size = r.take('HHII')
+                if sender == 1 and channel == fnv32('eflink.world.v1') and size <= 256 * 1024:
+                    try:
+                        body = json.loads(r.data[r.at:r.at + size])
+                        if body.get('schema') == 3 and body.get('room') == state['room'] and body.get('kind') == 'snapshot':
+                            state['world'], state['epoch'] = body['world'], body['epoch']
+                    except (ValueError, KeyError):
+                        pass
+        if args.cooperation_metadata and state['id'] and now - last_metadata >= 1:
+            last_metadata = now
+            def world_message(body):
+                body.update(schema=3, room=state['room'])
+                encoded = json.dumps(body, separators=(',', ':')).encode('utf-8')
+                tcp.sendall(frame(T_DATA, struct.pack('<HHII', state['id'], 1, fnv32('eflink.world.v1'), len(encoded)) + encoded))
+            world_message({'kind': 'coop_hello', 'world_schema': 3, 'contract_revision': 4,
+                           'contract': 'official-room-lifecycle-v1', 'build': 'mirror-diagnostic', 'game_version': 'diagnostic-fixture'})
+            if state['world'] and state['info']:
+                host_player = next((p for p in state['world'].get('players', []) if p.get('peer') == 1), {})
+                if host_player.get('growth'):
+                    world_message({'kind': 'character_growth', 'model': state['info']['model'], 'growth': host_player['growth']})
+                appearance = host_player.get('appearance')
+                weapon_template = args.weapon_template
+                for seconds, template in weapon_sequence:
+                    if now - started >= seconds:
+                        weapon_template = template
+                if appearance and weapon_template is not None:
+                    appearance = dict(appearance, weapon_template=weapon_template)
+                world_message({'kind': 'character_appearance', 'epoch': state['epoch'], 'model': state['info']['model'], 'appearance': appearance})
         if state['id'] and not state['udp_ok'] and now - last_hello > 0.5:
             last_hello = now
             udp.sendto(udp_header(U_HELLO) + struct.pack('<HI', state['id'], state['token']), target)
@@ -149,6 +209,8 @@ def main():
             _, body = pending.pop(0)
             sequence += 1
             struct.pack_into('<HI', body, 0, state['id'], sequence)
+            if args.weapon_state is not None:
+                body[10] = (body[10] & 15) | 16 | (args.weapon_state << 5)
             x, y, z = struct.unpack_from('<3f', body, 17)
             struct.pack_into('<3f', body, 17, x + args.offset[0], y + args.offset[1], z + args.offset[2])
             if state['udp_ok']:

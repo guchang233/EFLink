@@ -1,12 +1,17 @@
 #pragma once
 #include <atomic>
 #include <functional>
+#include <string>
 #include <thread>
 #include <memory>
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "nlohmann/json.hpp"
 
 namespace eflink {
+// Window class of the standalone preview renderer. One process hosts a single
+// preview, so the class name carries the process id. Shared with the preview
+// launcher, which waits for it before falling back to its own message loop.
+inline std::wstring previewWindowClass(unsigned long process) {return L"EFLink.Preview."+std::to_wstring(process);}
 // Runtime ImGui is rendered on Unity's Canvas callback, with no overlay HWND.
 // A separate Win32 renderer is available only to the standalone preview tool.
 class Gui {

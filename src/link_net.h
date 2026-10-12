@@ -144,6 +144,7 @@ public:
         return true;
     }
     Role currentRole() const {return role.load();}
+    std::size_t transmitPressure() const {return reliableBacklog.load();}
     Snapshot snapshot() {
         std::lock_guard lock(viewMutex);
         Snapshot s=view;s.rooms.clear();
@@ -205,6 +206,7 @@ private:
     std::uint32_t rtt=0,stateSequence=0;
     std::uint64_t bytesIn=0,bytesOut=0,statesIn=0,statesOut=0;
     std::uint64_t pongs=0;
+    std::atomic<std::size_t> reliableBacklog{0};
     std::string lastError,joinAddress;
     std::mt19937 random{std::random_device{}()};
 
@@ -778,6 +780,8 @@ private:
         if((role.load()==Role::Host||role.load()==Role::Client)&&now-lastInfoSent>5000) {std::lock_guard lock(localMutex);localInfoDirty=true;}
         if(now-lastDiscover>3000&&role.load()!=Role::Host) sendDiscover();
         std::lock_guard lock(viewMutex);
+        std::size_t backlog=server.out.size();for(const auto& [id,member]:members)backlog=(std::max)(backlog,member.tcp.out.size());
+        reliableBacklog.store(backlog);
         view.rttMs=rtt;view.bytesIn=bytesIn;view.bytesOut=bytesOut;view.statesIn=statesIn;view.statesOut=statesOut;view.pongs=pongs;
         if(!view.peers.empty()&&view.peers.front().local) view.peers.front().rttMs=rtt;
         for(auto it=rooms.begin();it!=rooms.end();) it=now-it->second.seenMs>6000?rooms.erase(it):std::next(it);
