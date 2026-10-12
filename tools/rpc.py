@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 
-def request(body=None, module="eflink.core", index=None):
+def request(body=None, module="eflink.core", index=None, http_timeout=4):
     path = Path(index) if index else Path(os.environ["LOCALAPPDATA"]) / "BetterEndfield/third-party/index.json"
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     endpoint = f'http://127.0.0.1:{config["port"]}'
@@ -21,7 +21,7 @@ def request(body=None, module="eflink.core", index=None):
         req = urllib.request.Request(endpoint + path,
             data=json.dumps(data).encode() if data is not None else None,
             headers={"Authorization": "Bearer " + config["token"], "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=4) as response:
+        with urllib.request.urlopen(req, timeout=http_timeout) as response:
             return json.load(response)
 
     if body is None:

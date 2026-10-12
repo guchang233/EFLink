@@ -6,16 +6,17 @@ namespace eflink {
 // Capability facts are supplied by a game adapter, never by a menu/configuration.
 // A loaded scene or matched replica is not proof of an authoritative world.
 struct AuthorityFacts {
-    bool isolatedWorld=false,logicalPlayers=false,combat=false,sceneRules=false;
-    bool complete() const {return isolatedWorld&&logicalPlayers&&combat&&sceneRules;}
+    bool isolatedWorld=false,logicalPlayers=false,combat=false,sceneRules=false,nativeDamageVerified=false;
+    bool complete() const {return isolatedWorld&&logicalPlayers&&combat&&sceneRules&&nativeDamageVerified;}
     nlohmann::json json() const {return {{"isolated_world",isolatedWorld},{"logical_players",logicalPlayers},
-        {"combat",combat},{"scene_rules",sceneRules}};}
+        {"combat",combat},{"scene_rules",sceneRules},{"native_damage_verified",nativeDamageVerified}};}
     nlohmann::json blockers() const {
         auto out=nlohmann::json::array();
         if(!isolatedWorld) out.push_back("host_world_isolation");
         if(!logicalPlayers) out.push_back("host_logical_players");
         if(!combat) out.push_back("host_combat_settlement");
         if(!sceneRules) out.push_back("host_scene_rules");
+        if(!nativeDamageVerified)out.push_back("host_native_damage_verification");
         return out;
     }
 };

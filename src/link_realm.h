@@ -45,6 +45,10 @@ public:
             // A new operator needs its own stats/skills. A mesh change cannot retain
             // the previous operator's combat binding or cooldown catalog.
             if(player.model!=peer.info.modelPath) {
+                if(!inserted) {
+                    if(++next>65535) {players.erase(it);continue;}
+                    player.entity=0xEF10000000000000ull|(std::uint64_t(room)<<16)|next;
+                }
                 player.model=peer.info.modelPath;player.nativeBound=false;player.skills.clear();player.lastCast.clear();player.state={};player.growth=nullptr;
             }
             player.name=peer.info.name;
@@ -130,6 +134,7 @@ inline bool validPlayers(const nlohmann::json& list,std::uint64_t epoch) {
                 p.at("name").get<std::string>().size()>128||p.at("model").get<std::string>().size()>512||
                 !p.at("in_scene").is_boolean()||!p.at("native_bound").is_boolean())return false;
             if(p.contains("growth")&&(!p.at("native_bound").get<bool>()||!validCharacterGrowth(p.at("growth"),p.at("model").get<std::string>())))return false;
+            if(p.contains("appearance")&&(!p.at("in_scene").get<bool>()||!validCharacterAppearance(p.at("appearance"),p.at("model").get<std::string>())))return false;
             if(p.contains("native_state")) {
                 const auto& state=p.at("native_state");const auto& position=state.at("position");
                 if(!p.at("native_bound").get<bool>()||!position.is_array()||position.size()!=3||!state.at("alive").is_boolean())return false;

@@ -3,6 +3,7 @@
 // in GameAssembly; this tool never takes an arbitrary process address.
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "runtime_scope.h"
+#include "authority/link_metadata.h"
 #include "nlohmann/json.hpp"
 #include <string>
 #include <mutex>
@@ -31,16 +32,26 @@ json inspect(const json& request) {
     auto* api=runtime();auto dll=GetModuleHandleW(L"GameAssembly.dll");
     if(!api||!dll)throw std::runtime_error("runtime unavailable");
     const auto name=request.at("class").get<std::string>(),space=request.value("namespace",std::string("Beyond.Gameplay.Core"));
+    if(request.contains("search")) {
+        const auto query=request.at("search").get<std::string>();
+        if(query.size()<3||query.size()>80||name.size()>80)throw std::runtime_error("invalid metadata search");
+        return {{"methods",eflink::authority::MetadataIndex{}.search(query,name,96)},{"gameplay_modified",false}};
+    }
+    if(request.value("metadata_only",false)) {
+        if(name.empty()||name.size()>200)throw std::runtime_error("invalid metadata class");
+        return {{"metadata",eflink::authority::MetadataIndex{}.classInfo(name,6,false)},{"gameplay_modified",false}};
+    }
     const auto library=request.value("assembly",std::string("Gameplay.Beyond.dll"));
     const bool protocol=library=="Beyond.Network.Proto.dll"&&space=="Proto";
     const bool application=(library=="Gameplay.Beyond.dll"||library=="Common.Beyond.dll"||
-        library=="Network.Beyond.dll")&&(space=="Beyond"||space.rfind("Beyond.",0)==0);
+        library=="Network.Beyond.dll"||library=="Unsafe.Beyond.dll")&&(space=="Beyond"||space.rfind("Beyond.",0)==0);
     if(name.empty()||name.size()>200||space.size()>200||(!protocol&&!application))
         throw std::runtime_error("invalid class/assembly");
     BE_ResolvedClassV1 type{};
     if(api->resolve_class(api->context,library.c_str(),space.c_str(),name.c_str(),&type)!=BE_Result_Ok)throw std::runtime_error("class unresolved");
     auto methods=sym<const void*(*)(const void*,void**)>(dll,"il2cpp_class_get_methods");
     auto methodName=sym<const char*(*)(const void*)>(dll,"il2cpp_method_get_name");
+    auto methodFlags=sym<unsigned(*)(const void*,unsigned*)>(dll,"il2cpp_method_get_flags");
     auto count=sym<unsigned(*)(const void*)>(dll,"il2cpp_method_get_param_count");
     auto param=sym<const void*(*)(const void*,unsigned)>(dll,"il2cpp_method_get_param");
     auto ret=sym<const void*(*)(const void*)>(dll,"il2cpp_method_get_return_type");
@@ -64,6 +75,7 @@ json inspect(const json& request) {
         BE_MethodDescriptorV1 descriptor{library.c_str(),space.c_str(),name.c_str(),label.c_str(),parameters.empty()?nullptr:parameters.c_str(),returns.c_str(),n};
         BE_ResolvedMethodV1 resolved{};auto result=api->resolve_method(api->context,&descriptor,&resolved);
         json item={{"name",label},{"parameters",parameters},{"return",returns},{"resolved",int(result)}};
+        unsigned implementation=0;item["static"]=(methodFlags(method,&implementation)&0x10)!=0;
         const auto address=reinterpret_cast<std::uintptr_t>(resolved.method_pointer);
         if(result==BE_Result_Ok&&address>=base&&address<base+imageSize) {
             item["rva"]=address-base;

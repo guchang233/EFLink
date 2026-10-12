@@ -143,7 +143,10 @@ inline PlayerInfo readPlayerInfo(Reader& r) {
     return p;
 }
 
-enum StateFlags:std::uint8_t {StateValid=1,StateAlive=2,StateCinematic=4,StateHidden=8};
+enum StateFlags:std::uint8_t {StateValid=1,StateAlive=2,StateCinematic=4,StateHidden=8,StateWeaponValid=16};
+// Optional view state occupies the three reserved high bits; wire and C ABI
+// layouts are unchanged. Native adapters still require room negotiation.
+inline unsigned weaponState(std::uint8_t flags) {return (flags>>5)&7;}
 // One sampled pose of a player's model, sent unreliably about twenty times a second.
 struct PlayerState {
     std::uint16_t id=0;

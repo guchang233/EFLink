@@ -6,8 +6,31 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <deque>
+#include <utility>
 
 namespace eflink::authority {
+// Commit removal only after native dispatch succeeds. A retry starts at the
+// failed message and cannot resend messages already accepted by the handler.
+class DeferredOfficialMessages {
+    std::deque<std::pair<std::string,std::string>> messages;
+    std::size_t bytes=0,countLimit,byteLimit;
+public:
+    explicit DeferredOfficialMessages(std::size_t count=512,std::size_t capacity=32u*1024*1024):countLimit(count),byteLimit(capacity) {}
+    bool append(std::string type,std::string data) {
+        if(messages.size()>=countLimit||data.size()>byteLimit-bytes)return false;
+        const auto size=data.size();messages.emplace_back(std::move(type),std::move(data));bytes+=size;return true;
+    }
+    template<class Dispatch> void replay(Dispatch dispatch) {
+        while(!messages.empty()) {
+            dispatch(messages.front().first,messages.front().second);
+            bytes-=messages.front().second.size();messages.pop_front();
+        }
+    }
+    std::size_t size() const {return messages.size();}
+    std::size_t byteSize() const {return bytes;}
+    bool empty() const {return messages.empty();}
+};
 struct OfficialViewSplit {
     bool changed=false;
     std::string visible,withheld;

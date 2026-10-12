@@ -9,7 +9,7 @@ if not exist build mkdir build
 set "TASK_ID=%~1"
 if "%TASK_ID%"=="" set "TASK_ID=eflink.core"
 pushd build
-set "TASK_FLAGS=/nologo /std:c++20 /EHa /W4 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I..\include /I..\src /I..\vendor\imgui"
+set "TASK_FLAGS=/bigobj /nologo /std:c++20 /EHa /W4 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I..\include /I..\src /I..\vendor\imgui"
 if "%~2"=="reuse-gui" goto module
 if "%~2"=="reuse-imgui" goto gui
 cl %TASK_FLAGS% /c ..\src\link_gui.cpp ..\vendor\imgui\imgui.cpp ..\vendor\imgui\imgui_draw.cpp ..\vendor\imgui\imgui_tables.cpp ..\vendor\imgui\imgui_widgets.cpp ..\vendor\imgui\backends\imgui_impl_win32.cpp ..\vendor\imgui\backends\imgui_impl_dx11.cpp
@@ -26,11 +26,36 @@ cl %TASK_FLAGS% ..\src\link_preview.cpp /Fe:EFLink.Preview.exe /link user32.lib
 if errorlevel 1 exit /b 1
 cl %TASK_FLAGS% /LD ..\examples\echo\echo.cpp /Fe:eflink.example.echo.dll /link /DYNAMICBASE /NXCOMPAT
 if errorlevel 1 exit /b 1
-for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_input_ownership_test link_map_consent_test link_native_op_policy_test link_official_view_test link_official_monster_test) do (
+for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_coop_contract_test link_cast_lifecycle_test link_damage_scope_test link_hit_provenance_test link_world_delta_test link_presentation_test link_presentation_codec_test link_appearance_test link_input_ownership_test link_map_consent_test link_native_op_policy_test link_official_view_test link_official_monster_test) do (
     cl %TASK_FLAGS% ..\tests\%%T.cpp /Fe:%%T.exe /link ws2_32.lib iphlpapi.lib
     if errorlevel 1 exit /b 1
 )
+rem UI tests need the imgui objects built above.
+cl %TASK_FLAGS% ..\tests\link_imgui_mesh_test.cpp imgui.obj imgui_draw.obj imgui_tables.obj imgui_widgets.obj /Fe:link_imgui_mesh_test.exe /link user32.lib imm32.lib
+if errorlevel 1 exit /b 1
+cl %TASK_FLAGS% ..\tests\link_ui_test.cpp imgui.obj imgui_draw.obj imgui_tables.obj imgui_widgets.obj /Fe:link_ui_test.exe /link user32.lib imm32.lib
+if errorlevel 1 exit /b 1
+link_imgui_mesh_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_ui_test.exe
+if not "%errorlevel%"=="0" exit /b 1
 link_protocol_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_coop_contract_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_cast_lifecycle_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_damage_scope_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_hit_provenance_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_world_delta_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_presentation_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_presentation_codec_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_appearance_test.exe
 if not "%errorlevel%"=="0" exit /b 1
 link_net_test.exe
 if not "%errorlevel%"=="0" exit /b 1
@@ -43,6 +68,8 @@ if not "%errorlevel%"=="0" exit /b 1
 link_native_op_policy_test.exe
 if not "%errorlevel%"=="0" exit /b 1
 link_official_view_test.exe
+if not "%errorlevel%"=="0" exit /b 1
+link_official_monster_test.exe
 if not "%errorlevel%"=="0" exit /b 1
 link_api_test.exe %TASK_ID%.dll %TASK_ID%
 exit /b %errorlevel%

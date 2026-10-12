@@ -3,6 +3,7 @@
 // CameraManager.TailLateTick; the module page and other modules control it through messages
 // and the exported EFLink_GetApiV1 table.
 #include "link_world.h"
+#include "link_damage_scope.h"
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "EndfieldLink/EndfieldLink.h"
 #include "runtime_scope.h"
@@ -80,7 +81,7 @@ void __fastcall onTick(void* instance,float delta,void* info) {
     std::lock_guard lock(worldMutex);
     auto* api=runtime();if(!api) return;
     if(cleanupRequested.load()) {
-        if(!canvasHooked.load()&&!cleanupDone.load()) {try {world.shutdown();} catch(...) {}cleanupDone.store(true);}
+        if(!canvasHooked.load()&&!cleanupDone.load()) {try {world.shutdown();cleanupDone.store(true);} catch(...) {}}
         return;
     }
     world.tick(api,net,session);
@@ -147,6 +148,48 @@ void __fastcall onDie(void* entity,void* info) {
 // the target view layout from runtime metadata before installing this hook.
 using CastSkill=bool(__fastcall*)(void*,void*,void*,void*,void*,void*,void*,void*,bool,void*);
 CastSkill nextCast=nullptr;BE_ResolvedMethodV1 castMethod{};bool castHooked=false;
+using SkillEnd=void(__fastcall*)(void*,int,int,void*,void*);
+SkillEnd nextSkillEnd=nullptr;BE_ResolvedMethodV1 skillEndMethod{};bool skillEndHooked=false;
+void __fastcall onSkillEnd(void* skill,int finish,int reason,void* context,void* info) {
+    if(!nextSkillEnd)return;
+    if(info&&info!=skillEndMethod.method_info) {nextSkillEnd(skill,finish,reason,context,info);return;}
+    std::lock_guard lock(worldMutex);
+    auto observed=cleanupRequested?std::optional<eflink::World::PlayerCastEndObservation>{}:world.beforePlayerCastEnd(skill,finish);
+    nextSkillEnd(skill,finish,reason,context,info);
+    if(observed&&!cleanupRequested)world.afterPlayerCastEnd(net,*observed,finish);
+}
+using GetCharInfo=void*(__fastcall*)(void*,std::uint64_t,void*);
+using TryGetCharInfo=bool(__fastcall*)(void*,std::uint64_t,void**,bool,void*);
+GetCharInfo nextCharInfo=nullptr;TryGetCharInfo nextTryCharInfo=nullptr;
+BE_ResolvedMethodV1 charInfoMethod{},tryCharInfoMethod{};bool charInfoHooked=false,tryCharInfoHooked=false;
+using WeaponModelPath=bool(__fastcall*)(int,std::uint64_t,void**,void*);
+WeaponModelPath nextWeaponPath=nullptr;BE_ResolvedMethodV1 weaponPathMethod{};bool weaponPathHooked=false;
+bool __fastcall onWeaponPath(int scope,std::uint64_t id,void** output,void* info) {
+    if(!nextWeaponPath)return false;
+    if(output&&(!info||info==weaponPathMethod.method_info)) {
+        std::lock_guard lock(worldMutex);bool handled=false;
+        if(!cleanupRequested)try {
+            const bool result=world.roomWeaponModelPath(id,output,handled);if(handled)return result;
+        }catch(...) {if(handled){*output=nullptr;return false;}}
+    }
+    return nextWeaponPath(scope,id,output,info);
+}
+void* __fastcall onCharInfo(void* bag,std::uint64_t id,void* info) {
+    if(!nextCharInfo)return nullptr;
+    if(!info||info==charInfoMethod.method_info) {
+        std::lock_guard lock(worldMutex);
+        if(!cleanupRequested)try {if(auto* room=world.roomCharacterInfo(id))return room;}catch(...) {}
+    }
+    return nextCharInfo(bag,id,info);
+}
+bool __fastcall onTryCharInfo(void* bag,std::uint64_t id,void** output,bool quiet,void* info) {
+    if(!nextTryCharInfo)return false;
+    if(output&&(!info||info==tryCharInfoMethod.method_info)) {
+        std::lock_guard lock(worldMutex);
+        if(!cleanupRequested)try {if(auto* room=world.roomCharacterInfo(id)) {*output=room;return true;}}catch(...) {}
+    }
+    return nextTryCharInfo(bag,id,output,quiet,info);
+}
 bool __fastcall onCast(void* ability,void* skill,void* target,void* ended,void* options,void* exclusive,void* started,void* castInfo,bool skip,void* info) {
     if(!nextCast)return false;
     if(info&&info!=castMethod.method_info)return nextCast(ability,skill,target,ended,options,exclusive,started,castInfo,skip,info);
@@ -154,7 +197,10 @@ bool __fastcall onCast(void* ability,void* skill,void* target,void* ended,void* 
     // observes room enemies so guests can replay the same attack on their copy.
     std::lock_guard lock(worldMutex);
     const bool accepted=nextCast(ability,skill,target,ended,options,exclusive,started,castInfo,skip,info);
-    if(accepted&&!cleanupRequested)world.observeEnemyCast(net,ability,skill,target);
+    if(accepted&&!cleanupRequested) {
+        if(skillEndHooked)world.observePlayerCastBegin(net,ability,skill,target);
+        world.observeEnemyCast(net,ability,skill,target);
+    }
     return accepted;
 }
 int __fastcall onDamage(void* ability,void* modifier,void* info) {
@@ -163,7 +209,10 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     std::lock_guard lock(worldMutex);
     if(!cleanupRequested)world.damageHookSeen();
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
-    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
+    eflink::DamageApplicationScope scope(ability,modifier);
+    if(!scope.observe())return nextDamage(ability,modifier,info);
+    auto source=cleanupRequested?decltype(world.observePlayerHitSource(net,modifier)){}:world.observePlayerHitSource(net,modifier);
+    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier,source);
     if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
     const auto result=nextDamage(ability,modifier,info);
@@ -181,9 +230,15 @@ int __fastcall onTransferred(void* ability,void* modifier,bool triggerEvent,void
     if(info&&info!=transferredMethod.method_info) return nextTransferred(ability,modifier,triggerEvent,info);
     std::lock_guard lock(worldMutex);
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
-    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
+    eflink::DamageApplicationScope scope(ability,modifier);
+    if(!scope.observe())return nextTransferred(ability,modifier,triggerEvent,info);
+    auto source=cleanupRequested?decltype(world.observePlayerHitSource(net,modifier)){}:world.observePlayerHitSource(net,modifier);
+    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier,source);
+    if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier))return 0;
+    auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
     const auto result=nextTransferred(ability,modifier,triggerEvent,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
+    if(observation)world.afterNativeDamage(net,*observation,result);
     if(!cleanupRequested)world.noteDamage("transferred",ability,std::to_string(result));
     return result;
 }
@@ -277,6 +332,16 @@ void __fastcall onReceive(void* bus,const void* response,void* info) {
             auto objectClass=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(dll,"il2cpp_object_get_class"));
             auto nameOf=reinterpret_cast<const char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_get_name"));
             const char* name=objectClass&&nameOf?nameOf(objectClass(body)):nullptr;
+            // Observe official equipment metadata without changing or consuming
+            // its response. Account/weapon instance IDs remain in a local cache.
+            if(name&&(std::strcmp(name,"SC_LOGIN")==0||eflink::authority::OfficialAppearance::accepts(name))) {
+                std::lock_guard lock(worldMutex);
+                if(!cleanupRequested) {
+                    if(std::strcmp(name,"SC_LOGIN")==0)world.resetAppearance();
+                    else try {world.observeAppearance(name,eflink::authority::NativeFeed::decode64(officialCodec.serialize(body)));}
+                    catch(...) {world.rejectAppearance();}
+                }
+            }
             if(name&&(std::strcmp(name,"SC_OBJECT_ENTER_VIEW")==0||std::strcmp(name,"SC_OBJECT_LEAVE_VIEW")==0)) {
                 std::lock_guard lock(worldMutex);
                 if(!cleanupRequested) {
@@ -284,6 +349,7 @@ void __fastcall onReceive(void* bus,const void* response,void* info) {
                     world.observeOfficial(name,bytes);
                     const auto split=world.filtering()?eflink::authority::splitOfficialView(name,bytes):eflink::authority::OfficialViewSplit{};
                     if(split.changed) {
+                        bool hasReplacement=false;
                         if(!split.visible.empty()) {
                             // Keep headMsg, packing state and receive timestamp.
                             // Only msgBody changes; never consume official seq IDs.
@@ -291,11 +357,13 @@ void __fastcall onReceive(void* bus,const void* response,void* info) {
                             replacementRoot=std::make_unique<eflink::unity::Api::TemporaryRoot>(runtime(),replacement);
                             std::memcpy(filtered,response,sizeof filtered);
                             std::memcpy(filtered+responseBodyOffset,&replacement,sizeof replacement);
-                            replaced=true;
+                            hasReplacement=true;
                         }
                         // Commit only after the replacement parsed successfully.
-                        world.withholdOfficial(name,split.withheld);
-                        if(!replaced)return;
+                        if(world.withholdOfficial(name,split.withheld)) {
+                            replaced=hasReplacement;
+                            if(!replaced)return;
+                        }
                     }
                 }
             }
@@ -445,6 +513,18 @@ BE_Result installHook() {
         installOpFilter(api);
         installOutboundObserver(api);
         installGuestGates(api);
+        BE_MethodDescriptorV1 charInfo{"Gameplay.Beyond.dll","Beyond.Gameplay","CharBagSystem","GetCharInfo","System.UInt64","Beyond.Gameplay.CharInfo",1};
+        BE_MethodDescriptorV1 tryCharInfo{"Gameplay.Beyond.dll","Beyond.Gameplay","CharBagSystem","TryGetCharInfo","System.UInt64|Beyond.Gameplay.CharInfo&|System.Boolean","System.Boolean",3};
+        if(api->resolve_method(api->context,&charInfo,&charInfoMethod)==BE_Result_Ok&&charInfoMethod.method_pointer) {
+            std::uint64_t charHandle=0;charInfoHooked=host.hooks->create(host.hooks->context,kId,charInfoMethod.method_pointer,reinterpret_cast<void*>(onCharInfo),reinterpret_cast<void**>(&nextCharInfo),&charHandle)==BE_Result_Ok;
+        }
+        if(api->resolve_method(api->context,&tryCharInfo,&tryCharInfoMethod)==BE_Result_Ok&&tryCharInfoMethod.method_pointer) {
+            std::uint64_t charHandle=0;tryCharInfoHooked=host.hooks->create(host.hooks->context,kId,tryCharInfoMethod.method_pointer,reinterpret_cast<void*>(onTryCharInfo),reinterpret_cast<void**>(&nextTryCharInfo),&charHandle)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 weaponPath{"Gameplay.Beyond.dll","Beyond.Gameplay","WeaponUtil","TryGetWeaponModelPathByCharInstId","Beyond.Gameplay.Scope|System.UInt64|System.String&","System.Boolean",3};
+        if(api->resolve_method(api->context,&weaponPath,&weaponPathMethod)==BE_Result_Ok&&weaponPathMethod.method_pointer) {
+            std::uint64_t pathHandle=0;weaponPathHooked=host.hooks->create(host.hooks->context,kId,weaponPathMethod.method_pointer,reinterpret_cast<void*>(onWeaponPath),reinterpret_cast<void**>(&nextWeaponPath),&pathHandle)==BE_Result_Ok;
+        }
         BE_MethodDescriptorV1 markTarget{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","GetMarkTargetScore",
             "Beyond.Gameplay.Core.AbilitySystem|Beyond.Gameplay.Core.BattleManager.MarkTargetPriority&|System.Single&|System.Boolean&","System.Boolean",4};
         if(api->resolve_method(api->context,&markTarget,&markTargetScoreMethod)==BE_Result_Ok&&markTargetScoreMethod.method_pointer) {
@@ -493,6 +573,23 @@ BE_Result installHook() {
                 std::uint64_t castHandle=0;castHooked=host.hooks->create(host.hooks->context,kId,castMethod.method_pointer,reinterpret_cast<void*>(onCast),reinterpret_cast<void**>(&nextCast),&castHandle)==BE_Result_Ok;
             }
         }
+        BE_MethodDescriptorV1 skillEnd{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","Skill","CastEnd",
+            "Beyond.Gameplay.Core.Skill.FinishType|Beyond.Gameplay.Core.Skill.InterruptReason|System.Nullable<Beyond.Gameplay.Core.Skill.InterruptContext>","System.Void",3};
+        if(api->resolve_method(api->context,&skillEnd,&skillEndMethod)==BE_Result_Ok&&skillEndMethod.method_pointer) {
+            auto parameter=reinterpret_cast<const void*(*)(const void*,unsigned)>(GetProcAddress(assembly,"il2cpp_method_get_param"));
+            auto fromType=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(assembly,"il2cpp_class_from_type"));
+            auto valueSize=reinterpret_cast<int(*)(const void*,unsigned*)>(GetProcAddress(assembly,"il2cpp_class_value_size"));
+            if(parameter&&fromType&&valueSize) {
+                auto* type=parameter(skillEndMethod.method_info,2);auto* klass_=type?fromType(type):nullptr;unsigned alignment=0;
+                // Nullable<InterruptContext> is passed indirectly on Windows x64.
+                if(klass_&&valueSize(klass_,&alignment)==24&&alignment==8) {
+                    std::uint64_t endHandle=0;skillEndHooked=host.hooks->create(host.hooks->context,kId,skillEndMethod.method_pointer,reinterpret_cast<void*>(onSkillEnd),reinterpret_cast<void**>(&nextSkillEnd),&endHandle)==BE_Result_Ok;
+                }
+            }
+        }
+        {std::lock_guard lock(worldMutex);world.setNativeEvidence(damageHooked&&transferredHooked&&dieHooked&&castHooked,
+            officialFilterReady&&opFilterReady&&enemyTargetHooked&&enableEnemyFindHooked&&assignEnemyTargetHooked);
+            world.setWeaponLookupEvidence(charInfoHooked&&tryCharInfoHooked&&weaponPathHooked);}
     }
     return result;
 }
@@ -572,7 +669,8 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"room_character_lookup_ready",charInfoHooked&&tryCharInfoHooked&&weaponPathHooked},
+        {"player_cast_observer_ready",castHooked&&skillEndHooked},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs}}}};
@@ -733,6 +831,9 @@ BE_Result BE_CALL initialize(const BE_ThirdPartyHostV1* input,const char* config
         if(!net.start()) {host={};return BE_Result_Failed;}
         cleanupRequested=false;cleanupDone=false;
         hookError.clear();guiError.clear();
+#ifdef EFLINK_NATIVE_DIAGNOSTICS
+        {std::lock_guard nativeLoggerLock(worldMutex);world.setNativeOperationLogger([](const std::string& message){if(host.log)host.log(host.context,message.c_str());});}
+#endif
         hookWorker=std::jthread([](std::stop_token stop) {
             while(!stop.stop_requested()&&!hooked.load()) {
                 {std::lock_guard workerLock(lifecycle);if(!initialized) return;const auto r=installHook();if(r!=BE_Result_Ok&&r!=BE_Result_NotReady) hookError="game hook unavailable ("+std::to_string(int(r))+")";}
@@ -778,8 +879,9 @@ void BE_CALL shutdown() {
     if(hooked.load()||canvasHooked.load()) {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if(!cleanupDone.load()&&host.log)host.log(host.context,"EF Link cleanup did not complete before module unload; inspect native restoration diagnostics");
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
+        hooked=false;canvasHooked=false;castHooked=false;skillEndHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;charInfoHooked=false;tryCharInfoHooked=false;weaponPathHooked=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     std::lock_guard lock(lifecycle);std::lock_guard lockWorld(worldMutex);host={};

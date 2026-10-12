@@ -75,10 +75,11 @@ public:
     }
     // Classes named `name` (any namespace): parents, static fields (with the
     // class of the object they hold), instance fields.
-    nlohmann::json classInfo(const std::string& name,std::size_t limit=6) const {
+    nlohmann::json classInfo(const std::string& name,std::size_t limit=6,bool readStaticObjects=true) const {
         static auto klassName=symbol<const char*(*)(const void*)>("il2cpp_class_get_name");
         static auto klassSpace=symbol<const char*(*)(const void*)>("il2cpp_class_get_namespace");
         static auto parent=symbol<const void*(*)(const void*)>("il2cpp_class_get_parent");
+        static auto declaring=symbol<const void*(*)(const void*)>("il2cpp_class_get_declaring_type");
         static auto fieldsOf=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_fields");
         static auto fieldName=symbol<const char*(*)(const void*)>("il2cpp_field_get_name");
         static auto fieldType=symbol<const void*(*)(const void*)>("il2cpp_field_get_type");
@@ -91,6 +92,7 @@ public:
         auto domainGet=symbol<void*(*)()>("il2cpp_domain_get");
         auto assemblies=symbol<void**(*)(void*,std::size_t*)>("il2cpp_domain_get_assemblies");
         auto imageOf=symbol<const void*(*)(const void*)>("il2cpp_assembly_get_image");
+        auto imageName=symbol<const char*(*)(const void*)>("il2cpp_image_get_name");
         auto classCount=symbol<std::size_t(*)(const void*)>("il2cpp_image_get_class_count");
         auto classAt=symbol<const void*(*)(const void*,std::size_t)>("il2cpp_image_get_class");
         std::size_t count=0;auto** list=assemblies(domainGet(),&count);
@@ -98,7 +100,10 @@ public:
             const auto* image=imageOf(list[a]);if(!image)continue;
             for(std::size_t c=0,n=classCount(image);c<n&&out.size()<limit;++c) {
                 const auto* klass=classAt(image,c);if(!klass||name!=klassName(klass)||!seen.insert(klass).second)continue;
-                nlohmann::json info;info["class"]=std::string(klassSpace(klass))+"."+klassName(klass);
+                std::string fullName=klassName(klass);const auto* top=klass;
+                for(auto* outer=declaring(klass);outer;outer=declaring(outer)) {fullName=std::string(klassName(outer))+"/"+fullName;top=outer;}
+                nlohmann::json info;info["class"]=std::string(klassSpace(top))+"."+fullName;
+                info["assembly"]=imageName(image);
                 nlohmann::json parents=nlohmann::json::array();for(auto* p=parent(klass);p;p=parent(p))parents.push_back(std::string(klassSpace(p))+"."+klassName(p));
                 info["parents"]=parents;info["static"]=nlohmann::json::array();info["instance"]=nlohmann::json::array();
                 for(const void* k=klass;k;k=parent(k)) {
@@ -107,12 +112,12 @@ public:
                         const auto* type=fieldType(field);nlohmann::json row={{"name",fieldName(field)},{"type",typeText(type)},{"declared",klassName(k)}};
                         if(fieldFlags(field)&0x10) {
                             const int kind=typeKind(type);
-                            if(kind==0x12||kind==0x15||kind==0x1c) { // class, generic instance, object
+                            if(readStaticObjects&&(kind==0x12||kind==0x15||kind==0x1c)) { // class, generic instance, object
                                 classInit(k);void* value=nullptr;staticValue(field,&value);
                                 row["holds"]=value?std::string(klassSpace(objectClass(value)))+"."+klassName(objectClass(value)):"null";
                             }
                             info["static"].push_back(row);
-                        } else if(info["instance"].size()<80) info["instance"].push_back(row);
+                        } else if(info["instance"].size()<256) info["instance"].push_back(row);
                     }
                 }
                 out.push_back(std::move(info));
