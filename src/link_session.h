@@ -12,6 +12,7 @@
 #include "link_version.h"
 #include "link_presentation.h"
 #include "link_presentation_codec.h"
+#include "link_resource_authority.h"
 #include <optional>
 #include "nlohmann/json.hpp"
 
@@ -121,6 +122,7 @@ class Session {
     std::atomic<std::uint64_t> presentationCoalesced{0};
     std::uint64_t presentationSequence=0,lastPresentation=0,presentationReceived=0,presentationSkipped=0,presentationRawBytes=0,presentationWireBytes=0,presentationPacked=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
+    Json resourceBaseline=Json::array();std::uint64_t resourceRevision=0,lastResourcePublish=0,resourceSeen=0;
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
         body["schema"]=coopWorldSchema;body["room"]=room;
         const auto plain=body.dump();const bool presentation=body.value("kind",Json{})=="presentation";
@@ -192,6 +194,7 @@ public:
             room=s.roomId;role=s.role;epoch=revision=seenAt=lastPublish=commandSequence=0;world=Json::object();
             sentWorld=nullptr;lastBaseline=sentRevision=0;baselineMissing=publishBlocked=sceneResetPending=false;
             presentations.clear();presentationSequence=lastPresentation=0;
+            resourceBaseline=Json::array();resourceRevision=lastResourcePublish=resourceSeen=0;
             playerCasts.clear();castEvents.clear();hitClaimLedger.clear();
             hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();hitSequences.clear();hitBudgets.clear();hitSequence=0;
             sequences.clear();attackBudgets.clear();locations.clear();lastLocation=0;commands.clear();teleport=Json::object();actorTeleports.clear();error.clear();
@@ -244,6 +247,11 @@ public:
                     const std::string build=b.contains("build")&&b.at("build").is_string()?b.at("build").get<std::string>().substr(0,64):std::string{};
                     compatibility[packet.from]={compatible,nowMs(),build};
                     if(!compatible) {++rejected;entries.erase(packet.from);if(role==Role::Client)admitted=false;}
+                } else if(kind=="resource_baseline") {
+                    if(b.size()!=8||role!=Role::Client||packet.from!=proto::kHostId||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(proto::kHostId)||
+                       b.at("epoch")!=epoch||b.at("map")!=world.at("map")||b.at("level")!=world.at("level")||
+                       !positiveRoomId(b.at("revision"))||b.at("revision").get<std::uint64_t>()<=resourceRevision||!validResourceBaseline(b.at("objects"))) {++rejected;continue;}
+                    resourceBaseline=b.at("objects");resourceRevision=b.at("revision").get<std::uint64_t>();resourceSeen=nowMs();
                 } else if(kind=="presentation") {
                     const auto owner=b.at("peer").get<std::uint16_t>();const auto* p=find(s,owner);
                     if(!ready()||!protocolCompatible(role==Role::Host?packet.from:proto::kHostId)||
@@ -275,7 +283,7 @@ public:
                         candidateActor=player.at("entity").get<std::uint64_t>();candidateBound=player.value("native_bound",false)&&player.value("in_scene",false);
                     }
                     if(e!=epoch||candidateActor!=playerEntity(s.localId)||(admitted&&!candidateBound)) {teleport=Json::object();commands.clear();replica={};admitted=false;playerHits.clear();enemyCasts.clear();
-                        if(e!=epoch) {playerCasts.clear();castEvents.clear();hitClaimLedger.clear();}
+                        if(e!=epoch) {playerCasts.clear();castEvents.clear();hitClaimLedger.clear();resourceBaseline=Json::array();resourceRevision=resourceSeen=0;}
                         entryToken=nowMs()^(std::uint64_t(room)<<32)^e; if(!entryToken)entryToken=1;
                         lastEntryReport=lastEntryAck=0;entryBlockers=Json::array();}
                     epoch=e;revision=r;world=std::move(candidate);seenAt=nowMs();baselineMissing=false;++received;
@@ -444,6 +452,7 @@ public:
             sentWorld=nullptr;lastBaseline=sentRevision=0;
             playerCasts.clear();castEvents.clear();hitClaimLedger.clear();
             sceneResetPending=false;
+            resourceBaseline=Json::array();resourceRevision=lastResourcePublish=resourceSeen=0;
         }
         entityLedger.annotate(value["entities"]);
         realm.reconcile(net.snapshot(),epoch,value.at("map").get<std::string>(),value.at("level").get<std::string>());
@@ -515,6 +524,14 @@ public:
         if(send(net,std::move(value),role==Role::Host?proto::kEveryone:proto::kHostId)){lastPresentation=now;return true;}
         return false;
     }
+    bool publishResources(Net& net,const Json& value) {
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!validResourceBaseline(value)||resourceRevision==UINT64_MAX)return false;
+        if(nowMs()-lastResourcePublish<250||net.transmitPressure()>64u*1024)return false;
+        const auto next=resourceRevision+1;
+        if(!send(net,{{"kind","resource_baseline"},{"epoch",epoch},{"revision",next},{"map",world.at("map")},{"level",world.at("level")},{"objects",value}}))return false;
+        resourceBaseline=value;resourceRevision=next;lastResourcePublish=resourceSeen=nowMs();return true;
+    }
+    Json resources() const {return ready()&&localSceneOperational()&&followHost&&combat&&resourceSeen&&nowMs()-resourceSeen<=1500?resourceBaseline:Json::array();}
     Json presentation(std::uint16_t peer) const {
         auto it=presentations.find(peer);
         if(it==presentations.end()||nowMs()-it->second.seen>500||it->second.data.value("epoch",std::uint64_t{})!=epoch)return Json{};
@@ -680,6 +697,7 @@ public:
             admitted=false;replica={};lastEntryAck=lastEntryReport=0;
             for(auto& [id,entry]:entries)entry.active=false;
             commands.clear();hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();castEvents.clear();
+            resourceBaseline=Json::array();resourceSeen=0;
         }
     }
     bool localSceneOperational() const {return localSceneReady;}
@@ -769,6 +787,8 @@ public:
             {"ages",[&]{Json ages=Json::array();for(const auto& [peer,p]:presentations)ages.push_back({{"peer",peer},{"age_ms",nowMs()-p.seen}});return ages;}()},{"native_skill_replay",false}}},
         {"player_casts",{{"accepted",castEventsAccepted},{"active",playerCasts.active(nowMs())},{"replay_enabled",false}}},
         {"hit_claims",{{"accepted",hitsAccepted},{"legacy_numeric_rejected",legacyHitsRejected},{"native_verification_required",true}}},
+        {"resources",{{"observed",resources().size()},{"revision",resourceRevision},{"age_ms",resourceSeen?nowMs()-resourceSeen:0},
+            {"operation_adapter_verified",false},{"replica_adapter_verified",false}}},
         {"age_ms",seenAt?nowMs()-seenAt:0},{"snapshots_received",received},{"skill_intents_accepted",attacks},{"hits_accepted",hitsAccepted},{"rejected",rejected},{"entry",entryStatus()},{"error",error}};}
 };
 }

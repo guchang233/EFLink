@@ -785,6 +785,8 @@ struct UiPanel {
         rail(-reserved);
         ImGui::SameLine();
         ImGui::BeginChild("content",{0,-reserved},ImGuiChildFlags_AlwaysUseWindowPadding);
+        ui::notice(ui::Tone::Warning,"实验模组存在账号处罚及状态异常风险；官方连接不代表官方认可，无法保证零封号风险。未验收能力不属于完整同步。");
+        ui::vspace(ui::px(8));
         if(tab==0) pageRooms();
         else if(tab==1) pageConnect();
         else if(tab==2) pageHost();

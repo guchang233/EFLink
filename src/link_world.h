@@ -1971,6 +1971,7 @@ private:
         mapHash=mapId.empty()?0:proto::fnv32(mapId);
     }
     #include "link_world_presentation.h"
+    #include "link_world_resources.h"
     void sample(Net& net) {
         const auto now=nowMs();
         if(now-lastMap>1000) {lastMap=now;readMap();}
@@ -2217,6 +2218,21 @@ private:
         return out;
     }
 public:
+    // Used by the separate read-only resource inspector, on the native game thread.
+    // This does not tick the room adapter or execute any gameplay operation.
+    nlohmann::json inspectNativeResources(const BE_HostApiV1* host) {
+        runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
+        auto* info=staticObject("worldInfo");auto* level=staticObject("levelLoader");
+        if(!info||!level||!api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info)||
+           api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),level))throw std::runtime_error("native scene is not ready for resource inspection");
+        mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
+        nlohmann::json resources=nlohmann::json::array();
+        nlohmann::json properties;
+        try {for(const auto& value:sampleResources())resources.push_back(value.state);properties=resourceProperties();}
+        catch(...) {clearResources();throw;}
+        auto types=resourceNativeTypes;auto unknown=resourceUnknown;clearResources();
+        return {{"map",mapId},{"level",levelId},{"resources",resources},{"properties",properties},{"native_types",types},{"unadapted",unknown},{"gameplay_modified",false}};
+    }
     const nlohmann::json& markerSnapshot() const {return markers;}
     bool takeHostMapNotice() {return hostMapConsent.takeNotice();}
     void chooseHostMap(Net& net,std::uint64_t token,bool follow) {
@@ -3424,6 +3440,7 @@ public:
         }
         nativePlayerCastBindings.retain(net.snapshot().roomId,link.playerEntity(net.snapshot().localId),link.generation(),nowMs());
         updatePresentation(net,link);
+        updateResources(net,link);
         for(const auto& event:link.takePlayerCasts()) {lastPlayerCast=event;++playerCastEventsSeen;}
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
@@ -3443,10 +3460,12 @@ public:
     // Game thread only.
     void clear() {
         clearPresentation();
+        clearResources();
         for(auto& [id,a]:avatars) {try {destroyAvatar(a);} catch(...) {}}
         avatars.clear();
     }
     void shutdown() {
+        clearResources();
         clearPlayerCastObservations();
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         if(!diagnosticFeedIds.empty())try {
@@ -3496,6 +3515,8 @@ public:
                 {"party_error",partySamplingError},{"effect_error",effectSamplingError},{"error",presentationError},{"native_skill_replay",false},{"full_sync_verified",false}}},
             {"player_casts",{{"events_sent",playerCastEventsSent},{"events_seen",playerCastEventsSeen},{"tracked",observedPlayerCasts.size()},
                 {"last",lastPlayerCast},{"replay_enabled",false}}},
+            {"resources",{{"local",nativeResourceCensus},{"scans",resourceScans},{"unadapted_native_objects",resourceUnknown},
+                {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},{"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
             {"hit_provenance",{{"matched",nativePlayerHitMatched},{"missing",nativePlayerHitMissing},{"bindings",nativePlayerCastBindings.size()},
                 {"last",lastPlayerHitSource},{"error",nativePlayerHitError},{"observation_only",true}}},
             {"world_replication",{{"native_entities",enemies.size()},{"private_enemies_quarantined",privateEnemies.size()},

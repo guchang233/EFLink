@@ -54,6 +54,20 @@ int main() {
     check(h.publish(host,scene(),true),"host publishes a real world snapshot");
     check(wait([&]{tick();return g.ready();}),"guest receives host map and enemies");
     check(wait([&]{tick();return h.protocolCompatible(2)&&g.protocolCompatible(1);}),"both game adapters negotiate the current cooperation contract");
+    const Json resource=Json::array({{{"key","map01_lv001:mine:logic:12"},{"kind","mine"},{"template","mineral_test"},{"position",{1,0,1}},
+        {"hp_ratio",10000},{"max_hp_ratio",10000},{"collected",false},{"life",1ull},{"version",1ull}}});
+    check(h.publishResources(host,resource)&&wait([&]{tick();return g.resources()==resource;}),"only the host publishes native mineral observations without granting combat admission");
+    auto forgedResource=Json{{"kind","resource_baseline"},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},
+        {"epoch",h.generation()},{"revision",99ull},{"map","map01"},{"level","map01_lv001"},{"objects",resource}};
+    auto resourceRejected=h.status()["rejected"].get<unsigned>();raw(guest,forgedResource,1);
+    check(wait([&]{tick();return h.status()["rejected"].get<unsigned>()>resourceRejected;})&&h.resources()==resource,
+        "guest cannot publish mineral durability or destruction as authority");
+    resourceRejected=g.status()["rejected"].get<unsigned>();forgedResource["epoch"]=h.generation()+1;raw(host,forgedResource,2);
+    check(wait([&]{tick();return g.status()["rejected"].get<unsigned>()>resourceRejected;})&&g.resources()==resource,
+        "resource observations from another scene generation cannot replace the active baseline");
+    resourceRejected=g.status()["rejected"].get<unsigned>();forgedResource["epoch"]=h.generation();forgedResource["revision"]=0ull;raw(host,forgedResource,2);
+    check(wait([&]{tick();return g.status()["rejected"].get<unsigned>()>resourceRejected;}),"zero resource baseline revisions are rejected");
+    g.setLocalSceneReady(false);check(g.resources().empty(),"loading revokes resource visibility and operation references immediately");g.setLocalSceneReady(true);
     Json member={{"slot",0},{"life",1ull},{"controlled",true},{"model",growthModel},{"flags",1},
         {"position",{0,0,0}},{"rotation",{0,0,0,1}},{"root",{0,0,0}},{"bones",Json::array()},{"names",Json::array()},
         {"growth",growth},{"appearance",appearance}};
