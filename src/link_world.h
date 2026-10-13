@@ -5,6 +5,7 @@
 #include "link_session.h"
 #include "unity_bridge.h"
 #include "authority/native_build_policy.h"
+#include "authority/native_resource_state.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_native_feed.h"
@@ -1976,27 +1977,41 @@ public:
         if(key.empty())throw std::runtime_error("mineral callback has no verified stable key");
         const auto kind=api.value<int>(gm("InteractiveDoodadCommonComponent","get_natureResourceType","","Beyond.Gameplay.ENatureType"),object);
         if(kind!=enumValue<int>("ENatureType","Mine","Beyond.Gameplay"))throw std::runtime_error("callback does not target a mineral");
-        auto parameters=nlohmann::json::object();
-        if(board&&classOf(board)=="Beyond.Gameplay.ParamBlackboard") {
-            auto* dictionary=readField<void*>(board,"ParamBlackboard","variableDict","Beyond.Gameplay");
-            if(dictionary) {
-                auto* keys=collection(dictionary,"get_Keys");eflink::unity::Api::TemporaryRoot keysRoot(runtime,keys);
+        auto parameters=nlohmann::json::object(),parameterBoards=nlohmann::json::array();std::set<void*> seenBoards;
+        const auto boardClass=board?classOf(board):std::string{};
+        std::function<void(void*,const std::string&,unsigned)> inspectBoard;
+        inspectBoard=[&](void* current,const std::string& path,unsigned depth) {
+            if(!current||depth>3||seenBoards.size()>=16||!seenBoards.insert(current).second)return;
+            auto* type=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(current);
+            auto base=api.klass("ParamBlackboard","Gameplay.Beyond.dll","Beyond.Gameplay");bool compatible=false;
+            for(auto* c=type;c;c=symbol<const void*(*)(const void*)>("il2cpp_class_get_parent")(c))if(c==base.class_info){compatible=true;break;}
+            if(!compatible)return;
+            auto* dictionary=readField<void*>(current,"ParamBlackboard","variableDict","Beyond.Gameplay");
+            auto* references=readField<void*>(current,"ParamBlackboard","subBlackboardRefDict","Beyond.Gameplay");
+            auto count=[&](void* map) {int value=0;if(map)if(auto* boxed=collection(map,"get_Count"))std::memcpy(&value,runtime->object_unbox(runtime->context,boxed),sizeof value);
+                if(value<0||value>4096)throw std::runtime_error("mineral event parameter map outside bounds");return value;};
+            parameterBoards.push_back({{"path",path},{"class",classOf(current)},{"variables",count(dictionary)},{"references",count(references)}});
+            auto each=[&](void* map,const std::function<void(const std::string&,void*)>& visit) {
+                if(!map)return;
+                auto* keys=collection(map,"get_Keys");eflink::unity::Api::TemporaryRoot keysRoot(runtime,keys);
                 auto* enumerator=genericValueCall(keys,"GetEnumerator");eflink::unity::Api::TemporaryRoot enumRoot(runtime,enumerator);
-                for(unsigned i=0;i<64;++i) {
+                for(unsigned i=0;i<64&&parameters.size()<128;++i) {
                     auto* box=genericValueCall(enumerator,"MoveNext");bool more=false;
                     if(!box)throw std::runtime_error("mineral event parameter enumeration unavailable");
                     std::memcpy(&more,runtime->object_unbox(runtime->context,box),sizeof more);if(!more)break;
                     const auto name=text(genericValueCall(enumerator,"get_Current"));if(name.empty()||name.size()>128)continue;
-                    auto* variable=collection(dictionary,"get_Item",{api.string(name)});
-                    if(variable)parameters[name]=classOf(variable);
+                    auto* value=collection(map,"get_Item",{api.string(name)});if(value)visit(name,value);
                 }
-            }
-        }
+            };
+            each(dictionary,[&](const std::string& name,void* variable){parameters[path+"/"+name]=classOf(variable);});
+            each(references,[&](const std::string& name,void* child){inspectBoard(child,path+"/"+name,depth+1);});
+        };
+        inspectBoard(board,"root",0);
         return {{"map",mapId},{"level",levelId},{"key",key+"/mine"},
             {"hp_ratio",readField<int>(object,"InteractiveDoodadCommonComponent","m_hpRatioRuntime")},
             {"server_hp_ratio",readField<int>(object,"InteractiveDoodadCommonComponent","m_hpRatio")},
             {"collected",readField<bool>(object,"InteractiveDoodadCommonComponent","m_isCollected")},
-            {"parameter_types",parameters},{"gameplay_modified",false}};
+            {"board_class",boardClass},{"parameter_boards",parameterBoards},{"parameter_types",parameters},{"gameplay_modified",false}};
     }
     // Used by the separate read-only resource inspector, on the native game thread.
     // This does not tick the room adapter or execute any gameplay operation.

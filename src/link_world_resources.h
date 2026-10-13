@@ -61,16 +61,15 @@
                    old->second.natureId==natureId&&old->second.identity.matches(identity))incarnation=old->second.incarnation;
                 else {if(nextResourceCookie==UINT64_MAX)throw std::runtime_error("native mineral allocation cookie exhausted");incarnation=++nextResourceCookie;}
                 const auto position=api.value<V3>(gm(type.c_str(),"get_natureResourcePosition","","UnityEngine.Vector3",space.c_str()),object);
-                const auto hp=readField<int>(object,type.c_str(),"m_hpRatioRuntime",space.c_str());
+                const auto hp=readField<int>(object,type.c_str(),"m_hpRatio",space.c_str());
                 const auto max=enumValue<int>(type.c_str(),"MAX_HP_RATIO",space.c_str());
                 const bool collected=readField<bool>(object,type.c_str(),"m_isCollected",space.c_str());
-                nlohmann::json state={{"template",resourceTemplate},{"position",{position.x,position.y,position.z}},
-                    {"hp_ratio",hp},{"max_hp_ratio",max},{"collected",collected}};
-                if(!worldauthority::validState(state)||max<=0)throw std::runtime_error("native mineral state outside verified bounds");
+                auto observation=worldauthority::mineralObservation({key,resourceTemplate,{position.x,position.y,position.z},incarnation,hp,
+                    readField<int>(object,type.c_str(),"m_hpRatioRuntime",space.c_str()),max,collected});
                 if(sampled.contains(key))throw std::runtime_error("multiple native minerals share an identity");
                 const auto root=rootOf(object);if(!root)throw std::runtime_error("native mineral rooting failed");
                 sampled.emplace(key,NativeResource{object,root,component,incarnation,natureId,identity,type,space,key});
-                result.push_back({key,"mineral",std::move(state),incarnation});
+                result.push_back(std::move(observation));
                 if(result.size()>512)throw std::runtime_error("native mineral baseline exceeds capacity");
             }
             if(!complete)throw std::runtime_error("native resource census truncated; previous baseline retained");

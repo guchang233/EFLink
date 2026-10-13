@@ -1,5 +1,6 @@
 #include "authority/world_authority.h"
 #include "authority/native_build_policy.h"
+#include "authority/native_resource_state.h"
 #include <atomic>
 #include <cstdio>
 using namespace eflink::worldauthority;
@@ -35,6 +36,15 @@ struct Fixture:NativeAdapter {
     void releasePersonal(std::uint64_t) noexcept override {++releases;retained=false;}
 };
 int main() {
+    MineralReading reading{"ore","quartz",{1,2,3},9,1490,1356,10000,false};
+    const auto committed=mineralObservation(reading);
+    check(committed.state["hp_ratio"]==1490&&!committed.state.contains("runtime_hp_ratio")&&mineralReadback(reading)["runtime_diverged"]==true,
+        "native runtime prediction stays diagnostic and cannot replace property durability");
+    reading.runtimeHp=0;check(mineralObservation(reading).state["collected"]==false,
+        "zero predicted runtime HP cannot manufacture resource destruction");
+    reading.propertyHp=0;check(mineralObservation(reading).state["collected"]==false,
+        "zero property durability cannot invent a not-yet-observed native collection flag");
+    reading.propertyHp=-1;check(throws([&]{mineralObservation(reading);}),"invalid native property value is rejected rather than clamped to a fabricated result");
     check(readOnlyBuildSupported("1.5.3")&&!readOnlyBuildSupported("")&&!readOnlyBuildSupported("1.5.4")&&!readOnlyBuildSupported("fixture-only"),
         "native read-only hooks default off for unknown game builds");
     Host host;Fixture adapter;host.reset(scene(),"fixture-only");
