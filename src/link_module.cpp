@@ -482,6 +482,14 @@ BE_Result installHook() {
     auto* api=runtime();
     if(!api||!api->resolve_method||!api->resolve_class||!host.hooks||!host.hooks->create) return BE_Result_NotReady;
     RuntimeThreadScope scope(true);if(!scope.ready()) return BE_Result_NotReady;
+    std::string gameVersion;
+    try {gameVersion=eflink::worldauthority::nativeGameVersion(api);}
+    catch(const std::exception& e) {hookError=e.what();return BE_Result_NotReady;}
+    catch(...) {hookError="native version probe unavailable";return BE_Result_NotReady;}
+    if(!eflink::worldauthority::readOnlyBuildSupported(gameVersion)) {
+        hookError="未验证游戏版本 "+gameVersion+"；原生游戏适配停用，账号风险不能排除";
+        return BE_Result_ContractMismatch;
+    }
     if(configuration.value("gui_enabled",true)&&!configuration.value("preview_mode",false)&&!canvasHooked) {
         BE_MethodDescriptorV1 canvas{"UnityEngine.UIModule.dll","UnityEngine","Canvas","SendWillRenderCanvases",nullptr,"System.Void",0};
         if(api->resolve_method(api->context,&canvas,&canvasMethod)!=BE_Result_Ok||!canvasMethod.method_pointer) return BE_Result_NotReady;
@@ -830,7 +838,7 @@ BE_Result BE_CALL initialize(const BE_ThirdPartyHostV1* input,const char* config
 #endif
         hookWorker=std::jthread([](std::stop_token stop) {
             while(!stop.stop_requested()&&!hooked.load()) {
-                {std::lock_guard workerLock(lifecycle);if(!initialized) return;const auto r=installHook();if(r!=BE_Result_Ok&&r!=BE_Result_NotReady) hookError="game hook unavailable ("+std::to_string(int(r))+")";}
+                {std::lock_guard workerLock(lifecycle);if(!initialized) return;const auto r=installHook();if(r!=BE_Result_Ok&&r!=BE_Result_NotReady&&r!=BE_Result_ContractMismatch) hookError="game hook unavailable ("+std::to_string(int(r))+")";}
                 for(int i=0;i<20&&!stop.stop_requested();++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         });

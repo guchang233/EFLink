@@ -4,6 +4,7 @@
 #include "link_net.h"
 #include "link_session.h"
 #include "unity_bridge.h"
+#include "authority/native_build_policy.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_native_feed.h"
@@ -24,7 +25,7 @@ inline constexpr bool legacyReplicaAdapterAvailable=false;
 // Native world feed: the guest's client receives the host world's monsters as
 // standard server messages (same server IDs, native create/spawn/remove), and
 // its own account monsters leave view natively instead of being hidden.
-inline constexpr bool nativeFeedAdapter=true;
+inline constexpr bool nativeFeedAdapter=false;
 inline constexpr bool roomAdapterAvailable=legacyReplicaAdapterAvailable||nativeFeedAdapter;
 class World {
     using V3=eflink::unity::V3;using Q=eflink::unity::Quaternion;
@@ -1963,6 +1964,40 @@ private:
         return out;
     }
 public:
+    // Read-only callback diagnostic. No native operation is invoked, no state
+    // is applied, and parameter VALUES/actor account IDs are deliberately omitted.
+    nlohmann::json inspectNativeMineralAttack(const BE_HostApiV1* host,void* object,void* board) {
+        runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
+        if(!object||classOf(object)!="Beyond.Gameplay.Core.InteractiveDoodadCommonComponent")throw std::runtime_error("unexpected mineral callback class");
+        auto* info=staticObject("worldInfo");if(!info)throw std::runtime_error("mineral callback world unavailable");
+        mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
+        auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),object);
+        const auto key=usable(entity)?entityKey(entity):std::string{};
+        if(key.empty())throw std::runtime_error("mineral callback has no verified stable key");
+        const auto kind=api.value<int>(gm("InteractiveDoodadCommonComponent","get_natureResourceType","","Beyond.Gameplay.ENatureType"),object);
+        if(kind!=enumValue<int>("ENatureType","Mine","Beyond.Gameplay"))throw std::runtime_error("callback does not target a mineral");
+        auto parameters=nlohmann::json::object();
+        if(board&&classOf(board)=="Beyond.Gameplay.ParamBlackboard") {
+            auto* dictionary=readField<void*>(board,"ParamBlackboard","variableDict","Beyond.Gameplay");
+            if(dictionary) {
+                auto* keys=collection(dictionary,"get_Keys");eflink::unity::Api::TemporaryRoot keysRoot(runtime,keys);
+                auto* enumerator=genericValueCall(keys,"GetEnumerator");eflink::unity::Api::TemporaryRoot enumRoot(runtime,enumerator);
+                for(unsigned i=0;i<64;++i) {
+                    auto* box=genericValueCall(enumerator,"MoveNext");bool more=false;
+                    if(!box)throw std::runtime_error("mineral event parameter enumeration unavailable");
+                    std::memcpy(&more,runtime->object_unbox(runtime->context,box),sizeof more);if(!more)break;
+                    const auto name=text(genericValueCall(enumerator,"get_Current"));if(name.empty()||name.size()>128)continue;
+                    auto* variable=collection(dictionary,"get_Item",{api.string(name)});
+                    if(variable)parameters[name]=classOf(variable);
+                }
+            }
+        }
+        return {{"map",mapId},{"level",levelId},{"key",key+"/mine"},
+            {"hp_ratio",readField<int>(object,"InteractiveDoodadCommonComponent","m_hpRatioRuntime")},
+            {"server_hp_ratio",readField<int>(object,"InteractiveDoodadCommonComponent","m_hpRatio")},
+            {"collected",readField<bool>(object,"InteractiveDoodadCommonComponent","m_isCollected")},
+            {"parameter_types",parameters},{"gameplay_modified",false}};
+    }
     // Used by the separate read-only resource inspector, on the native game thread.
     // This does not tick the room adapter or execute any gameplay operation.
     nlohmann::json inspectNativeResources(const BE_HostApiV1* host) {
@@ -2630,6 +2665,10 @@ public:
     }
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     void queueDiagnostic(nlohmann::json command) {
+        const auto action=command.value("action",std::string{});
+        if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||
+           action=="native_feed_lifecycle_probe"||action=="native_move_probe")
+            throw std::runtime_error("未验收的原生玩法修改入口已停用；只读诊断仍可使用");
         if(diagnosticQueue.size()>=8)throw std::runtime_error("诊断命令排队已满");
         diagnosticQueue.push_back(std::move(command));
     }

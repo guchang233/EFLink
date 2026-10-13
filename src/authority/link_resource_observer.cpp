@@ -16,6 +16,10 @@ BE_ThirdPartyHostV1 host{};
 std::mutex mutex;bool initialized=false,hooked=false;
 std::atomic<bool> requested=false;
 json captureResult;
+std::atomic<std::uint64_t> traceUntil{0};bool attackHooked=false;std::uint64_t traceSequence=0;
+json attackTrace=json::array();std::string observedVersion;
+BE_ResolvedMethodV1 attackMethod{};
+using Attack=void(__fastcall*)(void*,void*,void*);Attack nextAttack=nullptr;
 BE_ResolvedMethodV1 tickMethod{};const void* cameraClass=nullptr;
 using ClassOf=const void*(*)(void*);using ParentOf=const void*(*)(const void*);
 ClassOf classOf=nullptr;ParentOf parentOf=nullptr;
@@ -24,6 +28,27 @@ const BE_HostApiV1* runtime(){return host.get_runtime?host.get_runtime(host.cont
 bool camera(void* object) noexcept {
     __try {for(auto* c=classOf(object);c;c=parentOf(c))if(c==cameraClass)return true;}
     __except(EXCEPTION_EXECUTE_HANDLER) {return false;}return false;
+}
+json observeAttack(void* self,void* board) noexcept {
+    try {eflink::World inspector;return inspector.inspectNativeMineralAttack(runtime(),self,board);}
+    catch(const std::exception& e) {return {{"error",e.what()},{"gameplay_modified",false}};}
+    catch(...) {return {{"error","native mineral callback inspection fault"},{"gameplay_modified",false}};}
+}
+void __fastcall attack(void* self,void* board,void* info) {
+    // Every original call proceeds exactly once. The probe never gates actions,
+    // mutates fields, invokes attacks or sends official/room network requests.
+    const auto until=traceUntil.load();const bool active=until&&eflink::nowMs()<until&&self&&(!info||info==attackMethod.method_info);
+    json before;if(active)before=observeAttack(self,board);
+    if(nextAttack)nextAttack(self,board,info);
+    if(!active)return;
+    auto after=observeAttack(self,nullptr);
+    std::lock_guard lock(mutex);if(!initialized||!traceUntil.load())return;
+    attackTrace.push_back({{"sequence",++traceSequence},{"at",eflink::nowMs()},{"before",std::move(before)},{"after",std::move(after)}});
+    if(attackTrace.size()>64)attackTrace.erase(attackTrace.begin());
+}
+void verifyVersion() {
+    observedVersion=eflink::worldauthority::nativeGameVersion(runtime());
+    if(!eflink::worldauthority::readOnlyBuildSupported(observedVersion))throw std::runtime_error("read-only mineral probe disabled for unverified game version");
 }
 void __fastcall tick(void* self,float delta,void* info) {
     if(nextTick)nextTick(self,delta,info);
@@ -37,6 +62,7 @@ void install() {
     if(hooked)return;
     RuntimeThreadScope attached(true);auto* api=runtime();auto dll=GetModuleHandleW(L"GameAssembly.dll");
     if(!attached.ready()||!api||!dll||!host.hooks||!host.hooks->create||!host.hooks->disable_module)throw std::runtime_error("resource observer runtime unavailable");
+    verifyVersion();
     classOf=reinterpret_cast<ClassOf>(GetProcAddress(dll,"il2cpp_object_get_class"));
     parentOf=reinterpret_cast<ParentOf>(GetProcAddress(dll,"il2cpp_class_get_parent"));
     BE_ResolvedClassV1 klass{};
@@ -49,6 +75,17 @@ void install() {
     if(host.hooks->create(host.hooks->context,id,tickMethod.method_pointer,reinterpret_cast<void*>(tick),reinterpret_cast<void**>(&nextTick),&handle)!=BE_Result_Ok)
         throw std::runtime_error("resource observer shared hook failed");
     hooked=true;
+}
+void installAttack() {
+    if(attackHooked)return;
+    install();RuntimeThreadScope attached(true);auto* api=runtime();
+    if(!attached.ready())throw std::runtime_error("mineral event runtime attachment failed");
+    BE_MethodDescriptorV1 descriptor{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","InteractiveDoodadCommonComponent","_OnIntReceiveAttack","Beyond.Gameplay.ParamBlackboard","System.Void",1};
+    if(api->resolve_method(api->context,&descriptor,&attackMethod)!=BE_Result_Ok||!attackMethod.method_pointer)throw std::runtime_error("exact native mineral attack signature unavailable");
+    std::uint64_t handle=0;
+    if(host.hooks->create(host.hooks->context,id,attackMethod.method_pointer,reinterpret_cast<void*>(attack),reinterpret_cast<void**>(&nextAttack),&handle)!=BE_Result_Ok)
+        throw std::runtime_error("mineral event shared hook failed");
+    attackHooked=true;
 }
 BE_Result BE_CALL init(const BE_ThirdPartyHostV1* input,const char*) {
     std::lock_guard lock(mutex);
@@ -63,16 +100,20 @@ BE_Result BE_CALL message(const char* request,const char* body) {
     try {
         const auto command=json::parse(body);const auto action=command.at("action").get<std::string>();
         if(action=="capture") {install();captureResult=nullptr;requested=true;output={{"queued",true},{"gameplay_modified",false}};}
-        else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"gameplay_modified",false}};
+        else if(action=="trace") {installAttack();attackTrace=json::array();traceSequence=0;traceUntil=eflink::nowMs()+90000;
+            output={{"observing",true},{"duration_ms",90000},{"gameplay_modified",false},{"execution_adapter_verified",false}};}
+        else if(action=="stop_trace") {traceUntil=0;output={{"observing",false},{"gameplay_modified",false}};}
+        else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"observing",traceUntil.load()>eflink::nowMs()},
+            {"game_version",observedVersion},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
         else throw std::runtime_error("unknown resource observer action");
     }catch(const std::exception& e){code=BE_Result_InvalidArgument;output={{"error",e.what()}};}
     const auto text=output.dump();return host.reply(host.context,request,code,text.c_str());
 }
 void BE_CALL stop() {
-    requested=false;
+    requested=false;traceUntil=0;
     // Disable outside the inspector lock: a running tick may need that lock.
     if(host.hooks&&host.hooks->disable_module)host.hooks->disable_module(host.hooks->context,id);
-    std::lock_guard lock(mutex);initialized=false;hooked=false;captureResult=nullptr;
+    std::lock_guard lock(mutex);initialized=false;hooked=attackHooked=false;captureResult=nullptr;attackTrace=json::array();
 }
 const BE_ThirdPartyModuleV1 module{sizeof(BE_ThirdPartyModuleV1),1,id,init,configure,message,stop};
 }

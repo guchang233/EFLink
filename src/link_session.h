@@ -517,7 +517,7 @@ public:
         nativeAuthority.observe(kind,values);authoritySeen=nowMs();return true;
     }
     bool publishAuthority(Net& net,bool force=false) {
-        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return false;
         if(!force&&(nowMs()-lastAuthorityPublish<250||net.transmitPressure()>64u*1024))return false;
         Json message={{"map",world.at("map")},{"level",world.at("level")}};
         const auto baseline=nativeAuthority.baseline();const auto nativeRevision=baseline.at("revision").get<std::uint64_t>();

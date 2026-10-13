@@ -1,4 +1,5 @@
 #include "authority/world_authority.h"
+#include "authority/native_build_policy.h"
 #include <atomic>
 #include <cstdio>
 using namespace eflink::worldauthority;
@@ -23,6 +24,8 @@ struct Fixture:NativeAdapter {
     void cancel(const Ticket&) noexcept override {++cancels;}
 };
 int main() {
+    check(readOnlyBuildSupported("1.5.3")&&!readOnlyBuildSupported("")&&!readOnlyBuildSupported("1.5.4")&&!readOnlyBuildSupported("fixture-only"),
+        "native read-only hooks default off for unknown game builds");
     Host host;Fixture adapter;host.reset(scene(),"fixture-only");
     host.observe("player",{{"host","player",{{"hp",100},{"max_hp",100},{"dead",false}},10}});
     host.observe("mineral",{mineral()});
