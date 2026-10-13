@@ -233,8 +233,7 @@
                 try {sampleMaterials();materialError.clear();}catch(const std::exception& e){sampledMaterials=Json::array();materialError=e.what();}
                 link.publishPresentation(net,{{"material_vfx",sampledMaterials},{"members",sampledParty},{"effects",sampledEffects},{"sample_time",nowMs()}});
             }
-            replayEffects(net.snapshot(),link);
-            try {replayMaterials(net.snapshot(),link);}catch(const std::exception& e){materialError=e.what();}
+            // Read-only evidence while native display/apply paths are uncertified.
             sampleNativeCombat();presentationError.clear();
         }catch(const std::exception& e) {presentationError=e.what();}
     }

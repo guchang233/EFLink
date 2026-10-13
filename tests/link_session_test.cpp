@@ -274,43 +274,18 @@ int main() {
     rejectHit({{"cast",99}},"a hit cannot invent an unobserved cast instance");
     rejectHit({{"strike",1}},"changing the packet sequence cannot replay the same native hit occurrence");
     rejectHit({{"action",-1}},"an unadapted native hit unit cannot be guessed");
-    check(h.sendPlayerHit(host,2,30,"map01_lv001:level:100"),"host forwards an enemy hit on a guest's actor");
-    std::deque<Json> received;check(wait([&]{tick();received=g.takePlayerHits();return !received.empty();})&&received.front()["amount"]==30,
-        "the guest receives the enemy hit for its own operator");
-    check(!g.sendPlayerHit(guest,1,25,"map01_lv001:level:100"),"a guest cannot report damage from another controller's enemy");
-    auto delegated=scene();delegated["entities"][0]["owner"]=2;
-    check(h.assignEnemyOwner("map01_lv001:level:100",2)&&h.publish(host,delegated,true)&&
-        wait([&]{tick();return g.entityReference("map01_lv001:level:100")["owner"]==2;}),"host grants a new control lease before guest simulation");
-    check(g.sendPlayerHit(guest,1,25,"map01_lv001:level:100"),"a guest forwards an enemy hit on the host's stand-in");
-    check(wait([&]{tick();received=h.takePlayerHits();return !received.empty();})&&received.front()["amount"]==25,
-        "the host receives the hit for its own operator");
-    check(!g.sendPlayerHit(guest,2,25,"x"),"a guest cannot address a hit to itself");
-    check(h.sendEnemyCast(host,"map01_lv001:level:100","enemy_attack1",2),"host announces a room enemy's native cast");
-    std::deque<Json> casts;check(wait([&]{tick();casts=g.takeEnemyCasts();return !casts.empty();})&&casts.front()["skill"]=="enemy_attack1"&&casts.front()["target"]==2,
-        "guests receive the enemy cast and its target player");
-    check(!g.sendEnemyCast(guest,"map01_lv001:level:100","enemy_attack1",1),"only the host announces enemy casts");
-    const Json moved=Json::array({{{"key","map01_lv001:level:100"},{"position",{2,0,3}},{"rotation",{0,0,0,1}},{"engaged",true}}});
-    check(g.sendEnemyStates(guest,moved),"an admitted guest reports enemies its client simulates");
-    std::deque<Json> reports;check(wait([&]{tick();reports=h.takeEnemyStates();return !reports.empty();})&&reports.front()["from"]==2&&
-        reports.front()["states"][0]["position"]==Json::array({2,0,3}),"host receives the guest's enemy movement report");
-    auto stateRejected=h.status()["rejected"].get<int>();
-    raw(guest,{{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"kind","enemy_state"},{"epoch",1},
-        {"states",Json::array({{{"key","map01_lv001:level:100"},{"position",{1e9,0,0}},{"rotation",{0,0,0,1}}}})}},1);
-    check(wait([&]{tick();return h.status()["rejected"].get<int>()>stateRejected;})&&h.takeEnemyStates().empty(),"out-of-range enemy positions are rejected");
-    check(g.reportEnemyCast(guest,"map01_lv001:level:100","enemy_attack1",2),"a guest reports a cast by an enemy it simulates");
-    std::deque<Json> guestCasts;check(wait([&]{tick();guestCasts=h.takeEnemyCasts();return !guestCasts.empty();})&&guestCasts.front()["from"]==2,
-        "host receives the guest-simulated enemy cast with its sender");
-    auto oldControl=g.entityReference("map01_lv001:level:100");
-    Json delayedCast={{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"kind","enemy_cast"},{"epoch",1},
-        {"key","map01_lv001:level:100"},{"skill","enemy_attack1"},{"target",2},{"seq",9999},
-        {"life",oldControl["life"]},{"lease",oldControl["lease"]}};
-    raw(guest,delayedCast,1);
-    check(wait([&]{tick();guestCasts=h.takeEnemyCasts();return !guestCasts.empty();}),"a current owner and control lease can announce a unique cast");
-    auto castRejected=h.status()["rejected"].get<int>();raw(guest,delayedCast,1);
-    check(wait([&]{tick();return h.status()["rejected"].get<int>()>castRejected;})&&h.takeEnemyCasts().empty(),"duplicate cast events are not replayed");
-    check(h.assignEnemyOwner("map01_lv001:level:100",1)&&h.assignEnemyOwner("map01_lv001:level:100",2),"controller handover revokes old control rights even when the original peer returns");
-    delayedCast["seq"]=10000;castRejected=h.status()["rejected"].get<int>();raw(guest,delayedCast,1);
-    check(wait([&]{tick();return h.status()["rejected"].get<int>()>castRejected;})&&h.takeEnemyCasts().empty(),"an old lease cannot cast after owner A to B to A");
+    check(!h.sendPlayerHit(host,2,30,"map01_lv001:level:100")&&!g.sendPlayerHit(guest,1,25,"map01_lv001:level:100"),
+        "numeric player damage is retired on both host and guest");
+    const Json moved=Json::array({{{"key","map01_lv001:level:100"},{"position",{2,0,3}},{"rotation",{0,0,0,1}}}});
+    check(!g.sendEnemyStates(guest,moved)&&!g.reportEnemyCast(guest,"map01_lv001:level:100","enemy_attack1",2),
+        "a guest cannot publish autonomous AI state or native cast results");
+    for(const char* kind:{"player_hit","enemy_state","enemy_cast"}) {
+        auto count=h.status()["rejected"].get<unsigned>();
+        raw(guest,{{"kind",kind},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"epoch",h.generation()},
+            {"amount",30},{"seq",9999}},1);
+        check(wait([&]{tick();return h.status()["rejected"].get<unsigned>()>count;})&&h.takePlayerHits().empty()&&h.takeEnemyStates().empty()&&h.takeEnemyCasts().empty(),
+            "legacy result packets cannot enter settlement even through raw transport");
+    }
     auto lastAccepted=nowMs();
     nativeFixture.position[0]=50;pose.position[0]=0;guest.setLocalState(pose);
     check(wait([&]{tick();return nowMs()-lastAccepted>=1100;}),"cooldown expires before testing native range validation");

@@ -399,44 +399,15 @@ public:
                     if(budget.second>=40||!hitClaimLedger.accept(claim,now)) {++rejected;continue;}
                     hitSequences[packet.from]=seq;++budget.second;++hitsAccepted;
                     claim["from"]=packet.from;claim["seq"]=seq;hits.push_back(std::move(claim));
-                } else if(kind=="player_hit"&&role==Role::Client&&packet.from==proto::kHostId) {
-                    const double amount=b.at("amount").get<double>();
-                    if(!canAct(s.localId)||b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||playerHits.size()>=64||
-                        b.at("target_actor")!=playerEntity(s.localId)||!validEntityEvent(b)||!acceptEvent(packet.from,kind,b)) {++rejected;continue;}
-                    playerHits.push_back(b);
-                } else if(kind=="player_hit"&&role==Role::Host&&canAct(packet.from)) {
-                    // An enemy simulated on that guest hit another player's stand-in
-                    // there. The host applies it to its own operator or relays it.
-                    const double amount=b.at("amount").get<double>();const auto target=b.at("target").get<std::uint16_t>();
-                    const auto key=b.value("key",std::string{}).substr(0,128);
-                    if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||target==packet.from||!find(s,target)||!canAct(target)||
-                        b.at("target_actor")!=playerEntity(target)||!validEntityEvent(b,packet.from)||!acceptEvent(packet.from,kind,b)) {++rejected;continue;}
-                    auto& budget=hitBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
-                    if(budget.second>=40) {++rejected;continue;}
-                    ++budget.second;
-                    if(target==s.localId) {if(playerHits.size()<64)playerHits.push_back(b);}
-                    else sendPlayerHit(net,target,amount,key);
-                } else if(kind=="enemy_cast"&&(role==Role::Client?packet.from==proto::kHostId&&canAct(s.localId):role==Role::Host&&canAct(packet.from))) {
-                    // From the host: any room enemy. From a guest: an enemy that guest
-                    // owns (the game adapter checks ownership before replaying it).
+                } else if(kind=="player_hit"||kind=="enemy_state") {
+                    ++rejected; // retired guest-computed combat results
+                } else if(kind=="enemy_cast"&&(role==Role::Client&&packet.from==proto::kHostId&&canAct(s.localId))) {
+                    // Host observation only; guests never announce AI results.
                     const auto key=b.at("key").get<std::string>(),skill=b.at("skill").get<std::string>();
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||key.empty()||key.size()>128||skill.empty()||skill.size()>128||enemyCasts.size()>=64||
                         !validEntityEvent(b,role==Role::Host?packet.from:0)||!acceptEvent(packet.from,kind,b)) {++rejected;continue;}
                     enemyCasts.push_back({{"key",key},{"skill",skill},{"target",b.at("target").get<std::uint16_t>()},{"from",packet.from},
                         {"life",b.at("life")},{"lease",b.at("lease")},{"seq",b.at("seq")}});
-                } else if(kind=="enemy_state"&&role==Role::Host&&canAct(packet.from)) {
-                    // Movement of enemies whose AI runs on that guest (ownership is
-                    // assigned and checked by the host's game adapter).
-                    const auto& states=b.at("states");
-                    if(b.at("epoch").get<std::uint64_t>()!=epoch||!states.is_array()||states.size()>64||enemyStates.size()>=256) {++rejected;continue;}
-                    bool valid=true;
-                    for(const auto& item:states) {
-                        if(!item.at("key").is_string()||item.at("key").get<std::string>().size()>128||!validVector(item.at("position"))||!validEntityEvent(item,packet.from)) {valid=false;break;}
-                        const auto& q=item.at("rotation");if(!q.is_array()||q.size()!=4) {valid=false;break;}
-                        for(const auto& v:q)if(!v.is_number()||!std::isfinite(v.get<double>())) valid=false;
-                    }
-                    if(!valid||!acceptEvent(packet.from,kind,b)) {++rejected;continue;}
-                    enemyStates.push_back({{"from",packet.from},{"states",states}});
                 } else ++rejected;
             } catch(...) {++rejected;}
         }
@@ -549,17 +520,7 @@ public:
         ref.update(Json{{"kind","hit_claim"},{"seq",++hitSequence}});
         return send(net,std::move(ref),proto::kHostId);
     }
-    bool sendPlayerHit(Net& net,std::uint16_t peer,double amount,const std::string& key) {
-        if(!ready()||!std::isfinite(amount)||amount<=0) return false;
-        auto ref=entityReference(key);const auto targetActor=playerEntity(peer);
-        if(ref.is_null()||!targetActor)return false;
-        ref.update(Json{{"kind","player_hit"},{"epoch",epoch},{"seq",++eventSequence},{"amount",amount},{"key",key},{"target_actor",targetActor}});
-        if(role==Role::Host) return canAct(peer)&&peer!=proto::kHostId&&send(net,std::move(ref),peer);
-        // A guest forwards through the host, which owns the room's rules.
-        ref["target"]=peer;
-        return role==Role::Client&&canAct(net.snapshot().localId)&&ref.at("owner")==net.snapshot().localId&&peer!=net.snapshot().localId&&
-            send(net,std::move(ref),proto::kHostId);
-    }
+    bool sendPlayerHit(Net&,std::uint16_t,double,const std::string&) {return false;}
     // Presentation: a host room enemy began a native skill against a player.
     bool sendEnemyCast(Net& net,const std::string& key,const std::string& skill,std::uint16_t target) {
         if(role!=Role::Host||!ready()||key.empty()||skill.empty()||skill.size()>128) return false;
@@ -569,23 +530,9 @@ public:
     }
     std::deque<Json> takeEnemyCasts() {std::deque<Json> out;out.swap(enemyCasts);return out;}
     // Guest: report the room enemies whose AI this player runs.
-    bool sendEnemyStates(Net& net,const Json& states) {
-        if(role!=Role::Client||!canAct(net.snapshot().localId)||!states.is_array()||states.empty()||states.size()>64) return false;
-        auto stamped=states;
-        for(auto& state:stamped) {
-            auto ref=entityReference(state.at("key").get<std::string>());
-            if(ref.is_null()||ref.at("owner")!=net.snapshot().localId)return false;
-            state.update(ref);
-        }
-        return send(net,{{"kind","enemy_state"},{"epoch",epoch},{"seq",++eventSequence},{"states",stamped}},proto::kHostId);
-    }
+    bool sendEnemyStates(Net&,const Json&) {return false;}
     // Guest: an enemy it owns began a native skill; the host replays and relays it.
-    bool reportEnemyCast(Net& net,const std::string& key,const std::string& skill,std::uint16_t target) {
-        if(role!=Role::Client||!canAct(net.snapshot().localId)||key.empty()||skill.empty()||skill.size()>128) return false;
-        auto ref=entityReference(key);if(ref.is_null()||ref.at("owner")!=net.snapshot().localId)return false;
-        ref.update(Json{{"kind","enemy_cast"},{"epoch",epoch},{"seq",++eventSequence},{"key",key},{"skill",skill},{"target",target}});
-        return send(net,std::move(ref),proto::kHostId);
-    }
+    bool reportEnemyCast(Net&,const std::string&,const std::string&,std::uint16_t) {return false;}
     std::deque<Json> takeEnemyStates() {std::deque<Json> out;out.swap(enemyStates);return out;}
     std::deque<Json> takeHits() {std::deque<Json> out;out.swap(hits);return out;}
     std::deque<Json> takePlayerHits() {std::deque<Json> out;out.swap(playerHits);return out;}

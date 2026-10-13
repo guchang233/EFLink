@@ -197,7 +197,7 @@ class World {
     std::map<std::string,std::pair<std::uint16_t,std::uint64_t>> hitClaims;       // host: last guest to hit it
     struct Motion {std::deque<std::tuple<std::uint64_t,V3,Q>> samples;std::uint64_t stamp=0,commandAt=0;bool applied=false,walking=false;V3 last{};};
     // Guest puppets driven by native SC_MOVE_OBJECT_MOVE instead of MoveTo/TeleportTo.
-    bool nativeMovePuppets=true,nativeMoveNotify=false,hostOwnsAll=false;
+    bool nativeMovePuppets=true,nativeMoveNotify=false,hostOwnsAll=true;
     // A native server move places the entity at once, so it is sent every frame
     // (0 ms): 20 Hz placement reads as stepping.
     std::uint64_t nativeMoveIntervalMs=0;
@@ -765,35 +765,7 @@ class World {
         }catch(const std::exception& e){enemies.at(key).aiDiagnostics={{"error",e.what()}};}
     }
 #endif
-    void updateHostEnemies() {
-        if(nativeFeedAdapter)return; // host monsters are native already; nothing to spawn
-        auto* info=staticObject("worldInfo");if(!info)return;
-        const int level=api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info);
-        for(auto& [key,seed]:hostEnemySeeds) {
-            if(seed.at("hp").get<double>()<=0||!seed.value("alive",true))continue;
-            auto* entity=spawnEnemy(seed,level);if(!entity)continue;
-            auto& spawn=spawnedEnemies.at(key);
-            spawn.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);
-            if(!spawn.started){spawn.error="等待房主房间敌人组件启动";continue;}
-            if(!spawn.initialStateApplied) {
-                auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity);
-                if(!ability){spawn.error="房主房间敌人能力组件未就绪";continue;}
-                double max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
-                const double sourceMax=seed.at("max_hp").get<double>();
-                if(!std::isfinite(max)||std::abs(max-sourceMax)>(std::max)(.01,sourceMax*.001)) {
-                    spawn.error="房主房间敌人的原生属性尚未匹配场景属性";continue;
-                }
-                double hp=seed.at("hp").get<double>();bool skip=true;
-                api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
-                spawn.initialStateApplied=true;spawn.error.clear();
-            }
-            if(auto it=enemies.find(key);it==enemies.end())enemies.emplace(key,trackEnemy(entity));
-            else if(!currentEnemy(it->second)) {release(it->second.root);it->second=trackEnemy(entity);}
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-            // Diagnostics are sampled once below instead of for the whole group.
-#endif
-        }
-    }
+
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     void sampleHostDiagnostic() {
         if(nowMs()-lastHostDiagnostics<250||enemies.empty())return;
@@ -877,85 +849,7 @@ class World {
         }
         return true;
     }
-    void* spawnEnemy(const nlohmann::json& item,int levelNumber) {
-        const auto key=item.at("key").get<std::string>();auto& s=spawnedEnemies[key];
-        if(s.data&&!currentSpawn(s)) {releaseSpawn(s);s.initialStateApplied=s.started=false;}
-        if(s.data) {
-            auto* entity=spawnEntity(s);
-            if(entity) {
-                if(api.value<bool>(gm("Entity","get_hasInited","","System.Boolean"),entity))api.call(gm("Entity","TryStart"),entity);
-                s.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);
-                s.error.clear();return entity;
-            }
-            if(nowMs()<s.retry) return nullptr;s.retry=nowMs()+1000;
-            auto* node=api.call(gm("BaseEntityData","get_node","","Beyond.Gameplay.Core.EntityManager.EntityNode"),s.data);
-            if(node) {
-                bool yes=true;api.call(gm("EntityManager/EntityNode","SetSkipAoiCheck","System.Boolean"),node,{&yes});
-                api.call(gm("EntityManager/EntityNode","SetSpawnImmediatelyFlags"),node);
-                // A room replica belongs to the hosted scene even when the guest's
-                // account AOI center is elsewhere. This is our owned client node.
-                if(!api.value<bool>(gm("EntityManager/EntityNode","IsInAoi","","System.Boolean"),node))
-                    api.call(gm("EntityManager/EntityNode","SetInAoi","System.Boolean"),node,{&yes});
-                const int state=api.value<int>(gm("EntityManager/EntityNode","get_pipelineState","","Beyond.Gameplay.Core.EntityManager.EntityNode.PipelineState"),node);
-                s.pipeline=state;s.inAoi=api.value<bool>(gm("EntityManager/EntityNode","IsInAoi","","System.Boolean"),node);
-                s.resourcesComplete=api.value<bool>(gm("EntityManager/EntityNode","get_allResourcesReady","","System.Boolean"),node);
-                s.preload=api.value<bool>(gm("EntityManager/EntityNode","get_usePreload","","System.Boolean"),node);
-                std::string reason;
-                if(state==enumValue<int>("EntityManager/EntityNode/PipelineState","ResourcePrepare")&&resourcesReady(node,reason)) {
-                    // A standalone client node has no server AOI completion callback.
-                    // Skip the preload wait only after every actual resource order is ready.
-                    api.call(gm("EntityManager/EntityNode","SetSkipResPreload","System.Boolean"),node,{&yes});
-                    api.call(gm("EntityManager/EntityNode","SetSkipSpawnQueue","System.Boolean"),node,{&yes});
-                    // forcePreload creates a dormant node by design. The native
-                    // SwitchToNextPipelineState refuses ResourcePrepare while
-                    // usePreload is true. SpawnPreloaded clears that ownership flag
-                    // and advances only after the node's real resources are ready.
-                    api.call(gm("EntityManager/EntityNode","SpawnPreloaded"),node);
-                    s.pipeline=api.value<int>(gm("EntityManager/EntityNode","get_pipelineState","","Beyond.Gameplay.Core.EntityManager.EntityNode.PipelineState"),node);
-                    s.preload=api.value<bool>(gm("EntityManager/EntityNode","get_usePreload","","System.Boolean"),node);
-                }
-                s.error=(reason.empty()?std::string{}:reason+"; ")+text(api.call(gm("EntityManager/EntityNode","DebugOnlyGetLoadStatus","","System.String"),node)).substr(0,300);
-            }
-            return nullptr;
-        }
-        if(nowMs()<s.retry) return nullptr;
-        auto name=item.value("template",std::string{});
-        if(name.empty()||name.size()>128||name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/")!=std::string::npos) {s.error="敌人模板标识不可用";s.retry=nowMs()+15000;return nullptr;}
-        try {
-            auto klass=api.klass("EnemyInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
-            s.data=runtime->object_new(runtime->context,klass.class_info);s.root=rootOf(s.data);
-            api.call(gm("EnemyInfo",".ctor"),s.data);api.call(gm("BaseEntityData","OnAllocate"),s.data);
-            std::uint64_t id=(proto::fnv64(key)&0x00FFFFFFFFFFFFFFull)|0xEF00000000000000ull;
-            api.call(gm("BaseEntityData","set_id","System.UInt64"),s.data,{&id});
-            if(nextSpawnGeneration==UINT32_MAX)throw std::runtime_error("房间实体分配代数已耗尽");
-            s.id=id;s.generation=++nextSpawnGeneration;
-            api.call(gm("BaseEntityData","set_serverGeneration","System.UInt32"),s.data,{&s.generation});
-            s.ownershipEstablished=true;
-            api.call(gm("BaseEntityData","set_levelIdNum","System.Int32"),s.data,{&levelNumber});
-            api.call(gm("BaseEntityData","SetDataBitForClientEntityFromTemplate"),s.data);
-            if(!api.value<bool>(gm("BaseEntityData","SetupTemplate","System.String","System.Boolean"),s.data,{api.string(name)})) throw std::runtime_error("原生敌人模板加载失败: "+name);
-            // Growth data belongs to this room instance. Carry only a validated
-            // native level, not an account's server IDs or shared mutable data.
-            int enemyLevel=item.value("enemy_level",1);
-            if(enemyLevel<1||enemyLevel>1000)throw std::runtime_error("房间敌人等级无效");
-            auto* growth=runtime->object_new(runtime->context,api.klass("EnemyServerData","Gameplay.Beyond.dll","Beyond.Gameplay").class_info);
-            eflink::unity::Api::TemporaryRoot growthRoot(runtime,growth);
-            api.call(gm("EnemyServerData",".ctor","System.String|System.Int32","System.Void","Beyond.Gameplay"),growth,{api.string(name),&enemyLevel});
-            api.call(gm("BaseEntityData","set_serverData","Beyond.Gameplay.EntityServerData"),s.data,{growth});
-            V3 position{item["position"][0].get<float>(),item["position"][1].get<float>(),item["position"][2].get<float>()},rotation{};
-            api.call(gm("BaseEntityData","SetTransform","UnityEngine.Vector3|UnityEngine.Vector3"),s.data,{&position,&rotation});
-            field(s.data,"BaseEntityData","skipAoi",true);field(s.data,"BaseEntityData","forcePreload",true);
-            field(s.data,"BaseEntityData","ignoreManagerSyncMode",true);
-            api.call(gm("BaseEntityData","Commit"),s.data);
-            if(!api.value<bool>(gm("BaseEntityData","get_isCommitted","","System.Boolean"),s.data)) throw std::runtime_error("原生实体提交未完成: "+text(api.call(gm("BaseEntityData","GetFormatedDebugInfo","","System.String"),s.data)));
-            s.committed=true;
-            s.error.clear();return nullptr; // resources and start pipeline complete on later ticks
-        } catch(const std::exception& e) {
-            s.error=e.what();s.retry=nowMs()+15000;
-            releaseSpawn(s);
-            return nullptr;
-        }
-    }
+
     void applyWorld(const nlohmann::json& snapshot) {
         matchedEnemies=missingEnemies=deferredNativeEnemies=0;
         std::set<std::string> present;for(const auto& item:snapshot.at("entities")) present.insert(item.at("key").get<std::string>());
@@ -986,7 +880,7 @@ class World {
             if(found==enemies.end()||!currentEnemy(found->second)) {
                 if(item.at("hp").get<double>()<=0||!item.value("alive",true)) continue;
                 feedScene=snapshot.at("level_num").get<int>();
-                if(auto* created=nativeFeedAdapter?feedEnemy(item,snapshot.at("level_num").get<int>(),entering):spawnEnemy(item,snapshot.at("level_num").get<int>())) {
+                if(auto* created=feedEnemy(item,snapshot.at("level_num").get<int>(),entering)) {
                     auto key=item.at("key").get<std::string>();auto& entry=enemies[key];release(entry.root);entry=trackEnemy(created);found=enemies.find(key);
                 } else {
                     const auto spawn=spawnedEnemies.find(item.at("key").get<std::string>());
@@ -1014,32 +908,16 @@ class World {
             owners[key]=owner;
             // Our own enemy: its native AI fights this player's operator here.
             // Anyone else's: a puppet drawn from the host's 10 Hz snapshots.
-            setEnemyAI(e,owner==localPeer);
+            setEnemyAI(e,false);
             bool skip=true;
             if(owner!=localPeer&&item.contains("rotation")) {
                 const auto& r=item["rotation"];
                 pushMotion(key,session?session->snapshotTime():nowMs(),{item["position"][0].get<float>(),item["position"][1].get<float>(),item["position"][2].get<float>()},
                     {r[0].get<float>(),r[1].get<float>(),r[2].get<float>(),r[3].get<float>()});
             }
-            // Guest deaths belong to the hosted session. Keep the underlying native
-            // entity alive to avoid triggering its independent account's death/reward path.
-            double hp=(std::max)(1.,item["hp"].get<double>());
-            // Right after this player's own hit, the host's snapshot may not include
-            // it yet; never raise the bar back above the locally resolved value.
-            if(auto hit=localHitAt.find(item.at("key").get<std::string>());hit!=localHitAt.end()&&nowMs()-hit->second<1000)
-                hp=(std::min)(hp,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability));
-            // Write only real changes: every native HP write is a battle operation
-            // the client reports, so an unchanged value must not be rewritten.
-            if(std::abs(api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)-hp)>.5)
-                api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
-            if(item.contains("poise")&&validPoise(item.at("poise"))) {
-                float poise=item.at("poise").at("value").get<float>();
-                if(std::abs(api.value<float>(gm("AbilitySystem","get_poise","","System.Single"),ability)-poise)>.001f)
-                    {api.call(gm("AbilitySystem","SetPoiseDirectly","System.Single"),ability,{&poise});++nativePoiseWrites;}
-            }
-            auto* component=api.call(entityModel,e.entity);auto* go=component?api.call(modelGo,component):nullptr;
-            bool visible=item["hp"].get<double>()>0&&item.value("alive",true);
-            if(go&&alive(go)&&(!e.visibilityApplied||e.hidden==visible)) {api.call(setActive,go,{&visible});e.hidden=!visible;e.visibilityApplied=true;}
+            // State projection is suspended until a verified native result/apply
+            // adapter exists. Never approximate death by hiding a living entity,
+            // copy local HP/poise, or retain a locally resolved guest hit.
             ++matchedEnemies;
         }
         if(!entering.empty())try {FeedScope scope(feedOperating);feed.enter(entering);}catch(const std::exception& e) {++feedErrors;feedError=e.what();}
@@ -1780,151 +1658,18 @@ public:
     void requestEmergencyHome() {emergencyHomePending=true;officialTeleportStatus={{"purpose","emergency_home"},{"state","queued"},{"at",nowMs()}};}
 private:
     void replication(Net& net,Session& link) {
-        updateEmergencyHome(net);
-        if(!roomAdapterAvailable) {
-            session=&link;link.setAuthority({});link.update(net);link.reportEntry(net,{});
-            guestRestrictionsActive=false;
-            replicationError="真实服务器世界适配器尚未接入；旧场景复制已停用";
-            return;
+        session=&link;link.setAuthority({});localPeer=net.snapshot().localId;
+        // Transport and read-only discovery remain available. No replica world,
+        // native enemy creation, account-world withdrawal, shared teleport,
+        // actor skill execution or local result projection is admitted here.
+        roomHost=guestRealm=guestRestrictionsActive=false;
+        replicationError="统一原生权威适配器未验收；共享世界操作已停用";
+        if(net.currentRole()==Role::Host&&character&&nativeSceneInitialized&&!mapId.empty()&&!levelId.empty()) {
+            auto* info=staticObject("worldInfo");
+            auto position=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
+            link.publish(net,{{"map",mapId},{"level",levelId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
+                {"position",{position.x,position.y,position.z}},{"entities",nlohmann::json::array()} });
         }
-        session=&link;link.update(net);const auto role=net.currentRole();
-        if(recoveryAbort&&(role==Role::Host||role==Role::Client)) {link.setLocalSceneReady(false);net.leave();return;}
-        if(restorationPending) {
-            if(role==Role::Host||role==Role::Client)net.leave();
-            if(link.localSceneOperational())restorePrivateWorld();
-            return; // resume personal travel/interactions on the next game tick
-        }
-        guestRestrictionsActive=privateActionsRestricted(net);
-        const bool connected=role==Role::Host||role==Role::Client;
-        if(connected&&!backgroundLease) {
-            backgroundOriginal=api.value<bool>(m("Application","get_runInBackground","","System.Boolean"));
-            bool yes=true;api.call(m("Application","set_runInBackground","System.Boolean","System.Void"),nullptr,{&yes});backgroundLease=true;
-        }else if(!connected)restoreBackground();
-        nativeTimeScale=api.value<float>(m("Time","get_timeScale","","System.Single"));
-        nativeDeltaTime=api.value<float>(m("Time","get_deltaTime","","System.Single"));
-        if(auto* pause=staticObject("pauseGamePlayAndGameViewManager"))simulationPaused=api.value<bool>(gm("PauseGamePlayAndGameViewManager","get_isInPause","","System.Boolean"),pause);
-        const bool hostRoom=role==Role::Host&&link.followHost&&link.combat;
-        const bool quarantine=(hostRoom&&!nativeFeedAdapter)||(role==Role::Client&&link.followHost&&link.combat&&link.ready());
-        if(quarantine!=guestRealm||hostRoom!=roomHost) {
-            traceNative("world.mode_transition.begin");
-            const bool leavingHostWorld=nativeFeedAdapter&&guestRealm&&!quarantine;
-            dropEnemies();
-            if(leavingHostWorld)restorePrivateWorld();
-            guestRealm=quarantine;roomHost=hostRoom;lastEnemies=0;
-            if(restorationPending)return;
-            traceNative("world.mode_transition.end");
-        }
-        localPeer=net.snapshot().localId;
-        // The host world is authoritative when its account enemies are set aside
-        // for room-owned enemies (isolation), players have native actors and the
-        // host settles combat. Dungeon/subgame scripts are not taken over, so a
-        // room is only admitted in the overworld.
-        link.setAuthority({roomHost&&privateTargetIsolationReady&&nativeIsolationReady,roomHost&&character!=nullptr,
-            roomHost&&link.combat&&nativeCombatReady,roomHost&&character&&overworldScene()});
-        if(role==Role::Offline||role==Role::Connecting||!link.followHost) {
-            hostMapConsent.reset();hostMapChoiceMap.clear();hostMapChoiceLevel.clear();hostMapChoiceRoom=0;
-            if(!enemies.empty()||!privateEnemies.empty()||!spawnedEnemies.empty()) dropEnemies();dropActors();enemyEpoch=0;
-            // Leaving the host's world returns this player to where they entered
-            // from, behind the loading panel, like leaving an official co-op world.
-            if(home) {travel=std::move(*home);home.reset();travel->until=nowMs()+60000;travelState="returning_home";replicationError.clear();}
-            else if(travel&&!travel->homeward) {travel.reset();travelState="idle";}
-            if(travel)try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
-            return;
-        }
-        if(!link.localSceneOperational()) {
-            // Loading progress must keep running, but scene mutations cannot
-            // resume until the world and native player finish initialization.
-            if(!actors.empty())dropActors();if(!avatars.empty())clear();
-            if(travel)updateTravel();return;
-        }
-        auto request=link.takeTeleport();
-        if(!request.empty()) {hostMapConsent.explicitTeleport(request["map"].get<std::string>()+"/"+request["level"].get<std::string>());auto pos=request["position"];travel=Travel{request["map"].get<std::string>(),request["level"].get<std::string>(),{pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},nowMs()+90000,false,request.value("level_num",0)};travel->dungeon=request.value("dungeon",std::string{});travelState="queued";replicationError.clear();}
-        if(!character||mapId.empty()||levelId.empty()) {
-            for(auto& [peer,avatar]:avatars)destroyAvatar(avatar);avatars.clear();
-            dropActors();link.unbindPlayer(net.snapshot().localId);
-            if(!enemies.empty()||!privateEnemies.empty()||!spawnedEnemies.empty())dropEnemies();
-            enemyMap.clear();enemyEpoch=0;
-            if(role==Role::Client)link.reportEntry(net,{});
-            if(travel)updateTravel();return;
-        }
-        if(auto growth=localGrowth();!growth.is_null())link.publishGrowth(net,localModel,growth);
-        link.publishAppearance(net,localModel,localAppearance());
-        if(enemyMap!=mapId+"/"+levelId) {dropEnemies();enemyMap=mapId+"/"+levelId;travelState=travel?travelState:"idle";}
-        if(nowMs()-lastEnemies>(nativeFeedAdapter&&guestRealm?250u:1000u)) {lastEnemies=nowMs();scanEnemies();
-            for(auto& [key,s]:spawnedEnemies) if(!roomHost) {auto* created=spawnEntity(s);if(created&&!enemies.contains(key)) enemies[key]=trackEnemy(created);}}
-        if(role==Role::Host) {
-            if(roomHost) {updateHostEnemies();applyRoomHits(link);applyEnemyStates(link);assignOwners(net);mirrorEnemyCasts(net,link);applyPlayerHits(link);}
-            for(const auto& command:link.takeCommands()) {
-                try {
-                    const auto peer=command.at("from").get<std::uint16_t>();
-                    auto actor=actors.find(peer);
-                    if(command.at("epoch")!=link.generation()||actor==actors.end()||command.at("actor")!=actor->second.id||!link.canAct(peer))
-                        throw std::runtime_error("技能指令的房主角色绑定已失效");
-                    if(!link.entityMatches(command.at("key").get<std::string>(),command.at("life").get<std::uint64_t>()))throw std::runtime_error("技能目标的生成身份已失效");
-                    castNative(peer,command.at("key").get<std::string>(),command.at("skill").get<std::string>());
-                }catch(const std::exception& e) {++nativeCastRejected;replicationError=e.what();}
-            }
-            if(nowMs()-lastCapture>=50) {lastCapture=nowMs();link.publish(net,captureWorld());}
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-            sampleHostDiagnostic();
-#endif
-        } else if(role==Role::Client&&link.ready()) {
-            auto* info=staticObject("worldInfo");if(info) link.publishLocation(net,mapId,levelId,api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info));
-            const auto& snapshot=link.snapshot();
-            const auto room=net.snapshot().roomId;
-            if(hostMapChoiceRoom!=room) {hostMapConsent.reset();hostMapChoiceRoom=room;}
-            hostMapChoiceMap=snapshot.at("map").get<std::string>();hostMapChoiceLevel=snapshot.at("level").get<std::string>();
-            hostMapConsent.observe(hostMapChoiceMap+"/"+hostMapChoiceLevel,hostMapChoiceMap==mapId&&hostMapChoiceLevel==levelId);
-            if(hostMapConsent.pending()&&travel&&!travel->started&&!travel->homeward)travel.reset();
-            if(enemyEpoch!=link.generation()) {
-                if(!home) {
-                    // An interrupted return trip still points at the original home.
-                    if(travel&&travel->homeward) {home=*travel;home->started=home->observedLoading=false;}
-                    else if(info) {
-                        auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
-                        home=Travel{mapId,levelId,p,0,false,api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info),true};
-                    }
-                }
-                dropEnemies();enemyEpoch=link.generation();scanEnemies();lastEnemies=nowMs();
-                // Arrive beside the host rather than inside their operator.
-                if(!hostMapConsent.pending()) {auto pos=snapshot.at("position");travel=Travel{snapshot["map"].get<std::string>(),snapshot["level"].get<std::string>(),{pos[0].get<float>()+1.2f,pos[1].get<float>(),pos[2].get<float>()+.6f},nowMs()+90000,false,snapshot.value("level_num",0)};travel->dungeon=snapshot.value("dungeon",std::string{});travelState="entering_host_world";}
-            }
-            if(snapshot.at("map")!=mapId||snapshot.at("level")!=levelId) {
-                if(hostMapConsent.pending())travelState=hostMapConsent.deferred()?"host_map_follow_deferred":"awaiting_host_map_choice";
-                else if(!travel&&travelState!="failed") {auto pos=snapshot.at("position");travel=Travel{snapshot["map"].get<std::string>(),snapshot["level"].get<std::string>(),{pos[0].get<float>(),pos[1].get<float>(),pos[2].get<float>()},nowMs()+90000,false,snapshot.value("level_num",0)};travel->dungeon=snapshot.value("dungeon",std::string{});travelState="following_host";}
-            } else if(link.combat) {
-                // Each reliable snapshot is applied once. Retry unfinished native
-                // spawns, but do not reset HP/AI and scan replicas twice per packet.
-                if(lastAppliedEpoch!=link.generation()||lastAppliedRevision!=link.worldRevision()||missingEnemies) {
-                    applyWorld(snapshot);lastAppliedEpoch=link.generation();lastAppliedRevision=link.worldRevision();
-                }
-                mirrorEnemyCasts(net,link);reportOwnedEnemies(net,link);
-            }
-            else for(auto& [key,e]:enemies) restoreEnemy(e);
-            applyPlayerHits(link);
-            auto* levelLoader=staticObject("levelLoader");
-            const bool loaded=snapshot.at("map")==mapId&&snapshot.at("level")==levelId&&
-                levelLoader&&info&&api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info)&&
-                !api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader);
-            auto hostActor=actors.find(proto::kHostId);
-            const bool players=hostActor!=actors.end()&&hostActor->second.started&&currentActor(hostActor->second);
-            // Missing committed data or an unfinished visible entity blocks
-            // this partial adapter. A committed native node awaiting its AOI
-            // entity is counted separately and does not trigger re-entry.
-            link.reportEntry(net,{loaded,loaded&&link.combat&&missingEnemies==0,loaded&&guestRealm&&guestGatesReady&&privateTargetIsolationReady,players});
-        } else if(role==Role::Client&&!link.ready()) {for(auto& [key,e]:enemies) restoreEnemy(e);}
-        try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
-        updateActors(net,link);
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-        if(diagnosticCast) {
-            auto command=std::move(*diagnosticCast);diagnosticCast.reset();
-            try {
-                if(role!=Role::Host)throw std::runtime_error("原生技能诊断仅可由房主执行");
-                castNative(command.at("peer").get<std::uint16_t>(),command.at("key").get<std::string>(),command.value("skill",std::string{}),true,command.value("move_owned",false));
-            }catch(const std::exception& e){++nativeCastRejected;lastNativeCast={{"diagnostic",true},{"error",e.what()}};}
-        }
-#endif
-        observeNativeCast();
     }
     void projectPeers(const Snapshot& view) {
         markers=nlohmann::json::array();if(!character) return;
@@ -2479,56 +2224,19 @@ public:
     }
     struct DamageObservation {void* ability=nullptr;std::uint64_t actor=0;std::string key;double hp=0;void* target=nullptr;NativeIdentity identity;bool playerTarget=false;std::uint16_t peer=0;};
     std::optional<DamageObservation> beforeNativeDamage(Net& net,void* ability,void* modifier) {
+        if(net.currentRole()!=Role::Host||!roomHost||!ability||!modifier)return {};
         try {
-            if(net.currentRole()==Role::Client&&guestRealm&&ability&&modifier) {
-                // Guest: an enemy simulated here hit another player's stand-in.
-                if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier))return {};
-                auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
-                auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
-                auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
-                for(const auto& [key,e]:enemies)if(e.entity==sourceEntity&&currentEnemy(e)&&ownerOf(key)==localPeer)
-                    for(const auto& [peer,a]:actors)if(a.entity==target&&a.started&&currentActor(a)) {
-                        double full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);bool skip=true;
-                        if(!std::isfinite(full)||full<=0)return {};
-                        api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&full,&skip});
-                        return DamageObservation{ability,e.identity.server,key,full,target,a.identity,true,peer};
-                    }
-                return {};
-            }
-            if(net.currentRole()!=Role::Host||!ability||!modifier)return {};
             if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier))return {};
-            auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
-            auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
-            std::uint64_t actor=0;for(const auto& [peer,a]:actors)if(a.entity==sourceEntity&&a.started&&a.bound&&currentActor(a)){actor=a.id;break;}
-            if(sourceEntity==character&&roomHost&&session)actor=session->playerEntity(net.snapshot().localId);
             auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
-            for(const auto& [key,e]:enemies)if(e.entity==target&&currentEnemy(e))
-                return DamageObservation{ability,actor,key,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability),target,e.identity};
-            if(roomHost)for(const auto& [peer,a]:actors)if(a.entity==target&&a.started&&a.bound&&currentActor(a)) {
-                for(const auto& [key,e]:enemies)if(e.entity==sourceEntity&&currentEnemy(e)) {
-                    // The actor is a stand-in: the guest's own client holds that
-                    // operator's real health. Fill it first so the stand-in never
-                    // dies here; the measured loss is forwarded to that player.
-                    double full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);bool skip=true;
-                    if(!std::isfinite(full)||full<=0)return {};
-                    api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&full,&skip});
-                    return DamageObservation{ability,e.identity.server,key,full,target,a.identity,true,peer};
-                }
-            }
-        }catch(...) {}
-        return {};
+            for(const auto& [key,enemy]:enemies)if(enemy.entity==target&&currentEnemy(enemy))
+                return DamageObservation{ability,0,key,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability),target,enemy.identity};
+        }catch(...) {}return {};
     }
     void afterNativeDamage(Net& net,const DamageObservation& observation,int result) {
         try {
             if(!currentEntity(observation.target,observation.identity))return;
             if(api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),observation.ability)!=observation.target)return;
             auto hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),observation.ability);
-            if(observation.playerTarget) {
-                const double amount=observation.hp-hp;
-                double full=observation.hp;bool skip=true;
-                api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),observation.ability,{&full,&skip});
-                if(amount>0&&session&&session->sendPlayerHit(net,observation.peer,amount,observation.key))++playerHitsSent;
-            }
             if(observation.actor) {
                 if(nativeHits.size()>=32)nativeHits.erase(nativeHits.begin());
                 nativeHits.push_back({{"source_actor",observation.actor},{"key",observation.key},{"native_result",result},
@@ -2683,49 +2391,20 @@ public:
         try {
             if(replayingCast||!session||!session->ready()||!ability)return;
             const auto role=net.currentRole();
-            if(!(role==Role::Host&&roomHost)&&!(role==Role::Client&&guestRealm))return;
+            if(role!=Role::Host||!roomHost)return;
             auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
             std::string key;for(const auto& [id,e]:enemies)if(e.entity==entity&&currentEnemy(e)&&roomEnemy(id)) {key=id;break;}
             if(key.empty()||ownerOf(key)!=localPeer)return;
             const auto skill=text(skillString);if(skill.empty()||skill.size()>128)return;
             const auto peer=castTarget(targetHandle);
-            if(role==Role::Host?session->sendEnemyCast(net,key,skill,peer):session->reportEnemyCast(net,key,skill,peer))++enemyCastsSent;
+            if(session->sendEnemyCast(net,key,skill,peer))++enemyCastsSent;
         }catch(const std::exception& e){replicationError=e.what();}
     }
     // Replay another machine's enemy skill on the local puppet, aimed at the
     // same player, so its attack animation and effects play here too. Damage
     // from a puppet is blocked; the owner's machine resolves the real hit.
-    bool replayEnemyCast(const std::string& key,const std::string& id,std::uint16_t peer) {
-        auto e=enemies.find(key);if(e==enemies.end()||!roomEnemy(key)||!currentEnemy(e->second))return false;
-        auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity);
-        if(!ability||!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),e->second.entity))return false;
-        void* targetEntity=nullptr;
-        if(peer&&peer==localPeer)targetEntity=character;
-        else if(auto actor=actors.find(peer);actor!=actors.end()&&actor->second.started&&currentActor(actor->second))targetEntity=actor->second.entity;
-        auto* targetAbility=targetEntity?api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),targetEntity):nullptr;
-        void* skill=nullptr;
-        api.value<bool>(gm("AbilitySystem","TryGetSkill","System.String|Beyond.Gameplay.Core.Skill&","System.Boolean"),ability,{api.string(id),&skill});
-        if(!skill)return false;
-        auto* view=runtime->object_new(runtime->context,api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* viewRaw=runtime->object_unbox(runtime->context,view);
-        if(targetAbility) {
-            float limit=120.f;auto* handle=api.call(gm("Skill","GetDefaultTarget","Beyond.Gameplay.Core.AbilitySystem|System.Single","Beyond.Gameplay.Core.TargetHandle"),skill,{targetAbility,&limit});
-            if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});}
-        }
-        auto castMethod=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(castMethod,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
-        auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);bool no=false;
-        replayingCast=true;
-        bool accepted=false;
-        try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});}
-        catch(...) {replayingCast=false;throw;}
-        replayingCast=false;
-        if(accepted) {
-            e->second.mirroredCastAt=nowMs();
-            e->second.lastCastCheck=0;e->second.mirroredCasting=true;
-        }
-        return accepted;
+    bool replayEnemyCast(const std::string&,const std::string&,std::uint16_t) {
+        return false; // Native gameplay skills are never replayed as display effects.
     }
     void mirrorEnemyCasts(Net& net,Session& link) {
         for(const auto& cast:link.takeEnemyCasts()) {
@@ -2856,75 +2535,17 @@ public:
         }
     }
     // Host: give each live room enemy to the player it is fighting.
-    void assignOwners(Net& net) {
-        const auto now=nowMs();if(now-lastOwnership<250)return;lastOwnership=now;
-        bool changed=false;
-        std::vector<std::pair<std::uint16_t,V3>> players;
-        if(hostTargetable())players.push_back({localPeer,api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character)});
-        for(const auto& [peer,actor]:actors)if(roomTargetable(actor)&&session->canAct(peer))
-            players.push_back({peer,api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),actor.entity)});
-        for(auto& [key,e]:enemies) {
-            if(!currentEnemy(e)||!roomEnemy(key))continue;
-            if(auto seed=hostEnemySeeds.find(key);seed!=hostEnemySeeds.end()&&!seed->second.value("alive",true))continue;
-            const auto here=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
-            auto distance=[&](std::uint16_t peer){
-                for(const auto& [id,p]:players)if(id==peer)return std::sqrt(double(p.x-here.x)*(p.x-here.x)+double(p.y-here.y)*(p.y-here.y)+double(p.z-here.z)*(p.z-here.z));
-                return std::numeric_limits<double>::infinity();};
-            auto& owner=owners[key];if(!owner)owner=localPeer;
-            const double current=distance(owner);
-            bool engaged=false;
-            if(owner==localPeer)engaged=aiTargetOf(e.entity)==character;
-            else if(auto report=engagedReports.find(key);report!=engagedReports.end())engaged=report->second.first&&now-report->second.second<1500;
-            std::uint16_t best=owner;double nearest=current;
-            for(const auto& [id,p]:players)if(const double d=distance(id);d<nearest){nearest=d;best=id;}
-            std::uint16_t next=owner;
-            if(hostOwnsAll)next=localPeer; // single authority: every monster's AI runs on the host
-            else if(!std::isfinite(current))next=nearest<80?best:localPeer;
-            else if(auto claim=hitClaims.find(key);claim!=hitClaims.end()&&now-claim->second.second<3000&&claim->second.first!=owner&&!engaged&&distance(claim->second.first)<80)
-                next=claim->second.first;
-            else if(best!=owner&&nearest<60&&((!engaged&&nearest+4<current)||(engaged&&current>35)))next=best;
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-            if(auto pin=ownerPins.find(key);pin!=ownerPins.end()&&now<pin->second.second&&std::isfinite(distance(pin->second.first)))next=pin->second.first;
-#endif
-            if(next!=owner&&session->assignEnemyOwner(key,next)) {owner=next;changed=true;++ownershipChanges;motions[key].samples.clear();motions[key].applied=false;}
-            setEnemyAI(e,owner==localPeer);
+    void assignOwners(Net&) {
+        if(!roomHost)return;
+        for(auto& [key,enemy]:enemies) {
+            if(owners[key]!=proto::kHostId) {owners[key]=proto::kHostId;++ownershipChanges;}
+            // The host keeps its native AI. Guests have no AI execution authority.
         }
-        // The reliable grant precedes casts from the new controller. The previous
-        // lease is already revoked locally, before this snapshot is sent.
-        if(changed)session->publish(net,captureWorld(),true);
     }
     // Host: movement reports for enemies a guest simulates.
-    void applyEnemyStates(Session& link) {
-        const auto now=nowMs();
-        for(const auto& report:link.takeEnemyStates()) {
-            const auto from=report.at("from").get<std::uint16_t>();
-            for(const auto& item:report.at("states")) {
-                const auto key=item.at("key").get<std::string>();
-                if(!enemies.contains(key)||ownerOf(key)!=from||
-                    !link.entityMatches(key,item.at("life").get<std::uint64_t>(),item.at("lease").get<std::uint64_t>(),from))continue;
-                const auto& p=item.at("position");const auto& q=item.at("rotation");
-                pushMotion(key,now,{p[0].get<float>(),p[1].get<float>(),p[2].get<float>()},{q[0].get<float>(),q[1].get<float>(),q[2].get<float>(),q[3].get<float>()});
-                engagedReports[key]={item.value("engaged",false),now};++enemyStatesApplied;
-            }
-        }
-    }
+
     // Guest: report enemies whose AI runs on this machine (10 Hz).
-    void reportOwnedEnemies(Net& net,Session& link) {
-        if(nowMs()-lastEnemyReport<50)return;lastEnemyReport=nowMs();
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-        if(nowMs()-lastGuestDiagnostics>1000) {lastGuestDiagnostics=nowMs();
-            for(const auto& [key,e]:enemies)if(ownerOf(key)==localPeer&&currentEnemy(e))diagnoseAI(key,e.entity);}
-#endif
-        nlohmann::json states=nlohmann::json::array();
-        for(const auto& [key,e]:enemies) {
-            if(ownerOf(key)!=localPeer||!roomEnemy(key)||!currentEnemy(e)||states.size()>=64)continue;
-            const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
-            auto* component=api.call(entityModel,e.entity);auto* go=component?api.call(modelGo,component):nullptr;
-            Q q{0,0,0,1};if(go&&alive(go))q=api.value<Q>(getRotation,api.call(getTransform,go));
-            states.push_back({{"key",key},{"position",{p.x,p.y,p.z}},{"rotation",{q.x,q.y,q.z,q.w}},{"engaged",aiTargetOf(e.entity)==character}});
-        }
-        if(!states.empty()&&link.sendEnemyStates(net,states))enemyStatesSent+=states.size();
-    }
+
     // Claims are evidence for a native re-execution adapter, never HP deltas.
     void applyRoomHits(Session& link) {
         for(const auto& hit:link.takeHits()) {
@@ -2937,70 +2558,6 @@ public:
                 lastHitClaim=hit;++hitClaimsPending;
             }catch(const std::exception& ex){replicationError=ex.what();}
         }
-    }
-    // Guest: the host resolved an enemy hit against this player's actor.
-    void applyPlayerHits(Session& link) {
-        for(const auto& hit:link.takePlayerHits()) {
-            try {
-                if(hit.at("epoch")!=link.generation()||hit.at("target_actor")!=link.playerEntity(localPeer)||
-                    !link.entityMatches(hit.at("key").get<std::string>(),hit.at("life").get<std::uint64_t>(),hit.at("lease").get<std::uint64_t>()))continue;
-                if(!usable(character))continue;
-                auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);if(!ability)continue;
-                // Health floor of 1: this is the player's real account operator,
-                // and room enemies are not part of the official server's world.
-                double hp=(std::max)(1.,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)-hit.at("amount").get<double>());bool skip=true;
-                api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
-                ++playerHitsTaken;
-            }catch(const std::exception& ex){replicationError=ex.what();}
-        }
-    }
-    // Guest side: an attack resolved by this player's own client on a room
-    // replica. The replica is filled first so it never dies locally (the host owns
-    // death and rewards); the measured loss is reported to the host.
-    struct GuestHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::string key;double before=0,full=0;std::optional<PlayerHitSource> source;};
-    std::optional<GuestHit> beforeGuestHit(Net& net,void* ability,void* modifier,std::optional<PlayerHitSource> provenance={}) {
-        try {
-            if(applyingDamage||!session||!session->combat||!session->followHost||!session->ready()||net.currentRole()!=Role::Client||!ability||!modifier||!character)return {};
-            if(!session->canAct(net.snapshot().localId))return {};
-            const auto& hosted=session->snapshot();
-            if(hosted.value("map",std::string{})!=mapId||hosted.value("level",std::string{})!=levelId)return {};
-            if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier))return {};
-            auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
-            std::string key;NativeIdentity identity;
-            for(const auto& [id,e]:enemies)if(e.entity==target&&currentEnemy(e)&&roomEnemy(id)) {key=id;identity=e.identity;break;}
-            if(key.empty())return {};
-            bool live=false;for(const auto& e:hosted.at("entities"))if(e.at("key")==key){live=e.value("alive",true)&&e.at("hp").get<double>()>0;break;}
-            if(!live)return {};
-            auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
-            auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
-            if(sourceEntity!=character||!provenance)return {};
-            for(const auto& [peer,actor]:actors)if(actor.entity==sourceEntity)return {};
-            ++guestHitCandidates;
-            if(auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),sourceEntity)) {
-                auto sourceTemplate=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
-                if(guestHitSources.size()<64||guestHitSources.contains(sourceTemplate))++guestHitSources[sourceTemplate];
-            }
-            GuestHit hit{ability,target,identity,key};
-            hit.source=provenance;
-            hit.before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
-            hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
-            if(!std::isfinite(hit.before)||!std::isfinite(hit.full)||hit.full<=0)return {};
-            bool skip=true;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hit.full,&skip});
-            return hit;
-        }catch(const std::exception& e){replicationError=e.what();return {};}
-    }
-    void afterGuestHit(Net& net,const GuestHit& hit) {
-        try {
-            if(!currentEntity(hit.target,hit.identity))return;
-            const double after=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),hit.ability);
-            const double amount=(std::min)(hit.full,hit.full-after);
-            double restore=hit.before;bool skip=true;
-            api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),hit.ability,{&restore,&skip});
-            if(amount>0&&session&&hit.source&&hit.source->actor==session->playerEntity(net.snapshot().localId)&&hit.source->epoch==session->generation()&&
-                nativeHitStrike!=UINT64_MAX&&session->submitHitClaim(net,hit.key,hit.source->cast,++nativeHitStrike,hit.source->action,hit.source->unit)) {++guestHitsSent;localHitAt[hit.key]=nowMs();}
-            else if(amount<=0)++guestZeroDamage;
-            else ++guestHitSendFailed;
-        }catch(const std::exception& e){replicationError=e.what();}
     }
     struct DeathObservation {void* entity=nullptr;NativeIdentity identity;std::string key;};
     // Guest in the host world: a host monster dies only when the host says so.
@@ -3028,7 +2585,7 @@ public:
         if(input.contains("detach_scripts"))detachFedScripts=input.at("detach_scripts").get<bool>();
         if(input.contains("native_move"))nativeMovePuppets=input.at("native_move").get<bool>();
         if(input.contains("native_move_notify"))nativeMoveNotify=input.at("native_move_notify").get<bool>();
-        if(input.contains("host_owns_all"))hostOwnsAll=input.at("host_owns_all").get<bool>();
+        if(input.contains("host_owns_all")&&!input.at("host_owns_all").get<bool>())throw std::runtime_error("客机 AI 权限已删除");
         if(input.contains("native_move_speed"))nativeMoveSpeed=input.at("native_move_speed").get<bool>();
         if(input.contains("native_move_state"))nativeMoveState=input.at("native_move_state").get<bool>();
         if(input.contains("native_move_pin"))nativeMovePin=input.at("native_move_pin").get<bool>();
@@ -3318,6 +2875,7 @@ public:
         ownerPins[key]={peer,nowMs()+30000};return {{"key",key}};
     }
     void queueNativeCast(nlohmann::json command) {
+        throw std::runtime_error("统一原生执行适配器尚未验收，旧技能执行入口已停用");
         if(diagnosticCast)throw std::runtime_error("原生诊断正在排队");
         if(!command.contains("peer")||!command.at("peer").is_number_unsigned()||!command.contains("key")||
            !command.at("key").is_string()||command.at("key").get<std::string>().size()>128||command.value("skill",std::string{}).size()>128)
@@ -3329,56 +2887,15 @@ public:
     // Called only from the game's native damage detour, under the world mutex.
     // Enemy modifiers are stopped on guests; host enemy state is the source of truth.
     bool captureDamage(Net& net,void* ability,void* modifier) {
-        // Host: an enemy simulated by a guest is a puppet here; its replayed
-        // attack must not hurt anyone (the owner's machine resolved the hit).
-        if(net.currentRole()==Role::Host&&roomHost&&modifier)try {
-            if(auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier)) {
-                auto* sourceEntity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source);
-                for(const auto& [key,e]:enemies)if(e.entity==sourceEntity)return ownerOf(key)!=localPeer;
-            }
-            return false;
-        }catch(...) {return false;}
-        if(applyingDamage||!session||!session->combat||!session->followHost||!session->ready()||net.currentRole()!=Role::Client||!modifier||!character) return false;
+        if(!ability||!modifier)return false;
         try {
-            const auto& hosted=session->snapshot();if(hosted.value("map",std::string{})!=mapId||hosted.value("level",std::string{})!=levelId) return false;
-            if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier)) return false;
             auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
-            // A replayed enemy attack is presentation only. The host resolves it
-            // against this player's actor and forwards the damage (player_hit).
-            if(auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier)) {
-                auto* sourceEntity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source);
-                // An enemy we simulate hits this player's operator natively (hit
-                // reaction, dodge, health). Anything else from a replica is a replay.
-                for(const auto& [owned,e]:enemies)if(e.entity==sourceEntity&&roomEnemy(owned)) {
-                    if(ownerOf(owned)!=localPeer||!session->canAct(net.snapshot().localId))return true;
-                    if(target==character)return false;
-                    // A stand-in for another player: measured and forwarded below.
-                    for(const auto& [peer,actor]:actors)if(actor.entity==target)return false;
-                    return true;
-                }
-            }
-            // Resource objects and NPCs can take damage without an enemy
-            // controller. Guests must not mutate those private scene objects.
-            if(!target)return false;
-            if(!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),target))
-                return blockPrivateAction(net,"private_object_damage");
-            auto key=entityKey(target);for(const auto& [owned,e]:enemies) if(e.entity==target) {key=owned;break;}
-            bool authoritative=false,alive_=false;
-            for(const auto& e:hosted.at("entities")) if(e.at("key")==key) {authoritative=true;alive_=e.at("hp").get<double>()>0;break;}
-            // Do not settle a private guest enemy while connected to a hosted world.
-            // It must be replaced by a room-owned replica before it becomes playable.
-            if(!authoritative) return true;
-            if(!alive_) return true;
-            if(!session->canAct(net.snapshot().localId)) return true;
-            auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
-            auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
-            if(!sourceEntity||api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),sourceEntity)) return true;
-            for(const auto& [peer,actor]:actors)if(actor.entity==sourceEntity) return true;
-            // A proven native hit is handled by beforeGuestHit and bypasses
-            // this fallback. Missing provenance must not allow a local attack
-            // or summon to change a room replica's health.
-            return true;
-        }catch(const std::exception& e) {replicationError=e.what();return true;}
+            for(const auto& [peer,actor]:actors)if(actor.entity==target&&currentActor(actor))return true;
+            if(net.currentRole()!=Role::Client||!guestRealm)return false;
+            // No guest may execute damage on a shared view or report a local
+            // result. Native intent capture/execution is a separate adapter.
+            return api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier);
+        }catch(...) {return net.currentRole()==Role::Client&&guestRealm;}
     }
     // Borrow cursor state only on a menu transition. Never force it every frame;
     // never restore stale state over a change made by the game's own UI.
@@ -3446,8 +2963,7 @@ public:
         else if(!showMarkers) markers=nlohmann::json::array();
         const auto remotesStart=std::chrono::steady_clock::now();
         try {
-            if((net.currentRole()==Role::Host||net.currentRole()==Role::Client)&&link.localSceneOperational()) updateRemotes(presentationView(net.snapshot(),link),showRemote);
-            else if(!avatars.empty()) clear();
+            if(!avatars.empty())clear(); // uncertified native views are unsupported
         } catch(const std::exception& e) {localError=e.what();}
         try {if(link.localSceneOperational()&&((net.currentRole()==Role::Host&&roomHost)||(net.currentRole()==Role::Client&&guestRealm)))updateEnemyMotion();}
         catch(const std::exception& e) {replicationError=e.what();}
@@ -3505,6 +3021,9 @@ public:
             {"authorized_teleports",a.teleports},{"error",a.error}});
         nlohmann::json targetStatus=nlohmann::json::array();for(const auto& [key,e]:enemies)targetStatus.push_back({{"key",key},{"queries",e.targetQueries},{"enable_queries",e.enableQueries},{"assignments",e.targetAssignments},{"foreign_targets_rejected",e.foreignTargetsRejected},{"target_actor",e.targetActor},{"range",e.targetRange},{"error",e.targetError}});
         auto result=nlohmann::json{{"local_model",localModel},{"map_id",mapId},{"level_id",levelId},{"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},
+            {"authority_architecture",{{"phase","legacy_removed_adapters_unverified"},{"shared_world_supported",false},{"full_sync_verified",false},
+                {"guest_result_submission",false},{"guest_ai_authority",false},{"native_gameplay_replay",false},
+                {"account_risk",true},{"official_safety_guaranteed",false},{"native_paths_verified",false}}},
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",remote},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage",nativeWeaponLookupReady?"native_weapon_preview":"metadata_only"},

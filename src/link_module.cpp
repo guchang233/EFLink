@@ -211,12 +211,9 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
     eflink::DamageApplicationScope scope(ability,modifier);
     if(!scope.observe())return nextDamage(ability,modifier,info);
-    auto source=cleanupRequested?decltype(world.observePlayerHitSource(net,modifier)){}:world.observePlayerHitSource(net,modifier);
-    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier,source);
-    if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
+    if(!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
     const auto result=nextDamage(ability,modifier,info);
-    if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
     if(!cleanupRequested)world.noteDamage("apply",ability,std::to_string(result));
     return result;
@@ -232,12 +229,9 @@ int __fastcall onTransferred(void* ability,void* modifier,bool triggerEvent,void
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
     eflink::DamageApplicationScope scope(ability,modifier);
     if(!scope.observe())return nextTransferred(ability,modifier,triggerEvent,info);
-    auto source=cleanupRequested?decltype(world.observePlayerHitSource(net,modifier)){}:world.observePlayerHitSource(net,modifier);
-    auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier,source);
-    if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier))return 0;
+    if(!cleanupRequested&&world.captureDamage(net,ability,modifier))return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
     const auto result=nextTransferred(ability,modifier,triggerEvent,info);
-    if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
     if(!cleanupRequested)world.noteDamage("transferred",ability,std::to_string(result));
     return result;
