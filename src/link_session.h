@@ -122,11 +122,12 @@ class Session {
     std::atomic<std::uint64_t> presentationCoalesced{0};
     std::uint64_t presentationSequence=0,lastPresentation=0,presentationReceived=0,presentationSkipped=0,presentationRawBytes=0,presentationWireBytes=0,presentationPacked=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
-    worldauthority::Host nativeAuthority;worldauthority::Replica nativeReplica;
+    worldauthority::Host nativeAuthority;worldauthority::Replica nativeReplica;worldauthority::WorldHandoff nativeHandoff;
     std::string worldIncarnation;
     std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0,authoritySeen=0;
     bool authoritySent=false;
     void resetSharedObjects() {
+        nativeHandoff.withdraw(); // a retained personal snapshot must outlive room/scene ledger reset
         nativeAuthority.reset();nativeReplica.reset();sentAuthorityRevision=lastAuthorityPublish=lastAuthorityBaseline=authoritySeen=0;authoritySent=false;
     }
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
@@ -679,6 +680,7 @@ public:
             for(auto& [id,entry]:entries)entry.active=false;
             commands.clear();hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();castEvents.clear();
             nativeAuthority.suspend();nativeReplica.reset();authoritySeen=0;authoritySent=false;
+            nativeHandoff.withdraw();
         }
     }
     bool localSceneOperational() const {return localSceneReady;}
@@ -769,6 +771,7 @@ public:
         {"player_casts",{{"accepted",castEventsAccepted},{"active",playerCasts.active(nowMs())},{"replay_enabled",false}}},
         {"hit_claims",{{"accepted",hitsAccepted},{"legacy_numeric_rejected",legacyHitsRejected},{"native_verification_required",true}}},
         {"world_authority",{{"host",nativeAuthority.status()},{"observed",sharedObjects().size()},{"replica_revision",nativeReplica.version()},
+            {"handoff",nativeHandoff.status()},
             {"baseline_required",nativeReplica.needsBaseline()},{"age_ms",authoritySeen?nowMs()-authoritySeen:0},
             {"operation_adapter_verified",false},{"replica_adapter_verified",false},{"full_sync_verified",false}}},
         {"age_ms",seenAt?nowMs()-seenAt:0},{"snapshots_received",received},{"skill_intents_accepted",attacks},{"hits_accepted",hitsAccepted},{"rejected",rejected},{"entry",entryStatus()},{"error",error}};}

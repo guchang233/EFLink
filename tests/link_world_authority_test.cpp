@@ -12,6 +12,8 @@ Observation mineral(int hp=10000,std::uint64_t cookie=20,bool collected=false) {
 }
 struct Fixture:NativeAdapter {
     bool certified=true,began=true;unsigned starts=0,cancels=0;std::optional<Witness> result;
+    bool retained=false,allowCapture=true,beginWorld=true,initialized=true,applied=false,restoreBegin=true,restoreResult=false;
+    unsigned restores=0,releases=0,applies=0;Scope activeScope;
     std::string gameVersion() const override {return "fixture-only";}
     std::string path() const override {return "fixture/not-a-game-adapter";}
     bool executionVerified() const override {return certified;}
@@ -22,6 +24,15 @@ struct Fixture:NativeAdapter {
     bool begin(const Ticket&) override {++starts;return began;}
     std::optional<Witness> poll(const Ticket&) override {auto out=result;result.reset();return out;}
     void cancel(const Ticket&) noexcept override {++cancels;}
+    std::optional<std::uint64_t> capturePersonal() override {if(!allowCapture)return {};retained=true;return 99;}
+    bool personalRetained(std::uint64_t handle) const override {return handle==99&&retained;}
+    bool beginShared(std::uint64_t,const Scope& scope) override {activeScope=scope;return beginWorld;}
+    bool nativeInitialized(const Scope& scope) const override {return initialized&&scope==activeScope;}
+    bool applyBaseline(const Scope&,const Json&) override {++applies;return true;}
+    bool baselineObserved(const Scope&,std::uint64_t) const override {return applied;}
+    bool beginRestore(std::uint64_t) override {++restores;return restoreBegin;}
+    bool restoreObserved(std::uint64_t) const override {return restoreResult;}
+    void releasePersonal(std::uint64_t) noexcept override {++releases;retained=false;}
 };
 int main() {
     check(readOnlyBuildSupported("1.5.3")&&!readOnlyBuildSupported("")&&!readOnlyBuildSupported("1.5.4")&&!readOnlyBuildSupported("fixture-only"),
@@ -59,6 +70,8 @@ int main() {
     auto delta=host.changesSince(old);
     check(delta&&guest.delta(*delta,true)&&guest.snapshot().size()==3,"another object kind uses the same ordered journal");
     check(!guest.delta(*delta,true),"duplicate journal delivery cannot reapply state");
+    check(!validReceipt(Json{{"peer",2},{"member",1},{"request",1},{"action",88},{"strike",1},{"reward",999}}),
+        "result receipts cannot carry rewards or private account fields");
     const auto beforeMalformed=guest.snapshot();auto corrupted=host.baseline();corrupted["objects"][0]["account_uid"]=123;
     check(!guest.baseline(corrupted,scene(),true)&&guest.snapshot()==beforeMalformed,"private fields reject whole baseline atomically");
     auto invalid=mineral();invalid.state["hp_ratio"]=-1;auto before=host.baseline();
@@ -98,18 +111,41 @@ int main() {
     std::atomic<bool> wrongThread=false;std::thread other([&]{wrongThread=throws([&]{host.suspend();});});other.join();
     check(wrongThread,"network or worker threads cannot mutate native authority");
     WorldHandoff handoff;
-    check(!handoff.begin(scene(),false)&&handoff.begin(scene(),true),"handoff requires retained personal world before shared loading");
+    adapter.allowCapture=false;
+    check(!handoff.begin(scene(),adapter,"fixture-only"),"handoff cannot begin without a retained native personal snapshot");
+    adapter.allowCapture=true;
+    check(handoff.begin(scene(),adapter,"fixture-only"),"handoff captures a private native snapshot before shared loading");
     check(!handoff.personalOperationAllowed()&&!handoff.roomOperationAllowed(scene()),"loading permits neither personal nor shared operations");
-    adapter.certified=false;check(!handoff.admit(scene(),true,true,adapter,"fixture-only"),"baseline and native initialization do not certify isolation");
-    adapter.certified=true;check(handoff.admit(scene(),true,true,adapter,"fixture-only")&&handoff.roomOperationAllowed(scene()),"fixture handoff checks exact world scope and all adapter proofs");
+    adapter.certified=false;check(!handoff.admit(guest,"fixture-only"),"baseline and native initialization do not certify isolation");
+    adapter.certified=true;check(!handoff.admit(guest,"fixture-only")&&!handoff.roomOperationAllowed(scene())&&adapter.applies==1,
+        "native baseline dispatch return cannot admit a guest before observed application");
+    adapter.applied=true;check(handoff.admit(guest,"fixture-only")&&handoff.roomOperationAllowed(scene()),"fixture handoff checks exact world scope and all native observations");
     check(!handoff.roomOperationAllowed(scene(2)),"new scene immediately lacks old operation permission");
-    handoff.withdraw();handoff.restored(false);check(handoff.phase()==WorldHandoff::Phase::Failed&&handoff.recoveryRetained()&&!handoff.personalOperationAllowed(),"failed native recovery retains snapshot and closes account operation gate");
-    handoff.withdraw();handoff.restored(true);handoff.withdraw();handoff.restored(true);
-    check(handoff.personalOperationAllowed()&&!handoff.recoveryRetained(),"observed native restoration is retryable and cleanup idempotent");
+    handoff.withdraw();adapter.restoreBegin=false;
+    check(!handoff.restore()&&handoff.phase()==WorldHandoff::Phase::Failed&&handoff.recoveryRetained()&&!handoff.personalOperationAllowed(),"failed native recovery retains snapshot and closes account operation gate");
+    handoff.withdraw();adapter.restoreBegin=true;
+    check(!handoff.restore()&&!handoff.restore()&&adapter.restores==2&&handoff.recoveryRetained(),"native restore return is not success and polling cannot repeat restoration dispatch");
+    adapter.restoreResult=true;check(handoff.restore(),"observed native restoration releases retained private snapshot");handoff.withdraw();handoff.restore();
+    check(handoff.personalOperationAllowed()&&!handoff.recoveryRetained()&&adapter.releases==1,"observed native restoration is retryable and cleanup idempotent");
+    WorldHandoff failedBegin;adapter.beginWorld=false;
+    check(!failedBegin.begin(scene(),adapter,"fixture-only")&&failedBegin.phase()==WorldHandoff::Phase::Restoring&&failedBegin.recoveryRetained()&&
+        !failedBegin.personalOperationAllowed(),"partial native scene entry failure must restore rather than discard personal snapshot");
+    failedBegin.restore();
+    wrongThread=false;std::thread handoffWorker([&]{wrongThread=throws([&]{handoff.withdraw();});});handoffWorker.join();
+    check(wrongThread,"worker/network threads cannot execute native handoff or recovery");
     host.reset(scene(2),"fixture-only");host.observe("player",{{"host","player",{{"hp",100},{"max_hp",100}},10}});
     check(host.find("player","host")->ref!=actor&&host.status()["suspended"]==true,"scene reset revokes ownership and retains monotonic allocation");
     check(newWorldIncarnation().size()==32&&newWorldIncarnation()!=newWorldIncarnation(),"room incarnations are independent of official identities");
     for(const auto& kind:{"enemy","destructible","skill","projectile","summon","effect","wave","drop_display"})host.observe(kind,{{kind,kind,{{"active",true}},40}});
     check(host.baseline()["objects"].size()==9,"remaining object kinds share exactly the same ledger without category-specific authority");
+    auto retainedRevision=host.baseline().at("revision").get<std::uint64_t>();
+    for(unsigned stage=0;stage<300;++stage)host.observe("mechanism",{{"bounded","mechanism",{{"stage",stage}},101}});
+    check(!host.changesSince(retainedRevision),"history beyond bounded journal retention requires complete baseline");
+    Replica late;check(late.baseline(host.baseline(),scene(2),true)&&late.snapshot().size()==10,
+        "late join restores every object kind after incremental history expires");
+    auto beforeOversize=host.baseline();std::vector<Observation> oversized;
+    for(unsigned index=0;index<Host::maxObjects+1;++index)oversized.push_back({std::to_string(index),"effect",{{"active",true}},index+1});
+    check(throws([&]{host.observe("effect",oversized);})&&host.baseline()==beforeOversize,
+        "oversized census cannot evict valid world state or exceed transport capacity");
     return failures?1:0;
 }

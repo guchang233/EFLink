@@ -118,6 +118,12 @@ struct Intent {
             j.at("expected_version").get<std::uint64_t>(),Ref::parse(j.at("actor")),Ref::parse(j.at("target")),op};
     }
 };
+inline bool validReceipt(const Json& value) {
+    if(value.is_null())return true;
+    if(!exactFields(value,{"peer","member","request","action","strike"}))return false;
+    for(auto field:{"peer","member","request","action","strike"})if(!positive(value.at(field)))return false;
+    return value.at("peer").get<std::uint64_t>()<=65535;
+}
 struct Ticket {
     Scope scope;std::uint64_t serial=0,actorCookie=0,targetCookie=0,beforeVersion=0;Intent intent;
 };
@@ -140,6 +146,18 @@ public:
     virtual bool begin(const Ticket&) {return false;}
     virtual std::optional<Witness> poll(const Ticket&) {return {};}
     virtual void cancel(const Ticket&) noexcept {}
+    // Personal snapshot handles stay private to the native adapter. Room JSON
+    // and guest messages cannot supply a handle or assert restoration success.
+    virtual std::optional<std::uint64_t> capturePersonal() {return {};}
+    virtual bool personalRetained(std::uint64_t) const {return false;}
+    virtual bool beginShared(std::uint64_t,const Scope&) {return false;}
+    virtual bool nativeInitialized(const Scope&) const {return false;}
+    virtual bool applyBaseline(const Scope&,const Json&) {return false;}
+    virtual bool baselineObserved(const Scope&,std::uint64_t) const {return false;}
+    virtual void suspendShared(const Scope&) noexcept {}
+    virtual bool beginRestore(std::uint64_t) {return false;}
+    virtual bool restoreObserved(std::uint64_t) const {return false;}
+    virtual void releasePersonal(std::uint64_t) noexcept {}
 };
 class Host {
     struct Member {std::uint64_t incarnation=0,highRequest=0;Ref actor;bool active=false;};
@@ -298,6 +316,7 @@ class Replica {
     Scope scope_;std::map<std::uint64_t,Json> objects;std::uint64_t revision=0;bool missing=true;
 public:
     void reset(Scope scope={}) {scope_=std::move(scope);objects.clear();revision=0;missing=true;}
+    const Scope& scope() const {return scope_;}
     bool baseline(const Json& packet,const Scope& expected,bool fromHost) {
         try {
             if(!fromHost||!exactFields(packet,{"scope","revision","objects"})||Scope::parse(packet.at("scope"))!=expected||
@@ -324,7 +343,7 @@ public:
             auto candidate=objects;auto next=revision;
             for(const auto& event:packet.at("events")) {
                 if(next==UINT64_MAX||!exactFields(event,{"scope","revision","type","object","receipt"})||Scope::parse(event.at("scope"))!=scope_||
-                    event.at("revision")!=++next||!Object::validWire(event.at("object"))) {missing=true;return false;}
+                    !positive(event.at("revision"))||event.at("revision")!=++next||!Object::validWire(event.at("object"))||!validReceipt(event.at("receipt"))) {missing=true;return false;}
                 const auto& o=event.at("object");const auto ref=Ref::parse(o.at("ref"));auto prior=candidate.find(ref.id);
                 if(event.at("type")=="retire") {
                     if(prior==candidate.end()||prior->second.at("ref")!=ref.json()) {missing=true;return false;}candidate.erase(prior);
@@ -351,25 +370,70 @@ class WorldHandoff {
 public:
     enum class Phase {Personal,Loading,Shared,Restoring,Failed};
 private:
-    Phase phase_=Phase::Personal;Scope scope_;bool retained=false;
-public:
-    Phase phase() const {return phase_;}
-    bool begin(const Scope& scope,bool personalSnapshotRetained) {
-        if(phase_!=Phase::Personal||!scope.valid()||!personalSnapshotRetained)return false;
-        scope_=scope;retained=true;phase_=Phase::Loading;return true;
+    Phase phase_=Phase::Personal;Scope scope_;std::uint64_t snapshot=0,appliedRevision=0;
+    NativeAdapter* adapter=nullptr;bool restoreStarted=false,baselineSubmitted=false;std::string gameVersion_;
+    std::thread::id owner;
+    void thread() {
+        if(owner==std::thread::id{})owner=std::this_thread::get_id();
+        if(owner!=std::this_thread::get_id())throw std::runtime_error("native handoff outside game thread");
     }
-    bool admit(const Scope& scope,bool nativeInitialized,bool baselineApplied,const NativeAdapter& adapter,const std::string& gameVersion) {
-        if(phase_!=Phase::Loading||scope!=scope_||!nativeInitialized||!baselineApplied||gameVersion.empty()||adapter.gameVersion()!=gameVersion||
-            !adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified())return false;
+    bool verified(const std::string& gameVersion) const {
+        return adapter&&!gameVersion.empty()&&adapter->gameVersion()==gameVersion&&!adapter->path().empty()&&
+            adapter->executionVerified()&&adapter->isolationVerified()&&adapter->recoveryVerified()&&adapter->personalRetained(snapshot);
+    }
+public:
+    WorldHandoff()=default;WorldHandoff(const WorldHandoff&)=delete;WorldHandoff& operator=(const WorldHandoff&)=delete;
+    Phase phase() const {return phase_;}
+    bool begin(const Scope& scope,NativeAdapter& native,const std::string& gameVersion) {
+        thread();
+        if(phase_!=Phase::Personal||!scope.valid()||gameVersion.empty()||native.gameVersion()!=gameVersion||native.path().empty()||
+            !native.executionVerified()||!native.isolationVerified()||!native.recoveryVerified())return false;
+        std::optional<std::uint64_t> saved;try {saved=native.capturePersonal();}catch(...) {return false;}
+        if(!saved||!*saved||!native.personalRetained(*saved))return false;
+        scope_=scope;adapter=&native;snapshot=*saved;gameVersion_=gameVersion;phase_=Phase::Loading;restoreStarted=baselineSubmitted=false;
+        // Once capture succeeded, any native begin failure requires recovery;
+        // it cannot discard the original world or reopen account operations.
+        bool started=false;try {started=native.beginShared(snapshot,scope);}catch(...) {}
+        if(!started) {withdraw();return false;}return true;
+    }
+    bool admit(const Replica& replica,const std::string& gameVersion) {
+        thread();
+        if(phase_!=Phase::Loading||!verified(gameVersion)||gameVersion!=gameVersion_||replica.scope()!=scope_||replica.needsBaseline()||!adapter->nativeInitialized(scope_))return false;
+        if(!baselineSubmitted) {
+            bool submitted=false;try {submitted=adapter->applyBaseline(scope_,replica.snapshot());}catch(...) {}
+            if(!submitted) {withdraw();return false;}
+            appliedRevision=replica.version();baselineSubmitted=true;
+        }
+        if(replica.version()!=appliedRevision||!adapter->baselineObserved(scope_,appliedRevision))return false;
         phase_=Phase::Shared;return true;
     }
-    void withdraw() {if(phase_!=Phase::Personal)phase_=Phase::Restoring;}
-    void restored(bool nativeRestoreObserved) {
-        if(phase_!=Phase::Restoring)return;
-        if(nativeRestoreObserved) {phase_=Phase::Personal;scope_={};retained=false;}else phase_=Phase::Failed;
+    void withdraw() {
+        thread();
+        if(phase_==Phase::Personal)return;
+        if(adapter)adapter->suspendShared(scope_);
+        if(phase_!=Phase::Restoring)restoreStarted=false;
+        phase_=Phase::Restoring;
     }
-    bool roomOperationAllowed(const Scope& scope) const {return phase_==Phase::Shared&&scope==scope_;}
+    bool restore() {
+        thread();
+        if(phase_==Phase::Personal)return true;
+        if(phase_!=Phase::Restoring||!adapter||!adapter->personalRetained(snapshot))return false;
+        if(!restoreStarted) {
+            bool started=false;try {started=adapter->beginRestore(snapshot);}catch(...) {}
+            if(!started) {phase_=Phase::Failed;return false;}restoreStarted=true;
+        }
+        // Return/timeout is never native restoration evidence. Keep the native
+        // snapshot and the closed gate until the adapter observes restoration.
+        if(!adapter->restoreObserved(snapshot))return false;
+        adapter->releasePersonal(snapshot);snapshot=0;adapter=nullptr;scope_={};phase_=Phase::Personal;return true;
+    }
+    bool roomOperationAllowed(const Scope& scope) const {return phase_==Phase::Shared&&scope==scope_&&verified(gameVersion_)&&adapter->nativeInitialized(scope_);}
     bool personalOperationAllowed() const {return phase_==Phase::Personal;}
-    bool recoveryRetained() const {return retained;}
+    bool recoveryRetained() const {return snapshot!=0;}
+    Json status() const {
+        const char* phase=phase_==Phase::Personal?"personal":phase_==Phase::Loading?"loading":phase_==Phase::Shared?"shared":phase_==Phase::Restoring?"restoring":"restore_failed";
+        return {{"phase",phase},{"personal_snapshot_retained",recoveryRetained()},{"restore_started",restoreStarted},
+            {"personal_operation_allowed",personalOperationAllowed()},{"shared_operation_allowed",roomOperationAllowed(scope_)},{"full_sync_verified",false}};
+    }
 };
 }
