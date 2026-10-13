@@ -90,7 +90,7 @@ struct Ref {
 };
 struct Observation {std::string key,kind;Json state;std::uint64_t cookie=0;};
 struct Object {
-    Ref ref;std::string key,kind;Json state;std::uint64_t cookie=0,version=0;
+    Ref ref;std::string key,kind;Json state;std::uint64_t cookie=0,version=0,nativeStamp=0;
     Json json() const {return {{"ref",ref.json()},{"key",key},{"kind",kind},{"version",version},{"state",state}};}
     static bool validWire(const Json& j) {
         try {
@@ -125,12 +125,13 @@ inline bool validReceipt(const Json& value) {
     return value.at("peer").get<std::uint64_t>()<=65535;
 }
 struct Ticket {
-    Scope scope;std::uint64_t serial=0,actorCookie=0,targetCookie=0,beforeVersion=0;Intent intent;
+    Scope scope;std::uint64_t serial=0,actorCookie=0,targetCookie=0,beforeVersion=0;Intent intent;std::uint64_t beginStamp=0;
 };
 struct Witness {
     // Adapter must associate the native callback with THIS execution. A generic
-    // later census, function return or unchanged state cannot produce a witness.
-    std::uint64_t serial=0,actorCookie=0,targetCookie=0,event=0;Json state;
+    // later census or function return cannot produce a witness. The private
+    // capture stamp is issued at the actual callback, never when poll runs.
+    std::uint64_t serial=0,actorCookie=0,targetCookie=0,event=0;Json state;std::uint64_t nativeStamp=0;
 };
 class NativeAdapter {
 public:
@@ -152,7 +153,7 @@ public:
     virtual bool personalRetained(std::uint64_t) const {return false;}
     virtual bool beginShared(std::uint64_t,const Scope&) {return false;}
     virtual bool nativeInitialized(const Scope&) const {return false;}
-    virtual bool applyBaseline(const Scope&,const Json&) {return false;}
+    virtual bool applyBaseline(const Scope&,std::uint64_t,const Json&) {return false;}
     virtual bool baselineObserved(const Scope&,std::uint64_t) const {return false;}
     virtual void suspendShared(const Scope&) noexcept {}
     virtual bool beginRestore(std::uint64_t) {return false;}
@@ -170,7 +171,7 @@ class Host {
     std::map<Strike,std::uint64_t> strikes;
     std::set<std::pair<std::string,std::uint64_t>> nativeEvents;
     std::deque<Json> journal;
-    std::uint64_t nextObject=0,nextLife=0,nextTicket=0,revision=0,accepted=0,rejected=0,confirmed=0,expired=0;
+    std::uint64_t nextObject=0,nextLife=0,nextTicket=0,nextNativeStamp=0,revision=0,accepted=0,rejected=0,confirmed=0,expired=0;
     bool suspended=true;
     void thread() {
         if(owner==std::thread::id{})owner=std::this_thread::get_id();
@@ -186,7 +187,7 @@ class Host {
     bool usable(const Intent& intent) const {
         auto m=members.find(intent.peer);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
         return !suspended&&intent.scope==scope_&&m!=members.end()&&m->second.active&&m->second.incarnation==intent.member&&
-            m->second.actor==intent.actor&&actor&&actor->kind=="player"&&target&&target->version==intent.expectedVersion&&
+            m->second.actor==intent.actor&&actor&&actor->kind=="player"&&target&&intent.expectedVersion>0&&target->version>=intent.expectedVersion&&
             !actor->state.value("dead",false)&&!actor->state.value("downed",false)&&!target->state.value("collected",false)&&
             target->state.value("active",true);
     }
@@ -210,6 +211,10 @@ public:
         // Allocators survive room/scene resets, including reuse of a network ID.
     }
     const Scope& scope() const {return scope_;}
+    // Native adapters call this on the game thread at capture time. A delayed
+    // callback may acknowledge its ticket, but cannot roll back a newer census.
+    // This clock and native cookies are private and never accepted from JSON.
+    std::uint64_t captureNativeStamp() {thread();advance(nextNativeStamp);return nextNativeStamp;}
     const Object* find(Ref ref) const {for(const auto& [key,o]:objects)if(o.ref==ref)return &o;return nullptr;}
     const Object* find(const std::string& kind,const std::string& key) const {auto it=objects.find(index(kind,key));return it==objects.end()?nullptr:&it->second;}
     Json baseline() const {
@@ -220,6 +225,7 @@ public:
     // incomplete adapter scan must never call this with a partial collection.
     void observe(const std::string& kind,const std::vector<Observation>& observations) {
         thread();if(!scope_.valid()||!knownKind(kind)||observations.size()>maxObjects)throw std::runtime_error("unavailable native census");
+        const auto stamp=captureNativeStamp();
         auto candidate=objects;auto id=nextObject,life=nextLife;std::set<std::string> seen;std::vector<std::pair<std::string,Object>> events;
         for(const auto& v:observations) {
             if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!validState(v.state)||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
@@ -230,8 +236,11 @@ public:
                  (!it->second.state.value("active",true)&&v.state.value("active",true)));
             if(it==candidate.end()||it->second.cookie!=v.cookie||regenerated) {
                 if(it!=candidate.end())events.emplace_back("retire",it->second);
-                advance(id);advance(life);Object object{{id,life},v.key,kind,v.state,v.cookie,1};candidate[key]=object;events.emplace_back("upsert",object);
-            }else if(it->second.state!=v.state) {advance(it->second.version);it->second.state=v.state;events.emplace_back("upsert",it->second);}
+                advance(id);advance(life);Object object{{id,life},v.key,kind,v.state,v.cookie,1,stamp};candidate[key]=object;events.emplace_back("upsert",object);
+            }else {
+                it->second.nativeStamp=stamp;
+                if(it->second.state!=v.state) {advance(it->second.version);it->second.state=v.state;events.emplace_back("upsert",it->second);}
+            }
         }
         for(auto it=candidate.begin();it!=candidate.end();)if(it->second.kind==kind&&!seen.contains(it->first)) {events.emplace_back("retire",it->second);it=candidate.erase(it);}else ++it;
         if(candidate.size()>maxObjects||events.size()>UINT64_MAX-revision)throw std::runtime_error("authority capacity exhausted");
@@ -266,7 +275,7 @@ public:
             auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
             Strike strike{sender,intent.member,intent.action,intent.target.id,intent.target.life,intent.strike};
             if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
-            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent};
+            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp()};
             m.highRequest=intent.request;strikes[strike]=intent.request;
             if(now>UINT64_MAX-1500) {++rejected;return {};}
             pending.emplace(ticket.serial,Pending{ticket,&adapter,now+1500});
@@ -290,15 +299,23 @@ public:
             auto* existing=find(t.intent.target);
             if(witness->serial!=t.serial||witness->actorCookie!=t.actorCookie||witness->targetCookie!=t.targetCookie||!witness->event||
                 !validState(witness->state)||!existing||nativeEvents.contains({p.adapter->path(),witness->event})||
-                existing->version!=t.beforeVersion||witness->state==existing->state||nativeEvents.size()>=8192||revision==UINT64_MAX||existing->version==UINT64_MAX) {
+                !witness->nativeStamp||witness->nativeStamp<=t.beginStamp||witness->nativeStamp>nextNativeStamp||
+                (witness->nativeStamp==existing->nativeStamp&&witness->state!=existing->state)||
+                nativeEvents.size()>=8192||revision==UINT64_MAX) {
                 ++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;
             }
             auto& object=objects.at(index(existing->kind,existing->key));
-            auto candidate=object;candidate.state=witness->state;++candidate.version;
+            auto candidate=object;
+            const bool changed=witness->nativeStamp>object.nativeStamp&&witness->state!=object.state;
+            if(changed) {
+                if(candidate.version==UINT64_MAX) {++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;}
+                candidate.state=witness->state;++candidate.version;
+            }
+            candidate.nativeStamp=std::max(candidate.nativeStamp,witness->nativeStamp);
             auto full=baseline();for(auto& o:full["objects"])if(o.at("ref")==candidate.ref.json())o=candidate.json();
             if(full.dump().size()>maxWire) {++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;}
             object=std::move(candidate);nativeEvents.emplace(p.adapter->path(),witness->event);
-            record("upsert",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
+            record(changed?"upsert":"receipt",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
             ++confirmed;it=pending.erase(it);
         }
     }
@@ -351,6 +368,10 @@ public:
                     if(prior!=candidate.end()&&(prior->second.at("ref")!=ref.json()||prior->second.at("kind")!=o.at("kind")||prior->second.at("key")!=o.at("key")||
                         prior->second.at("version").get<std::uint64_t>()==UINT64_MAX||o.at("version")!=prior->second.at("version").get<std::uint64_t>()+1)) {missing=true;return false;}
                     if(prior==candidate.end()&&o.at("version")!=1) {missing=true;return false;}candidate[ref.id]=o;
+                }else if(event.at("type")=="receipt") {
+                    // A correlated result already covered by a later native
+                    // observation acknowledges only; it cannot replace state.
+                    if(prior==candidate.end()||prior->second!=o||event.at("receipt").is_null()) {missing=true;return false;}
                 }else {missing=true;return false;}
             }
             if(next!=end||candidate.size()>Host::maxObjects) {missing=true;return false;}
@@ -399,8 +420,15 @@ public:
     bool admit(const Replica& replica,const std::string& gameVersion) {
         thread();
         if(phase_!=Phase::Loading||!verified(gameVersion)||gameVersion!=gameVersion_||replica.scope()!=scope_||replica.needsBaseline()||!adapter->nativeInitialized(scope_))return false;
+        if(baselineSubmitted) {
+            if(!adapter->baselineObserved(scope_,appliedRevision))return false;
+            if(replica.version()==appliedRevision) {phase_=Phase::Shared;return true;}
+            // Wait for the prior native application before catching up. Never
+            // dispatch overlapping baselines or admit an older revision.
+            baselineSubmitted=false;
+        }
         if(!baselineSubmitted) {
-            bool submitted=false;try {submitted=adapter->applyBaseline(scope_,replica.snapshot());}catch(...) {}
+            bool submitted=false;try {submitted=adapter->applyBaseline(scope_,replica.version(),replica.snapshot());}catch(...) {}
             if(!submitted) {withdraw();return false;}
             appliedRevision=replica.version();baselineSubmitted=true;
         }
