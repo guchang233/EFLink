@@ -1,6 +1,5 @@
     // Included inside World. Native resource census runs on the game thread.
     // No private account ID, resource pointer or locally allocated nature ID is published.
-    ResourceAuthority resourceAuthority;
     std::uint32_t resourceRoom=0;std::uint64_t resourceEpoch=0,lastResourceScan=0;
     nlohmann::json nativeResourceCensus=nlohmann::json::array();
     std::map<std::string,std::size_t> resourceNativeTypes;
@@ -11,10 +10,10 @@
     void clearResources() {
         for(auto& [key,resource]:nativeResources)release(resource.root);
         nativeResources.clear();nativeResourceCensus=nlohmann::json::array();
-        resourceAuthority.reset();resourceRoom=0;resourceEpoch=lastResourceScan=lastResourceSuccess=0;
+        resourceRoom=0;resourceEpoch=lastResourceScan=lastResourceSuccess=0;
     }
-    std::vector<ResourceAuthority::Observation> sampleResources() {
-        std::vector<ResourceAuthority::Observation> result;
+    std::vector<worldauthority::Observation> sampleResources() {
+        std::vector<worldauthority::Observation> result;
         std::map<std::string,NativeResource> sampled;
         auto cleanup=[&] {for(auto& [key,value]:sampled)release(value.root);};
         try {
@@ -65,13 +64,13 @@
                 const auto hp=readField<int>(object,type.c_str(),"m_hpRatioRuntime",space.c_str());
                 const auto max=enumValue<int>(type.c_str(),"MAX_HP_RATIO",space.c_str());
                 const bool collected=readField<bool>(object,type.c_str(),"m_isCollected",space.c_str());
-                nlohmann::json state={{"key",key},{"kind","mine"},{"template",resourceTemplate},{"position",{position.x,position.y,position.z}},
+                nlohmann::json state={{"template",resourceTemplate},{"position",{position.x,position.y,position.z}},
                     {"hp_ratio",hp},{"max_hp_ratio",max},{"collected",collected}};
-                if(!validResourceObservation(state))throw std::runtime_error("native mineral state outside verified bounds");
+                if(!worldauthority::validState(state)||max<=0)throw std::runtime_error("native mineral state outside verified bounds");
                 if(sampled.contains(key))throw std::runtime_error("multiple native minerals share an identity");
                 const auto root=rootOf(object);if(!root)throw std::runtime_error("native mineral rooting failed");
                 sampled.emplace(key,NativeResource{object,root,component,incarnation,natureId,identity,type,space,key});
-                result.push_back({std::move(state),incarnation});
+                result.push_back({key,"mineral",std::move(state),incarnation});
                 if(result.size()>512)throw std::runtime_error("native mineral baseline exceeds capacity");
             }
             if(!complete)throw std::runtime_error("native resource census truncated; previous baseline retained");
@@ -86,14 +85,16 @@
             if(resourceRoom)clearResources();return;
         }
         if(resourceRoom!=snapshot.roomId||resourceEpoch!=link.generation()) {
-            clearResources();resourceRoom=snapshot.roomId;resourceEpoch=link.generation();resourceAuthority.reset(resourceRoom,resourceEpoch);
+            clearResources();resourceRoom=snapshot.roomId;resourceEpoch=link.generation();
         }
         if(nowMs()-lastResourceScan<100)return;lastResourceScan=nowMs();
         try {
             const auto observations=sampleResources();nativeResourceCensus=nlohmann::json::array();
-            for(const auto& observation:observations)nativeResourceCensus.push_back(observation.state);
-            if(snapshot.role==Role::Host)link.publishResources(net,resourceAuthority.observe(observations));
-            resourceAuthority.expire(nowMs());++resourceScans;lastResourceSuccess=nowMs();resourceError.clear();
+            for(const auto& observation:observations) {
+                auto state=observation.state;state["key"]=observation.key;state["kind"]=observation.kind;nativeResourceCensus.push_back(std::move(state));
+            }
+            if(snapshot.role==Role::Host) {link.observeNativeObjects("mineral",observations);link.publishAuthority(net);}
+            ++resourceScans;lastResourceSuccess=nowMs();resourceError.clear();
         }catch(const std::exception& e) {resourceError=e.what();}
     }
     nlohmann::json resourceProperties() {

@@ -26,7 +26,7 @@ cl %TASK_FLAGS% ..\src\link_preview.cpp /Fe:EFLink.Preview.exe /link user32.lib
 if errorlevel 1 exit /b 1
 cl %TASK_FLAGS% /LD ..\examples\echo\echo.cpp /Fe:eflink.example.echo.dll /link /DYNAMICBASE /NXCOMPAT
 if errorlevel 1 exit /b 1
-for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_coop_contract_test link_resource_authority_test link_cast_lifecycle_test link_damage_scope_test link_hit_provenance_test link_world_delta_test link_presentation_test link_presentation_codec_test link_appearance_test link_input_ownership_test link_map_consent_test link_native_op_policy_test link_official_view_test link_official_monster_test) do (
+for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_coop_contract_test link_world_authority_test link_cast_lifecycle_test link_damage_scope_test link_hit_provenance_test link_world_delta_test link_presentation_test link_presentation_codec_test link_appearance_test link_input_ownership_test link_map_consent_test link_native_op_policy_test link_official_view_test link_official_monster_test) do (
     cl %TASK_FLAGS% ..\tests\%%T.cpp /Fe:%%T.exe /link ws2_32.lib iphlpapi.lib
     if errorlevel 1 exit /b 1
 )
@@ -43,7 +43,7 @@ link_protocol_test.exe
 if not "%errorlevel%"=="0" exit /b 1
 link_coop_contract_test.exe
 if not "%errorlevel%"=="0" exit /b 1
-link_resource_authority_test.exe
+link_world_authority_test.exe
 if not "%errorlevel%"=="0" exit /b 1
 link_cast_lifecycle_test.exe
 if not "%errorlevel%"=="0" exit /b 1

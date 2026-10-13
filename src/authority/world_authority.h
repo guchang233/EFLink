@@ -1,0 +1,375 @@
+#pragma once
+// Pure room rules. Only the native adapter supplies observations and execution
+// witnesses; packets never contain pointers, native IDs or account identifiers.
+#include "nlohmann/json.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <deque>
+#include <map>
+#include <optional>
+#include <random>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <vector>
+
+namespace eflink::worldauthority {
+using Json=nlohmann::json;
+inline bool positive(const Json& v) {
+    return (v.is_number_unsigned()&&v.get<std::uint64_t>()>0)||
+        (v.is_number_integer()&&!v.is_number_unsigned()&&v.get<std::int64_t>()>0);
+}
+inline bool exactFields(const Json& value,std::initializer_list<const char*> fields) {
+    if(!value.is_object()||value.size()!=fields.size())return false;
+    for(auto name:fields)if(!value.contains(name))return false;
+    return true;
+}
+inline bool vector(const Json& v,std::size_t count=3) {
+    if(!v.is_array()||v.size()!=count)return false;
+    double length=0;
+    for(const auto& n:v) {
+        if(!n.is_number())return false;
+        auto f=n.get<double>();if(!std::isfinite(f)||std::abs(f)>1000000)return false;
+        length+=f*f;
+    }
+    return count!=4||(length>=.5&&length<=1.5);
+}
+inline bool knownKind(const std::string& kind) {
+    static const std::set<std::string> kinds={"player","enemy","mineral","mechanism","destructible","skill","projectile","summon","effect","wave","drop_display"};
+    return kinds.contains(kind);
+}
+// One public schema for every object. New fields require explicit validation;
+// adapters must translate native state instead of dumping private objects.
+inline bool validState(const Json& state) {
+    if(!state.is_object()||state.empty()||state.size()>20||state.dump().size()>4096)return false;
+    for(auto it=state.begin();it!=state.end();++it) {
+        const auto& k=it.key();const auto& v=it.value();
+        if(k=="position") {if(!vector(v))return false;}
+        else if(k=="rotation") {if(!vector(v,4))return false;}
+        else if(k=="template"||k=="phase"||k=="animation") {if(!v.is_string()||v.get_ref<const std::string&>().size()>256)return false;}
+        else if(k=="active"||k=="dead"||k=="collected"||k=="downed") {if(!v.is_boolean())return false;}
+        else if(k=="hp"||k=="max_hp"||k=="poise"||k=="max_poise") {
+            if(!v.is_number()||!std::isfinite(v.get<double>())||v.get<double>()<0||v.get<double>()>1e12)return false;
+        } else if(k=="hp_ratio"||k=="max_hp_ratio"||k=="stage"||k=="wave") {
+            if(!v.is_number_integer()||v.get<std::int64_t>()<0||v.get<std::uint64_t>()>100000000)return false;
+        } else return false;
+    }
+    for(const auto& pair:std::vector<std::pair<std::string,std::string>>{{"hp","max_hp"},{"poise","max_poise"},{"hp_ratio","max_hp_ratio"}})
+        if(state.contains(pair.first)&&state.contains(pair.second)&&
+           (state.at(pair.second).get<double>()<=0||state.at(pair.first).get<double>()>state.at(pair.second).get<double>()))return false;
+    return true;
+}
+struct Scope {
+    std::uint32_t room=0;std::string world;std::uint64_t epoch=0;
+    bool operator==(const Scope&) const=default;
+    bool valid() const {
+        return room&&epoch&&world.size()==32&&world.find_first_not_of("0123456789abcdef")==std::string::npos;
+    }
+    Json json() const {return {{"room",room},{"world",world},{"epoch",epoch}};}
+    static Scope parse(const Json& j) {
+        if(!exactFields(j,{"room","world","epoch"})||!positive(j.at("room"))||j.at("room").get<std::uint64_t>()>UINT32_MAX||!positive(j.at("epoch")))throw std::runtime_error("invalid world scope");
+        Scope s{j.at("room").get<std::uint32_t>(),j.at("world").get<std::string>(),j.at("epoch").get<std::uint64_t>()};
+        if(!s.valid())throw std::runtime_error("invalid world incarnation");return s;
+    }
+};
+inline std::string newWorldIncarnation() {
+    std::random_device random;std::string value;value.reserve(32);
+    for(unsigned i=0;i<16;++i){const auto b=static_cast<unsigned>(random())&255;value.push_back("0123456789abcdef"[b>>4]);value.push_back("0123456789abcdef"[b&15]);}
+    return value;
+}
+struct Ref {
+    std::uint64_t id=0,life=0;bool operator==(const Ref&) const=default;
+    Json json() const {return {{"id",id},{"life",life}};}
+    static Ref parse(const Json& j) {
+        if(!exactFields(j,{"id","life"})||!positive(j.at("id"))||!positive(j.at("life")))throw std::runtime_error("invalid object reference");
+        return {j.at("id").get<std::uint64_t>(),j.at("life").get<std::uint64_t>()};
+    }
+};
+struct Observation {std::string key,kind;Json state;std::uint64_t cookie=0;};
+struct Object {
+    Ref ref;std::string key,kind;Json state;std::uint64_t cookie=0,version=0;
+    Json json() const {return {{"ref",ref.json()},{"key",key},{"kind",kind},{"version",version},{"state",state}};}
+    static bool validWire(const Json& j) {
+        try {
+            Ref::parse(j.at("ref"));
+            return exactFields(j,{"ref","key","kind","version","state"})&&positive(j.at("version"))&&j.at("key").is_string()&&
+                !j.at("key").get_ref<const std::string&>().empty()&&j.at("key").get_ref<const std::string&>().size()<=160&&
+                knownKind(j.at("kind").get<std::string>())&&validState(j.at("state"));
+        }catch(...) {return false;}
+    }
+};
+struct Intent {
+    Scope scope;std::uint16_t peer=0;std::uint64_t member=0,request=0,action=0,strike=0,expectedVersion=0;
+    Ref actor,target;std::string operation;
+    Json json() const {return {{"scope",scope.json()},{"peer",peer},{"member",member},{"request",request},{"action",action},
+        {"strike",strike},{"actor",actor.json()},{"target",target.json()},{"expected_version",expectedVersion},{"operation",operation}};}
+    static Intent parse(const Json& j) {
+        if(!exactFields(j,{"scope","peer","member","request","action","strike","actor","target","expected_version","operation"}))throw std::runtime_error("intent contains outcome or unsupported fields");
+        for(auto name:{"peer","member","request","action","strike","expected_version"})if(!positive(j.at(name)))throw std::runtime_error("invalid intent identity");
+        if(j.at("peer").get<std::uint64_t>()>65535)throw std::runtime_error("invalid sender");
+        auto op=j.at("operation").get<std::string>();
+        static const std::set<std::string> operations={"attack","mine","interact","cast","interrupt","revive"};
+        if(!operations.contains(op))throw std::runtime_error("unsupported operation");
+        return {Scope::parse(j.at("scope")),j.at("peer").get<std::uint16_t>(),j.at("member").get<std::uint64_t>(),
+            j.at("request").get<std::uint64_t>(),j.at("action").get<std::uint64_t>(),j.at("strike").get<std::uint64_t>(),
+            j.at("expected_version").get<std::uint64_t>(),Ref::parse(j.at("actor")),Ref::parse(j.at("target")),op};
+    }
+};
+struct Ticket {
+    Scope scope;std::uint64_t serial=0,actorCookie=0,targetCookie=0,beforeVersion=0;Intent intent;
+};
+struct Witness {
+    // Adapter must associate the native callback with THIS execution. A generic
+    // later census, function return or unchanged state cannot produce a witness.
+    std::uint64_t serial=0,actorCookie=0,targetCookie=0,event=0;Json state;
+};
+class NativeAdapter {
+public:
+    virtual ~NativeAdapter()=default;
+    virtual std::string gameVersion() const=0;
+    virtual std::string path() const=0;
+    virtual bool executionVerified() const {return false;}
+    virtual bool isolationVerified() const {return false;}
+    virtual bool recoveryVerified() const {return false;}
+    virtual bool dualClientVerified() const {return false;}
+    virtual bool supports(const std::string&,const std::string&) const {return false;}
+    virtual bool validate(const Intent&,const Object&,const Object&) const {return false;}
+    virtual bool begin(const Ticket&) {return false;}
+    virtual std::optional<Witness> poll(const Ticket&) {return {};}
+    virtual void cancel(const Ticket&) noexcept {}
+};
+class Host {
+    struct Member {std::uint64_t incarnation=0,highRequest=0;Ref actor;bool active=false;};
+    struct Pending {Ticket ticket;NativeAdapter* adapter=nullptr;std::uint64_t deadline=0;};
+    Scope scope_;std::string gameVersion_;std::thread::id owner;
+    std::map<std::string,Object> objects;
+    std::map<std::uint16_t,Member> members;
+    std::map<std::uint64_t,Pending> pending;
+    using Strike=std::tuple<std::uint16_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t>;
+    std::map<Strike,std::uint64_t> strikes;
+    std::set<std::pair<std::string,std::uint64_t>> nativeEvents;
+    std::deque<Json> journal;
+    std::uint64_t nextObject=0,nextLife=0,nextTicket=0,revision=0,accepted=0,rejected=0,confirmed=0,expired=0;
+    bool suspended=true;
+    void thread() {
+        if(owner==std::thread::id{})owner=std::this_thread::get_id();
+        if(owner!=std::this_thread::get_id())throw std::runtime_error("authority mutation outside game thread");
+    }
+    static void advance(std::uint64_t& n) {if(n==UINT64_MAX)throw std::runtime_error("authority identity exhausted");++n;}
+    static std::string index(const std::string& kind,const std::string& key) {return kind+"/"+key;}
+    void record(const std::string& type,const Object& object,Json receipt=nullptr) {
+        advance(revision);Json event={{"scope",scope_.json()},{"revision",revision},{"type",type},{"object",object.json()},{"receipt",std::move(receipt)}};
+        journal.push_back(std::move(event));while(journal.size()>256)journal.pop_front();
+    }
+    void cancelAll() noexcept {for(auto& [id,p]:pending)p.adapter->cancel(p.ticket);pending.clear();}
+    bool usable(const Intent& intent) const {
+        auto m=members.find(intent.peer);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
+        return !suspended&&intent.scope==scope_&&m!=members.end()&&m->second.active&&m->second.incarnation==intent.member&&
+            m->second.actor==intent.actor&&actor&&actor->kind=="player"&&target&&target->version==intent.expectedVersion&&
+            !actor->state.value("dead",false)&&!actor->state.value("downed",false)&&!target->state.value("collected",false)&&
+            target->state.value("active",true);
+    }
+    void invalidatePending() {
+        for(auto it=pending.begin();it!=pending.end();) {
+            const auto& t=it->second.ticket;const auto* a=find(t.intent.actor);const auto* o=find(t.intent.target);
+            auto m=members.find(t.intent.peer);
+            if(t.scope!=scope_||!a||!o||a->cookie!=t.actorCookie||o->cookie!=t.targetCookie||
+               m==members.end()||!m->second.active||m->second.incarnation!=t.intent.member||m->second.actor!=t.intent.actor) {
+                it->second.adapter->cancel(t);it=pending.erase(it);
+            }else ++it;
+        }
+    }
+public:
+    static constexpr std::size_t maxObjects=1024,maxWire=240*1024;
+    Host()=default;Host(const Host&)=delete;Host& operator=(const Host&)=delete;
+    // Adapter lifetime must exceed all pending tickets. Reset before destruction.
+    void reset(Scope scope={},std::string gameVersion={}) {
+        thread();cancelAll();scope_=std::move(scope);gameVersion_=std::move(gameVersion);objects.clear();members.clear();
+        strikes.clear();nativeEvents.clear();journal.clear();revision=0;suspended=true;
+        // Allocators survive room/scene resets, including reuse of a network ID.
+    }
+    const Scope& scope() const {return scope_;}
+    const Object* find(Ref ref) const {for(const auto& [key,o]:objects)if(o.ref==ref)return &o;return nullptr;}
+    const Object* find(const std::string& kind,const std::string& key) const {auto it=objects.find(index(kind,key));return it==objects.end()?nullptr:&it->second;}
+    Json baseline() const {
+        Json list=Json::array();for(const auto& [key,o]:objects)list.push_back(o.json());
+        return {{"scope",scope_.json()},{"revision",revision},{"objects",std::move(list)}};
+    }
+    // Complete enumeration for this kind only, transactionally validated. An
+    // incomplete adapter scan must never call this with a partial collection.
+    void observe(const std::string& kind,const std::vector<Observation>& observations) {
+        thread();if(!scope_.valid()||!knownKind(kind)||observations.size()>maxObjects)throw std::runtime_error("unavailable native census");
+        auto candidate=objects;auto id=nextObject,life=nextLife;std::set<std::string> seen;std::vector<std::pair<std::string,Object>> events;
+        for(const auto& v:observations) {
+            if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!validState(v.state)||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
+            const auto key=index(kind,v.key);auto it=candidate.find(key);
+            const bool regenerated=it!=candidate.end()&&
+                ((it->second.state.value("collected",false)&&!v.state.value("collected",false))||
+                 (it->second.state.value("dead",false)&&!v.state.value("dead",false))||
+                 (!it->second.state.value("active",true)&&v.state.value("active",true)));
+            if(it==candidate.end()||it->second.cookie!=v.cookie||regenerated) {
+                if(it!=candidate.end())events.emplace_back("retire",it->second);
+                advance(id);advance(life);Object object{{id,life},v.key,kind,v.state,v.cookie,1};candidate[key]=object;events.emplace_back("upsert",object);
+            }else if(it->second.state!=v.state) {advance(it->second.version);it->second.state=v.state;events.emplace_back("upsert",it->second);}
+        }
+        for(auto it=candidate.begin();it!=candidate.end();)if(it->second.kind==kind&&!seen.contains(it->first)) {events.emplace_back("retire",it->second);it=candidate.erase(it);}else ++it;
+        if(candidate.size()>maxObjects||events.size()>UINT64_MAX-revision)throw std::runtime_error("authority capacity exhausted");
+        Json list=Json::array();for(const auto& [key,o]:candidate)list.push_back(o.json());
+        if(list.dump().size()>maxWire-512)throw std::runtime_error("native baseline exceeds transport budget");
+        objects=std::move(candidate);nextObject=id;nextLife=life;for(const auto& [type,o]:events)record(type,o);
+        invalidatePending();
+    }
+    bool bind(std::uint16_t peer,std::uint64_t incarnation,Ref actor) {
+        thread();auto* object=find(actor);if(!peer||!incarnation||!object||object->kind!="player")return false;
+        for(const auto& [other,m]:members)if(other!=peer&&m.active&&m.actor==actor)return false;
+        auto it=members.find(peer);
+        if(it!=members.end()) {
+            if(incarnation<it->second.incarnation)return false;
+            if(incarnation==it->second.incarnation)return it->second.actor==actor&&it->second.active;
+        }
+        members[peer]={incarnation,0,actor,true};invalidatePending();return true;
+    }
+    void revoke(std::uint16_t peer) {thread();auto it=members.find(peer);if(it!=members.end())it->second.active=false;invalidatePending();}
+    void suspend() {thread();suspended=true;cancelAll();}
+    // Admission can be opened only for a compiled adapter matching the native
+    // build and proven isolation/recovery. Observation support grants nothing.
+    bool resume(const NativeAdapter& adapter) {
+        thread();suspended=!(scope_.valid()&&!gameVersion_.empty()&&adapter.gameVersion()==gameVersion_&&!adapter.path().empty()&&
+            adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified());return !suspended;
+    }
+    std::optional<std::uint64_t> submit(const Json& body,std::uint16_t sender,NativeAdapter& adapter,std::uint64_t now) {
+        thread();try {
+            Intent intent=Intent::parse(body);
+            if(sender!=intent.peer||!usable(intent)||pending.size()>=128||strikes.size()>=8192||!adapter.executionVerified()||!adapter.isolationVerified()||
+                !adapter.recoveryVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()) {++rejected;return {};}
+            auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
+            Strike strike{sender,intent.member,intent.action,intent.target.id,intent.target.life,intent.strike};
+            if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
+            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent};
+            m.highRequest=intent.request;strikes[strike]=intent.request;
+            if(now>UINT64_MAX-1500) {++rejected;return {};}
+            pending.emplace(ticket.serial,Pending{ticket,&adapter,now+1500});
+            // Consume request identity even when native dispatch fails: an
+            // ambiguous failure must not be retried as a second native action.
+            bool began=false;try {began=adapter.begin(ticket);}catch(...) {}
+            if(!began) {adapter.cancel(ticket);pending.erase(ticket.serial);++rejected;return {};}
+            ++accepted;return ticket.serial;
+        }catch(...) {++rejected;return {};}
+    }
+    void poll(std::uint64_t now) {
+        thread();invalidatePending();
+        for(auto it=pending.begin();it!=pending.end();) {
+            auto& p=it->second;const auto& t=p.ticket;
+            if(!p.adapter->executionVerified()||!p.adapter->isolationVerified()||!p.adapter->recoveryVerified()||p.adapter->gameVersion()!=gameVersion_) {
+                p.adapter->cancel(t);it=pending.erase(it);++rejected;continue;
+            }
+            if(now>=p.deadline) {p.adapter->cancel(t);it=pending.erase(it);++expired;continue;}
+            std::optional<Witness> witness;try {witness=p.adapter->poll(t);}catch(...) {}
+            if(!witness) {++it;continue;}
+            auto* existing=find(t.intent.target);
+            if(witness->serial!=t.serial||witness->actorCookie!=t.actorCookie||witness->targetCookie!=t.targetCookie||!witness->event||
+                !validState(witness->state)||!existing||nativeEvents.contains({p.adapter->path(),witness->event})||
+                existing->version!=t.beforeVersion||witness->state==existing->state||nativeEvents.size()>=8192||revision==UINT64_MAX||existing->version==UINT64_MAX) {
+                ++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;
+            }
+            auto& object=objects.at(index(existing->kind,existing->key));
+            auto candidate=object;candidate.state=witness->state;++candidate.version;
+            auto full=baseline();for(auto& o:full["objects"])if(o.at("ref")==candidate.ref.json())o=candidate.json();
+            if(full.dump().size()>maxWire) {++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;}
+            object=std::move(candidate);nativeEvents.emplace(p.adapter->path(),witness->event);
+            record("upsert",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
+            ++confirmed;it=pending.erase(it);
+        }
+    }
+    std::optional<Json> changesSince(std::uint64_t since) const {
+        if(since>revision||(!journal.empty()&&since<journal.front().at("revision").get<std::uint64_t>()-1))return {};
+        Json changes=Json::array();for(const auto& e:journal)if(e.at("revision").get<std::uint64_t>()>since)changes.push_back(e);
+        if(changes.dump().size()>maxWire-512)return {};
+        return Json{{"scope",scope_.json()},{"base",since},{"revision",revision},{"events",std::move(changes)}};
+    }
+    Json status() const {return {{"objects",objects.size()},{"revision",revision},{"pending",pending.size()},{"suspended",suspended},
+        {"intents_accepted",accepted},{"intents_rejected",rejected},{"results_confirmed",confirmed},{"expired",expired},
+        {"full_sync_verified",false},{"native_execution_supported",false},{"account_risk",true}};}
+};
+class Replica {
+    Scope scope_;std::map<std::uint64_t,Json> objects;std::uint64_t revision=0;bool missing=true;
+public:
+    void reset(Scope scope={}) {scope_=std::move(scope);objects.clear();revision=0;missing=true;}
+    bool baseline(const Json& packet,const Scope& expected,bool fromHost) {
+        try {
+            if(!fromHost||!exactFields(packet,{"scope","revision","objects"})||Scope::parse(packet.at("scope"))!=expected||
+                !packet.at("revision").is_number_unsigned()||!packet.at("objects").is_array()||packet.at("objects").size()>Host::maxObjects||packet.dump().size()>Host::maxWire)return false;
+            auto next=packet.at("revision").get<std::uint64_t>();if(scope_==expected&&next<revision)return false;
+            std::map<std::uint64_t,Json> candidate;std::set<std::pair<std::string,std::string>> keys;
+            for(const auto& o:packet.at("objects"))if(!Object::validWire(o)||!candidate.emplace(o.at("ref").at("id").get<std::uint64_t>(),o).second||
+                !keys.emplace(o.at("kind").get<std::string>(),o.at("key").get<std::string>()).second)return false;
+            if(scope_==expected) {
+                if(next==revision&&candidate!=objects)return false;
+                for(const auto& [id,o]:candidate)if(auto it=objects.find(id);it!=objects.end()&&
+                    (it->second.at("ref")!=o.at("ref")||it->second.at("kind")!=o.at("kind")||it->second.at("key")!=o.at("key")||
+                     o.at("version").get<std::uint64_t>()<it->second.at("version").get<std::uint64_t>()))return false;
+            }
+            scope_=expected;objects=std::move(candidate);revision=next;missing=false;return true;
+        }catch(...) {return false;}
+    }
+    bool delta(const Json& packet,bool fromHost) {
+        try {
+            if(!fromHost||missing||!exactFields(packet,{"scope","base","revision","events"})||Scope::parse(packet.at("scope"))!=scope_||
+                !packet.at("base").is_number_unsigned()||!packet.at("revision").is_number_unsigned()||!packet.at("events").is_array()||packet.at("events").size()>256||packet.dump().size()>Host::maxWire)return false;
+            const auto end=packet.at("revision").get<std::uint64_t>();if(end<=revision)return false;
+            if(packet.at("base")!=revision) {missing=true;return false;}
+            auto candidate=objects;auto next=revision;
+            for(const auto& event:packet.at("events")) {
+                if(next==UINT64_MAX||!exactFields(event,{"scope","revision","type","object","receipt"})||Scope::parse(event.at("scope"))!=scope_||
+                    event.at("revision")!=++next||!Object::validWire(event.at("object"))) {missing=true;return false;}
+                const auto& o=event.at("object");const auto ref=Ref::parse(o.at("ref"));auto prior=candidate.find(ref.id);
+                if(event.at("type")=="retire") {
+                    if(prior==candidate.end()||prior->second.at("ref")!=ref.json()) {missing=true;return false;}candidate.erase(prior);
+                }else if(event.at("type")=="upsert") {
+                    if(prior!=candidate.end()&&(prior->second.at("ref")!=ref.json()||prior->second.at("kind")!=o.at("kind")||prior->second.at("key")!=o.at("key")||
+                        prior->second.at("version").get<std::uint64_t>()==UINT64_MAX||o.at("version")!=prior->second.at("version").get<std::uint64_t>()+1)) {missing=true;return false;}
+                    if(prior==candidate.end()&&o.at("version")!=1) {missing=true;return false;}candidate[ref.id]=o;
+                }else {missing=true;return false;}
+            }
+            if(next!=end||candidate.size()>Host::maxObjects) {missing=true;return false;}
+            std::set<std::pair<std::string,std::string>> keys;
+            Json all=Json::array();for(const auto& [id,o]:candidate) {if(!keys.emplace(o.at("kind").get<std::string>(),o.at("key").get<std::string>()).second){missing=true;return false;}all.push_back(o);}
+            if(all.dump().size()>Host::maxWire-512) {missing=true;return false;}
+            objects=std::move(candidate);revision=end;return true;
+        }catch(...) {missing=true;return false;}
+    }
+    bool needsBaseline() const {return missing;}
+    std::uint64_t version() const {return revision;}
+    Json snapshot() const {Json list=Json::array();if(!missing)for(const auto& [id,o]:objects)list.push_back(o);return list;}
+};
+// Common personal-world handoff. Opening gameplay requires proven isolation,
+// apply and recovery; a baseline merely stored in memory never opens the gate.
+class WorldHandoff {
+public:
+    enum class Phase {Personal,Loading,Shared,Restoring,Failed};
+private:
+    Phase phase_=Phase::Personal;Scope scope_;bool retained=false;
+public:
+    Phase phase() const {return phase_;}
+    bool begin(const Scope& scope,bool personalSnapshotRetained) {
+        if(phase_!=Phase::Personal||!scope.valid()||!personalSnapshotRetained)return false;
+        scope_=scope;retained=true;phase_=Phase::Loading;return true;
+    }
+    bool admit(const Scope& scope,bool nativeInitialized,bool baselineApplied,const NativeAdapter& adapter,const std::string& gameVersion) {
+        if(phase_!=Phase::Loading||scope!=scope_||!nativeInitialized||!baselineApplied||gameVersion.empty()||adapter.gameVersion()!=gameVersion||
+            !adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified())return false;
+        phase_=Phase::Shared;return true;
+    }
+    void withdraw() {if(phase_!=Phase::Personal)phase_=Phase::Restoring;}
+    void restored(bool nativeRestoreObserved) {
+        if(phase_!=Phase::Restoring)return;
+        if(nativeRestoreObserved) {phase_=Phase::Personal;scope_={};retained=false;}else phase_=Phase::Failed;
+    }
+    bool roomOperationAllowed(const Scope& scope) const {return phase_==Phase::Shared&&scope==scope_;}
+    bool personalOperationAllowed() const {return phase_==Phase::Personal;}
+    bool recoveryRetained() const {return retained;}
+};
+}

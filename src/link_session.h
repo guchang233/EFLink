@@ -12,7 +12,7 @@
 #include "link_version.h"
 #include "link_presentation.h"
 #include "link_presentation_codec.h"
-#include "link_resource_authority.h"
+#include "authority/world_authority.h"
 #include <optional>
 #include "nlohmann/json.hpp"
 
@@ -122,7 +122,13 @@ class Session {
     std::atomic<std::uint64_t> presentationCoalesced{0};
     std::uint64_t presentationSequence=0,lastPresentation=0,presentationReceived=0,presentationSkipped=0,presentationRawBytes=0,presentationWireBytes=0,presentationPacked=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
-    Json resourceBaseline=Json::array();std::uint64_t resourceRevision=0,lastResourcePublish=0,resourceSeen=0;
+    worldauthority::Host nativeAuthority;worldauthority::Replica nativeReplica;
+    std::string worldIncarnation;
+    std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0,authoritySeen=0;
+    bool authoritySent=false;
+    void resetSharedObjects() {
+        nativeAuthority.reset();nativeReplica.reset();sentAuthorityRevision=lastAuthorityPublish=lastAuthorityBaseline=authoritySeen=0;authoritySent=false;
+    }
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
         body["schema"]=coopWorldSchema;body["room"]=room;
         const auto plain=body.dump();const bool presentation=body.value("kind",Json{})=="presentation";
@@ -194,7 +200,7 @@ public:
             room=s.roomId;role=s.role;epoch=revision=seenAt=lastPublish=commandSequence=0;world=Json::object();
             sentWorld=nullptr;lastBaseline=sentRevision=0;baselineMissing=publishBlocked=sceneResetPending=false;
             presentations.clear();presentationSequence=lastPresentation=0;
-            resourceBaseline=Json::array();resourceRevision=lastResourcePublish=resourceSeen=0;
+            resetSharedObjects();worldIncarnation=role==Role::Host?worldauthority::newWorldIncarnation():std::string{};
             playerCasts.clear();castEvents.clear();hitClaimLedger.clear();
             hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();hitSequences.clear();hitBudgets.clear();hitSequence=0;
             sequences.clear();attackBudgets.clear();locations.clear();lastLocation=0;commands.clear();teleport=Json::object();actorTeleports.clear();error.clear();
@@ -218,7 +224,7 @@ public:
         }
         if((role==Role::Host||role==Role::Client)&&(!lastHello||nowMs()-lastHello>=1000)) {
             if(send(net,{{"kind","coop_hello"},{"world_schema",coopWorldSchema},{"contract_revision",coopContractRevision},
-                {"contract",coopContractName},{"build",EFLINK_BUILD_ID},{"game_version",adapterVersion}},role==Role::Host?proto::kEveryone:proto::kHostId))lastHello=nowMs();
+                {"contract",coopContractName},{"build",EFLINK_BUILD_ID},{"game_version",adapterVersion},{"world_incarnation",worldIncarnation}},role==Role::Host?proto::kEveryone:proto::kHostId))lastHello=nowMs();
         }
         for(auto it=entries.begin();it!=entries.end();) {
             if(!find(s,it->first)||(it->second.active&&!realm.bound(it->first)))it=entries.erase(it);else ++it;
@@ -243,15 +249,26 @@ public:
                 if(kind=="coop_hello") {
                     if(packet.from==s.localId||(role==Role::Client&&packet.from!=proto::kHostId)||
                         (role!=Role::Host&&role!=Role::Client)) {++rejected;continue;}
-                    const bool compatible=validCoopHello(b)&&b.at("build")==EFLINK_BUILD_ID&&b.at("game_version")==adapterVersion;
+                    bool compatible=validCoopHello(b)&&b.at("build")==EFLINK_BUILD_ID&&b.at("game_version")==adapterVersion;
+                    if(role==Role::Client&&compatible) {
+                        auto nonce=b.value("world_incarnation",std::string{});
+                        if(nonce.size()!=32||nonce.find_first_not_of("0123456789abcdef")!=std::string::npos||(!worldIncarnation.empty()&&worldIncarnation!=nonce))compatible=false;
+                        else worldIncarnation=std::move(nonce);
+                    }
                     const std::string build=b.contains("build")&&b.at("build").is_string()?b.at("build").get<std::string>().substr(0,64):std::string{};
                     compatibility[packet.from]={compatible,nowMs(),build};
                     if(!compatible) {++rejected;entries.erase(packet.from);if(role==Role::Client)admitted=false;}
-                } else if(kind=="resource_baseline") {
-                    if(b.size()!=8||role!=Role::Client||packet.from!=proto::kHostId||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(proto::kHostId)||
-                       b.at("epoch")!=epoch||b.at("map")!=world.at("map")||b.at("level")!=world.at("level")||
-                       !positiveRoomId(b.at("revision"))||b.at("revision").get<std::uint64_t>()<=resourceRevision||!validResourceBaseline(b.at("objects"))) {++rejected;continue;}
-                    resourceBaseline=b.at("objects");resourceRevision=b.at("revision").get<std::uint64_t>();resourceSeen=nowMs();
+                } else if(kind=="authority_baseline"||kind=="authority_delta") {
+                    if(b.size()!=6||role!=Role::Client||packet.from!=proto::kHostId||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(proto::kHostId)||
+                       b.at("map")!=world.at("map")||b.at("level")!=world.at("level")) {++rejected;continue;}
+                    const worldauthority::Scope expected{room,worldIncarnation,epoch};
+                    if(!expected.valid()||(kind=="authority_baseline"?!nativeReplica.baseline(b.at("baseline"),expected,true):
+                        worldauthority::Scope::parse(b.at("delta").at("scope"))!=expected||!nativeReplica.delta(b.at("delta"),true))) {++rejected;continue;}
+                    authoritySeen=nowMs();
+                } else if(kind=="world_intent"||kind=="resource_baseline") {
+                    // No native execution adapter has passed isolation/recovery
+                    // acceptance. Legacy per-object authority is not negotiated.
+                    ++rejected;
                 } else if(kind=="presentation") {
                     const auto owner=b.at("peer").get<std::uint16_t>();const auto* p=find(s,owner);
                     if(!ready()||!protocolCompatible(role==Role::Host?packet.from:proto::kHostId)||
@@ -283,7 +300,7 @@ public:
                         candidateActor=player.at("entity").get<std::uint64_t>();candidateBound=player.value("native_bound",false)&&player.value("in_scene",false);
                     }
                     if(e!=epoch||candidateActor!=playerEntity(s.localId)||(admitted&&!candidateBound)) {teleport=Json::object();commands.clear();replica={};admitted=false;playerHits.clear();enemyCasts.clear();
-                        if(e!=epoch) {playerCasts.clear();castEvents.clear();hitClaimLedger.clear();resourceBaseline=Json::array();resourceRevision=resourceSeen=0;}
+                        if(e!=epoch) {playerCasts.clear();castEvents.clear();hitClaimLedger.clear();resetSharedObjects();}
                         entryToken=nowMs()^(std::uint64_t(room)<<32)^e; if(!entryToken)entryToken=1;
                         lastEntryReport=lastEntryAck=0;entryBlockers=Json::array();}
                     epoch=e;revision=r;world=std::move(candidate);seenAt=nowMs();baselineMissing=false;++received;
@@ -423,7 +440,7 @@ public:
             sentWorld=nullptr;lastBaseline=sentRevision=0;
             playerCasts.clear();castEvents.clear();hitClaimLedger.clear();
             sceneResetPending=false;
-            resourceBaseline=Json::array();resourceRevision=lastResourcePublish=resourceSeen=0;
+            resetSharedObjects();nativeAuthority.reset({room,worldIncarnation,epoch},adapterVersion);
         }
         entityLedger.annotate(value["entities"]);
         realm.reconcile(net.snapshot(),epoch,value.at("map").get<std::string>(),value.at("level").get<std::string>());
@@ -495,14 +512,31 @@ public:
         if(send(net,std::move(value),role==Role::Host?proto::kEveryone:proto::kHostId)){lastPresentation=now;return true;}
         return false;
     }
-    bool publishResources(Net& net,const Json& value) {
-        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!validResourceBaseline(value)||resourceRevision==UINT64_MAX)return false;
-        if(nowMs()-lastResourcePublish<250||net.transmitPressure()>64u*1024)return false;
-        const auto next=resourceRevision+1;
-        if(!send(net,{{"kind","resource_baseline"},{"epoch",epoch},{"revision",next},{"map",world.at("map")},{"level",world.at("level")},{"objects",value}}))return false;
-        resourceBaseline=value;resourceRevision=next;lastResourcePublish=resourceSeen=nowMs();return true;
+    bool observeNativeObjects(const std::string& kind,const std::vector<worldauthority::Observation>& values) {
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
+        nativeAuthority.observe(kind,values);authoritySeen=nowMs();return true;
     }
-    Json resources() const {return ready()&&localSceneOperational()&&followHost&&combat&&resourceSeen&&nowMs()-resourceSeen<=1500?resourceBaseline:Json::array();}
+    bool publishAuthority(Net& net,bool force=false) {
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
+        if(!force&&(nowMs()-lastAuthorityPublish<250||net.transmitPressure()>64u*1024))return false;
+        Json message={{"map",world.at("map")},{"level",world.at("level")}};
+        const auto baseline=nativeAuthority.baseline();const auto nativeRevision=baseline.at("revision").get<std::uint64_t>();
+        bool full=force||!authoritySent||nowMs()-lastAuthorityBaseline>=1000;
+        auto delta=full?std::optional<Json>{}:nativeAuthority.changesSince(sentAuthorityRevision);
+        if(!delta)full=true;
+        if(full) {message["kind"]="authority_baseline";message["baseline"]=baseline;}
+        else {message["kind"]="authority_delta";message["delta"]=std::move(*delta);}
+        // An unchanged baseline is a heartbeat; an empty delta cannot revive a
+        // stale replica. Reliable critical events never use presentation coalescing.
+        if(!full&&nativeRevision==sentAuthorityRevision) {message.erase("delta");message["kind"]="authority_baseline";message["baseline"]=baseline;full=true;}
+        if(!send(net,std::move(message))) {nativeAuthority.suspend();return false;}
+        authoritySent=true;sentAuthorityRevision=nativeRevision;lastAuthorityPublish=nowMs();if(full)lastAuthorityBaseline=nowMs();return true;
+    }
+    Json sharedObjects() const {
+        if(!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return Json::array();
+        return role==Role::Host?nativeAuthority.baseline().at("objects"):nativeReplica.snapshot();
+    }
+    Json authorityBaseline() const {return nativeAuthority.baseline();}
     Json presentation(std::uint16_t peer) const {
         auto it=presentations.find(peer);
         if(it==presentations.end()||nowMs()-it->second.seen>500||it->second.data.value("epoch",std::uint64_t{})!=epoch)return Json{};
@@ -644,7 +678,7 @@ public:
             admitted=false;replica={};lastEntryAck=lastEntryReport=0;
             for(auto& [id,entry]:entries)entry.active=false;
             commands.clear();hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();castEvents.clear();
-            resourceBaseline=Json::array();resourceSeen=0;
+            nativeAuthority.suspend();nativeReplica.reset();authoritySeen=0;authoritySent=false;
         }
     }
     bool localSceneOperational() const {return localSceneReady;}
@@ -734,8 +768,9 @@ public:
             {"ages",[&]{Json ages=Json::array();for(const auto& [peer,p]:presentations)ages.push_back({{"peer",peer},{"age_ms",nowMs()-p.seen}});return ages;}()},{"native_skill_replay",false}}},
         {"player_casts",{{"accepted",castEventsAccepted},{"active",playerCasts.active(nowMs())},{"replay_enabled",false}}},
         {"hit_claims",{{"accepted",hitsAccepted},{"legacy_numeric_rejected",legacyHitsRejected},{"native_verification_required",true}}},
-        {"resources",{{"observed",resources().size()},{"revision",resourceRevision},{"age_ms",resourceSeen?nowMs()-resourceSeen:0},
-            {"operation_adapter_verified",false},{"replica_adapter_verified",false}}},
+        {"world_authority",{{"host",nativeAuthority.status()},{"observed",sharedObjects().size()},{"replica_revision",nativeReplica.version()},
+            {"baseline_required",nativeReplica.needsBaseline()},{"age_ms",authoritySeen?nowMs()-authoritySeen:0},
+            {"operation_adapter_verified",false},{"replica_adapter_verified",false},{"full_sync_verified",false}}},
         {"age_ms",seenAt?nowMs()-seenAt:0},{"snapshots_received",received},{"skill_intents_accepted",attacks},{"hits_accepted",hitsAccepted},{"rejected",rejected},{"entry",entryStatus()},{"error",error}};}
 };
 }

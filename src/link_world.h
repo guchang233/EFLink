@@ -1658,7 +1658,7 @@ public:
     void requestEmergencyHome() {emergencyHomePending=true;officialTeleportStatus={{"purpose","emergency_home"},{"state","queued"},{"at",nowMs()}};}
 private:
     void replication(Net& net,Session& link) {
-        session=&link;link.setAuthority({});localPeer=net.snapshot().localId;
+        session=&link;link.update(net);link.setAuthority({});localPeer=net.snapshot().localId;
         // Transport and read-only discovery remain available. No replica world,
         // native enemy creation, account-world withdrawal, shared teleport,
         // actor skill execution or local result projection is admitted here.
@@ -1973,7 +1973,7 @@ public:
         mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
         nlohmann::json resources=nlohmann::json::array();
         nlohmann::json properties;
-        try {for(const auto& value:sampleResources())resources.push_back(value.state);properties=resourceProperties();}
+        try {for(const auto& value:sampleResources()) {auto state=value.state;state["key"]=value.key;state["kind"]=value.kind;resources.push_back(std::move(state));}properties=resourceProperties();}
         catch(...) {clearResources();throw;}
         auto types=resourceNativeTypes;auto unknown=resourceUnknown;clearResources();
         return {{"map",mapId},{"level",levelId},{"resources",resources},{"properties",properties},{"native_types",types},{"unadapted",unknown},{"gameplay_modified",false}};

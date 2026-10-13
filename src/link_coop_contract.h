@@ -9,7 +9,7 @@
 
 namespace eflink {
 inline constexpr unsigned coopWorldSchema=3;
-inline constexpr unsigned coopContractRevision=9;
+inline constexpr unsigned coopContractRevision=10;
 inline constexpr char coopContractName[]="official-room-lifecycle-v1";
 inline bool positiveRoomId(const nlohmann::json& value) {
     return value.is_number_integer()&&(value.is_number_unsigned()?value.get<std::uint64_t>()!=0:value.get<std::int64_t>()>0);
