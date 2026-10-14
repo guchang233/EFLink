@@ -1388,6 +1388,40 @@ private:
         return out;
     }
 public:
+    nlohmann::json inspectNativeInteractiveMessage(const BE_HostApiV1* host,void* message) {
+        runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
+        if(!message||classOf(message)!="Proto.SC_SCENE_UPDATE_INTERACTIVE_PROPERTY")throw std::runtime_error("unverified native interactive message class");
+        authority::MetadataIndex metadata;
+        auto* boxedId=metadata.fieldObject(message,"id_","System.UInt64");std::uint64_t id=0;
+        if(!boxedId)throw std::runtime_error("native interactive message identity unavailable");
+        std::memcpy(&id,runtime->object_unbox(runtime->context,boxedId),sizeof id);
+        auto* boxedFlag=metadata.fieldObject(message,"clientOperate_","System.Boolean");bool client=false;
+        if(boxedFlag)std::memcpy(&client,runtime->object_unbox(runtime->context,boxedFlag),sizeof client);
+        auto* properties=metadata.fieldObject(message,"properties_","Google.Protobuf.Collections.MapField<System.Int32,Proto.DYNAMIC_PARAMETER>");
+        auto* boxedCount=properties?collection(properties,"get_Count"):nullptr;int count=0;
+        if(boxedCount)std::memcpy(&count,runtime->object_unbox(runtime->context,boxedCount),sizeof count);
+        if(count<0||count>4096)throw std::runtime_error("native interactive message outside diagnostic bounds");
+        nlohmann::json result={{"property_count",count},{"client_operate",client},{"resource_known",false},{"gameplay_modified",false}};
+        auto* manager=staticObject("natureResourceManager");
+        auto* dictionary=manager?readField<void*>(manager,"NatureResourceManager","m_resources","Beyond.Gameplay"):nullptr;
+        if(!dictionary||!id)return result;
+        auto* found=collection(dictionary,"ContainsKey",{&id});bool present=false;
+        if(found)std::memcpy(&present,runtime->object_unbox(runtime->context,found),sizeof present);
+        void* resource=present?collection(dictionary,"get_Item",{&id}):nullptr;
+        if(!resource||classOf(resource)!="Beyond.Gameplay.Core.InteractiveDoodadCommonComponent")return result;
+        const auto kind=api.value<int>(gm("InteractiveDoodadCommonComponent","get_natureResourceType","","Beyond.Gameplay.ENatureType"),resource);
+        if(kind!=enumValue<int>("ENatureType","Mine","Beyond.Gameplay"))return result;
+        auto* info=staticObject("worldInfo");if(!info)return result;
+        mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
+        auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),resource);
+        const auto key=usable(entity)?entityKey(entity):std::string{};if(key.empty())return result;
+        result["resource_known"]=true;result["key"]=key+"/mine";
+        result["map"]=mapId;result["level"]=levelId;
+        result["property_hp_ratio"]=readField<int>(resource,"InteractiveDoodadCommonComponent","m_hpRatio");
+        result["runtime_hp_ratio"]=readField<int>(resource,"InteractiveDoodadCommonComponent","m_hpRatioRuntime");
+        result["collected"]=readField<bool>(resource,"InteractiveDoodadCommonComponent","m_isCollected");
+        return result; // no message dump, unknown fields, native IDs or credentials
+    }
     nlohmann::json inspectNativeResourceOperation(const BE_HostApiV1* host,void* operation,void* argument) {
         runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
         nlohmann::json result={{"operation_present",operation!=nullptr},{"mineral",false},{"argument_matches_operator",false}};

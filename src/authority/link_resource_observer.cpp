@@ -20,6 +20,9 @@ json captureResult;
 eflink::worldauthority::NativeTraceWindow traceWindow;bool attackHooked=false,attackAttempted=false;std::uint64_t traceSequence=0;
 json attackTrace=json::array();std::string observedVersion;std::atomic<std::uint64_t> traceFaults{0};
 json phaseCounts=json::object();bool operationHooked=false,operationAttempted=false;
+std::atomic<DWORD> gameThread{0};std::atomic<std::uint64_t> wrongThread{0};
+bool propertyHooked=false,propertyAttempted=false;BE_ResolvedMethodV1 propertyMethod{};
+using PropertyMessage=void(__fastcall*)(void*,void*,void*);PropertyMessage nextPropertyMessage=nullptr;
 BE_ResolvedMethodV1 operationInitMethod{},operationFinishMethod{};
 using OperationInit=void*(__fastcall*)(void*,void*,int,std::uint64_t,void*);OperationInit nextOperationInit=nullptr;
 using OperationFinish=void(__fastcall*)(void*,void*,bool,void*);OperationFinish nextOperationFinish=nullptr;
@@ -39,6 +42,7 @@ bool camera(void* object) noexcept {
     __except(EXCEPTION_EXECUTE_HANDLER) {return false;}return false;
 }
 json observeAttack(void* self,void* board) noexcept {
+    if(!gameThread.load()||gameThread.load()!=GetCurrentThreadId()) {++wrongThread;return nullptr;}
     try {eflink::World inspector;return inspector.inspectNativeMineralAttack(runtime(),self,board);}
     catch(...) {++traceFaults;return nullptr;}
 }
@@ -82,6 +86,7 @@ void __fastcall serverHp(void* self,void* name,int oldValue,int newValue,void* i
     if(active)appendTrace("server_hp",std::move(before),observeAttack(self,nullptr));
 }
 json observeOperation(void* operation,void* argument) noexcept {
+    if(!gameThread.load()||gameThread.load()!=GetCurrentThreadId()) {++wrongThread;return nullptr;}
     try {eflink::World inspector;return inspector.inspectNativeResourceOperation(runtime(),operation,argument);}
     catch(...) {++traceFaults;return nullptr;}
 }
@@ -107,13 +112,24 @@ void __fastcall operationFinish(void* self,void* operation,bool success,void* in
         try {appendTrace("operation_finish",std::move(observed),{{"callback_flag",success},{"result_verified",false}});}catch(...) {++traceFaults;}
     }
 }
+json observeMessage(void* message) noexcept {
+    if(!gameThread.load()||gameThread.load()!=GetCurrentThreadId()) {++wrongThread;return nullptr;}
+    try {eflink::World inspector;return inspector.inspectNativeInteractiveMessage(runtime(),message);}
+    catch(...) {++traceFaults;return nullptr;}
+}
+void __fastcall propertyMessage(void* self,void* message,void* info) {
+    const bool active=observing(self,info,propertyMethod);json before;if(active)before=observeMessage(message);
+    if(nextPropertyMessage)nextPropertyMessage(self,message,info);
+    if(active)appendTrace("network_property",std::move(before),observeMessage(message));
+}
 void verifyVersion() {
     observedVersion=eflink::worldauthority::nativeGameVersion(runtime());
     if(!eflink::worldauthority::readOnlyBuildSupported(observedVersion))throw std::runtime_error("read-only mineral probe disabled for unverified game version");
 }
 void __fastcall tick(void* self,float delta,void* info) {
     if(nextTick)nextTick(self,delta,info);
-    if(!self||(info&&info!=tickMethod.method_info)||!camera(self)||!requested.exchange(false))return;
+    if(!self||(info&&info!=tickMethod.method_info)||!camera(self))return;
+    gameThread=GetCurrentThreadId();if(!requested.exchange(false))return;
     std::lock_guard lock(mutex);if(!initialized)return;
     try {eflink::World inspector;captureResult=inspector.inspectNativeResources(runtime());}
     catch(const std::exception& e){captureResult={{"error",e.what()},{"gameplay_modified",false}};}
@@ -189,6 +205,22 @@ void installOperations() {
     hook("_OnOperationFinish","Beyond.Gameplay.Operation|System.Boolean","System.Void",2,operationFinishMethod,reinterpret_cast<void*>(operationFinish),reinterpret_cast<void**>(&nextOperationFinish));
     operationHooked=true;
 }
+void installPropertyMessages() {
+    if(propertyHooked)return;
+    if(propertyAttempted)throw std::runtime_error("incomplete property observation installation; disable probe before retrying");
+    install();RuntimeThreadScope attached(true);auto* api=runtime();if(!attached.ready())throw std::runtime_error("property observation runtime unavailable");
+    BE_ResolvedClassV1 message{};
+    auto valueType=reinterpret_cast<bool(*)(const void*)>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"),"il2cpp_class_is_valuetype"));
+    if(!valueType||api->resolve_class(api->context,"Beyond.Network.Proto.dll","Proto","SC_SCENE_UPDATE_INTERACTIVE_PROPERTY",&message)!=BE_Result_Ok||
+       !message.class_info||valueType(message.class_info))throw std::runtime_error("unverified native property message ABI");
+    BE_MethodDescriptorV1 descriptor{"Gameplay.Beyond.dll","Beyond.Gameplay","GameplayNetwork","_Handle_SyncInteractiveProperty","Proto.SC_SCENE_UPDATE_INTERACTIVE_PROPERTY","System.Void",1};
+    if(api->resolve_method(api->context,&descriptor,&propertyMethod)!=BE_Result_Ok||!propertyMethod.method_pointer)
+        throw std::runtime_error("native property observation signature unavailable");
+    propertyAttempted=true;std::uint64_t handle=0;
+    if(host.hooks->create(host.hooks->context,id,propertyMethod.method_pointer,reinterpret_cast<void*>(propertyMessage),reinterpret_cast<void**>(&nextPropertyMessage),&handle)!=BE_Result_Ok)
+        throw std::runtime_error("native property observation hook unavailable");
+    propertyHooked=true;
+}
 BE_Result BE_CALL init(const BE_ThirdPartyHostV1* input,const char*) {
     std::lock_guard lock(mutex);
     if(!input||input->version!=1||!input->module_id||std::string(input->module_id)!=id||!input->reply||
@@ -205,13 +237,14 @@ BE_Result BE_CALL message(const char* request,const char* body) {
         else if(action=="trace") {
             const auto duration=command.value("duration_ms",600000u);if(duration<1000||duration>600000)throw std::runtime_error("trace duration outside limits");
             const auto collect=command.value("collect_ms",3000u);if(collect<1000||collect>30000)throw std::runtime_error("single capture duration outside limits");
-            installAttack();if(command.value("observe_operations",false))installOperations();
-            attackTrace=json::array();phaseCounts=json::object();traceSequence=0;traceFaults=0;
+            installAttack();if(command.value("observe_operations",false))installOperations();if(command.value("observe_network",false))installPropertyMessages();
+            attackTrace=json::array();phaseCounts=json::object();traceSequence=0;traceFaults=0;wrongThread=0;
             if(command.value("one_shot",false))traceWindow.singleAttack(collect);else traceWindow.timed(eflink::nowMs(),duration);
             output={{"observing",true},{"awaiting_attack",traceWindow.awaitingAttack()},{"duration_ms",duration},{"gameplay_modified",false},{"execution_adapter_verified",false}};}
         else if(action=="stop_trace") {traceWindow.stop();output={{"observing",false},{"gameplay_modified",false}};}
         else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"phase_counts",phaseCounts},{"operations_hooked",operationHooked},{"observing",traceWindow.active(eflink::nowMs())},{"awaiting_attack",traceWindow.awaitingAttack()},
-            {"game_version",observedVersion},{"trace_faults",traceFaults.load()},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
+            {"game_version",observedVersion},{"game_thread_ready",gameThread.load()!=0},{"wrong_thread_callbacks",wrongThread.load()},{"property_hooked",propertyHooked},
+            {"trace_faults",traceFaults.load()},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
         else throw std::runtime_error("unknown resource observer action");
     }catch(const std::exception& e){code=BE_Result_InvalidArgument;output={{"error",e.what()}};}
     const auto text=output.dump();return host.reply(host.context,request,code,text.c_str());
@@ -220,7 +253,7 @@ void BE_CALL stop() {
     requested=false;traceWindow.stop();
     // Disable outside the inspector lock: a running tick may need that lock.
     if(host.hooks&&host.hooks->disable_module)host.hooks->disable_module(host.hooks->context,id);
-    std::lock_guard lock(mutex);initialized=false;hooked=attackHooked=attackAttempted=operationHooked=operationAttempted=false;captureResult=nullptr;attackTrace=json::array();phaseCounts=json::object();
+    std::lock_guard lock(mutex);initialized=false;hooked=attackHooked=attackAttempted=operationHooked=operationAttempted=propertyHooked=propertyAttempted=false;gameThread=0;captureResult=nullptr;attackTrace=json::array();phaseCounts=json::object();
 }
 const BE_ThirdPartyModuleV1 module{sizeof(BE_ThirdPartyModuleV1),1,id,init,configure,message,stop};
 }
