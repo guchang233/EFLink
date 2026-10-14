@@ -96,7 +96,7 @@ public:
     }
     // Classes named `name` (any namespace): parents, static fields (with the
     // class of the object they hold), instance fields.
-    nlohmann::json classInfo(const std::string& name,std::size_t limit=6,bool readStaticObjects=true) const {
+    nlohmann::json classInfo(const std::string& name,std::size_t limit=6,bool readStaticObjects=false) const {
         static auto klassName=symbol<const char*(*)(const void*)>("il2cpp_class_get_name");
         static auto klassSpace=symbol<const char*(*)(const void*)>("il2cpp_class_get_namespace");
         static auto parent=symbol<const void*(*)(const void*)>("il2cpp_class_get_parent");

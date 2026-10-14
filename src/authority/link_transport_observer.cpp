@@ -4,6 +4,7 @@
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "../runtime_scope.h"
 #include "native_proto_codec.h"
+#include "native_build_policy.h"
 #include "nlohmann/json.hpp"
 #include <atomic>
 #include <cstring>
@@ -121,6 +122,8 @@ void start() {
     auto* api=runtime();auto module=GetModuleHandleW(L"GameAssembly.dll");
     if(!attached.ready()||!api||!module||!host.hooks||!host.hooks->create||!host.hooks->disable_module)
         throw std::runtime_error("runtime/shared hook chain unavailable");
+    if(!eflink::worldauthority::readOnlyBuildSupported(eflink::worldauthority::nativeGameVersion(api)))
+        throw std::runtime_error("unverified game build; native transport observation disabled");
     classOf=symbol<ClassOf>(module,"il2cpp_object_get_class");
     className=symbol<ClassText>(module,"il2cpp_class_get_name");
     classNamespace=symbol<ClassText>(module,"il2cpp_class_get_namespace");

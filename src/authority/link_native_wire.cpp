@@ -2,6 +2,7 @@
 // protobuf bytes into newly allocated objects. No gameplay calls or hooks.
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "../runtime_scope.h"
+#include "native_build_policy.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <array>
@@ -85,6 +86,8 @@ json roundtrip(const json& input) {
     auto* api=host.get_runtime?host.get_runtime(host.context):host.runtime;
     auto module=GetModuleHandleW(L"GameAssembly.dll");
     if(!attached.ready()||!api||!module)throw std::runtime_error("runtime unavailable");
+    if(!eflink::worldauthority::readOnlyBuildSupported(eflink::worldauthority::nativeGameVersion(api)))
+        throw std::runtime_error("unverified game build; native synthetic parsing disabled");
     auto methods=symbol<const void*(*)(const void*,void**)>(module,"il2cpp_class_get_methods");
     auto methodName=symbol<const char*(*)(const void*)>(module,"il2cpp_method_get_name");
     auto paramCount=symbol<unsigned(*)(const void*)>(module,"il2cpp_method_get_param_count");

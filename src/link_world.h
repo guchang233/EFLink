@@ -699,13 +699,9 @@ public:
     // Map marks of a map with activation and teleport targets (read-only).
     nlohmann::json teleportMarks(const nlohmann::json& command) {
         void* map=nullptr;
-        if(command.contains("static_class")) {
-            auto klass=api.klass(command.at("static_class").get<std::string>().c_str(),command.value("assembly",std::string("Gameplay.Beyond.dll")).c_str(),command.value("namespace",std::string("Beyond.Gameplay")).c_str());
-            symbol<void(*)(const void*)>("il2cpp_runtime_class_init")(klass.class_info);
-            auto* field=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,command.at("static_field").get<std::string>().c_str());
-            if(!field)throw std::runtime_error("static field not found");
-            symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field,&map);
-        } else {
+        if(command.contains("static_class")||command.contains("static_field")||command.contains("assembly")||command.contains("namespace"))
+            throw std::runtime_error("diagnostics cannot select arbitrary native objects or static fields");
+        {
             // GameInstance.instance.player.mapManager (a public field of GamePlayer)
             auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
             auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
@@ -745,11 +741,7 @@ public:
         }
         return {{"map",mapName},{"total",total},{"marks",out}};
     }
-    // Development only: this player's own operator casts its first normal
-    // attack at the nearest room enemy, through the game's own cast path (the
-    // same TryCastSkill a key press reaches). Exercises local hit resolution.
-    // Development only: move this player within the current level (test setup).
-    // Development only: hand a room enemy to a player for 30 s (host).
+    // Retired compatibility diagnostic; it cannot execute a game skill.
     void queueNativeCast(nlohmann::json) {throw std::runtime_error("统一原生执行适配器尚未验收，旧技能执行入口已删除");}
 #endif
     bool showRemote=true,showMarkers=true;
