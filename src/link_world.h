@@ -1687,6 +1687,41 @@ private:
         return out;
     }
 public:
+    nlohmann::json inspectNativeResourceOperation(const BE_HostApiV1* host,void* operation,void* argument) {
+        runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
+        nlohmann::json result={{"operation_present",operation!=nullptr},{"mineral",false},{"argument_matches_operator",false}};
+        if(!operation)return result;
+        if(classOf(operation)!="Beyond.Gameplay.Operation")throw std::runtime_error("unverified native resource operation class");
+        authority::MetadataIndex metadata;
+        auto scalar=[&]<class T>(const char* name,const char* type) {
+            auto* boxed=metadata.fieldObject(operation,name,type);T value{};
+            if(!boxed)throw std::runtime_error("native resource operation field unavailable");
+            std::memcpy(&value,runtime->object_unbox(runtime->context,boxed),sizeof value);return value;
+        };
+        const auto operatorId=scalar.template operator()<std::uint64_t>("operatorId","System.UInt64");
+        const auto resourceId=scalar.template operator()<std::uint64_t>("resourceId","System.UInt64");
+        result["operation_type"]=scalar.template operator()<int>("operationType","Beyond.Gameplay.ENatureOperation");
+        result["argument_matches_operator"]=usable(argument)&&api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),argument)==operatorId;
+        auto* manager=staticObject("natureResourceManager");
+        auto* dictionary=manager?readField<void*>(manager,"NatureResourceManager","m_resources","Beyond.Gameplay"):nullptr;
+        if(!dictionary)return result;
+        auto* found=collection(dictionary,"ContainsKey",{const_cast<std::uint64_t*>(&resourceId)});bool present=false;
+        if(found)std::memcpy(&present,runtime->object_unbox(runtime->context,found),sizeof present);
+        if(!present)return result;
+        auto* resource=collection(dictionary,"get_Item",{const_cast<std::uint64_t*>(&resourceId)});
+        if(!resource||classOf(resource)!="Beyond.Gameplay.Core.InteractiveDoodadCommonComponent")return result;
+        const auto kind=api.value<int>(gm("InteractiveDoodadCommonComponent","get_natureResourceType","","Beyond.Gameplay.ENatureType"),resource);
+        result["mineral"]=kind==enumValue<int>("ENatureType","Mine","Beyond.Gameplay");
+        if(result["mineral"]==true) {
+            auto* info=staticObject("worldInfo");if(!info)return result;
+            levelId=text(api.call(levelIdText,info));
+            auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),resource);
+            const auto key=usable(entity)?entityKey(entity):std::string{};
+            if(!key.empty())result["key"]=key+"/mine";
+            result["collected"]=readField<bool>(resource,"InteractiveDoodadCommonComponent","m_isCollected");
+        }
+        return result;
+    }
     // Only local native references and asset metadata are examined. Public
     // diagnostics expose comparisons, never raw pointers or account/entity IDs.
     nlohmann::json inspectNativeAttackOrigin(void* board,void* target) {

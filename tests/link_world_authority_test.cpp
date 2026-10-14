@@ -53,6 +53,9 @@ int main() {
     check(!trace.active(2000000),"native callback after diagnostic stop cannot restart capture");
     trace.timed(5,1000);trace.nativeAttack(200);
     check(trace.active(1004)&&!trace.active(1005)&&!trace.awaitingAttack(),"timed capture preserves its original bound");
+    trace.singleAttack(30000);trace.nativeAttack(10);trace.nativeAttack(30000);
+    check(trace.collecting(30009)&&!trace.active(30010)&&throws([&]{trace.singleAttack(30001);}),
+        "resource completion capture has a finite bound that subsequent hits cannot extend");
     MineralReading reading{"ore","quartz",{1,2,3},9,1490,1356,10000,false};
     const auto committed=mineralObservation(reading);
     check(committed.state["hp_ratio"]==1490&&!committed.state.contains("runtime_hp_ratio")&&mineralReadback(reading)["runtime_diverged"]==true,

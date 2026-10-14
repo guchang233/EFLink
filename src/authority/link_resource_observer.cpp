@@ -19,6 +19,10 @@ std::atomic<bool> requested=false;
 json captureResult;
 eflink::worldauthority::NativeTraceWindow traceWindow;bool attackHooked=false,attackAttempted=false;std::uint64_t traceSequence=0;
 json attackTrace=json::array();std::string observedVersion;std::atomic<std::uint64_t> traceFaults{0};
+json phaseCounts=json::object();bool operationHooked=false,operationAttempted=false;
+BE_ResolvedMethodV1 operationInitMethod{},operationFinishMethod{};
+using OperationInit=void*(__fastcall*)(void*,void*,int,std::uint64_t,void*);OperationInit nextOperationInit=nullptr;
+using OperationFinish=void(__fastcall*)(void*,void*,bool,void*);OperationFinish nextOperationFinish=nullptr;
 BE_ResolvedMethodV1 attackMethod{};
 using Attack=void(__fastcall*)(void*,void*,void*);Attack nextAttack=nullptr;
 BE_ResolvedMethodV1 receiveMethod{},runtimeHpMethod{},serverHpMethod{};
@@ -40,12 +44,13 @@ json observeAttack(void* self,void* board) noexcept {
 }
 bool observing(void* self,void* info,const BE_ResolvedMethodV1& method) {
     return traceWindow.active(eflink::nowMs())&&self&&(!info||info==method.method_info)&&
-        (!traceWindow.awaitingAttack()||&method==&attackMethod||&method==&receiveMethod);
+        (!traceWindow.awaitingAttack()||&method==&attackMethod||&method==&receiveMethod||&method==&operationInitMethod||&method==&operationFinishMethod);
 }
 void appendTrace(const char* phase,json before,json after) noexcept {
     try {
         std::lock_guard lock(mutex);if(!initialized||!traceWindow.active(eflink::nowMs()))return;
         attackTrace.push_back({{"phase",phase},{"sequence",++traceSequence},{"at",eflink::nowMs()},{"before",std::move(before)},{"after",std::move(after)}});
+        phaseCounts[phase]=phaseCounts.value(phase,std::uint64_t{})+1;
         if(attackTrace.size()>64)attackTrace.erase(attackTrace.begin());
     }catch(...) {++traceFaults;}
 }
@@ -75,6 +80,32 @@ void __fastcall serverHp(void* self,void* name,int oldValue,int newValue,void* i
     const bool active=observing(self,info,serverHpMethod);json before;if(active)before=observeAttack(self,nullptr);
     if(nextServerHp)nextServerHp(self,name,oldValue,newValue,info);
     if(active)appendTrace("server_hp",std::move(before),observeAttack(self,nullptr));
+}
+json observeOperation(void* operation,void* argument) noexcept {
+    try {eflink::World inspector;return inspector.inspectNativeResourceOperation(runtime(),operation,argument);}
+    catch(...) {++traceFaults;return nullptr;}
+}
+void* __fastcall operationInit(void* self,void* argument,int kind,std::uint64_t resource,void* info) {
+    const bool active=observing(self,info,operationInitMethod);
+    auto* operation=nextOperationInit?nextOperationInit(self,argument,kind,resource,info):nullptr;
+    if(active) {
+        auto observed=observeOperation(operation,argument);
+        if(observed.is_object()&&observed.value("mineral",false)&&observed.contains("key")) {
+            traceWindow.nativeAttack(eflink::nowMs());appendTrace("operation_init",std::move(observed),nullptr);
+        }
+    }
+    return operation;
+}
+void __fastcall operationFinish(void* self,void* operation,bool success,void* info) {
+    const bool active=observing(self,info,operationFinishMethod);
+    json observed;if(active)observed=observeOperation(operation,nullptr);
+    if(nextOperationFinish)nextOperationFinish(self,operation,success,info);
+    // A native completion callback flag is diagnostic evidence, not permission
+    // to manufacture a result or acknowledge a room intent.
+    if(active&&observed.is_object()&&observed.value("mineral",false)&&observed.contains("key")) {
+        traceWindow.nativeAttack(eflink::nowMs());
+        try {appendTrace("operation_finish",std::move(observed),{{"callback_flag",success},{"result_verified",false}});}catch(...) {++traceFaults;}
+    }
 }
 void verifyVersion() {
     observedVersion=eflink::worldauthority::nativeGameVersion(runtime());
@@ -134,6 +165,30 @@ void installAttack() {
     hook("_OnHpRatioPropertyChanged","System.String|System.Int32|System.Int32",3,serverHpMethod,reinterpret_cast<void*>(serverHp),reinterpret_cast<void**>(&nextServerHp));
     attackHooked=true;
 }
+void installOperations() {
+    if(operationHooked)return;
+    if(operationAttempted)throw std::runtime_error("incomplete operation observation installation; disable probe before retrying");
+    install();RuntimeThreadScope attached(true);auto* api=runtime();if(!attached.ready())throw std::runtime_error("operation observation runtime unavailable");
+    BE_ResolvedClassV1 operation{},kind{};
+    auto dll=GetModuleHandleW(L"GameAssembly.dll");
+    auto valueType=reinterpret_cast<bool(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_is_valuetype"));
+    auto enumBase=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_enum_basetype"));
+    auto typeKind=reinterpret_cast<int(*)(const void*)>(GetProcAddress(dll,"il2cpp_type_get_type"));
+    if(!valueType||!enumBase||!typeKind||api->resolve_class(api->context,"Gameplay.Beyond.dll","Beyond.Gameplay","Operation",&operation)!=BE_Result_Ok||
+       api->resolve_class(api->context,"Gameplay.Beyond.dll","Beyond.Gameplay","ENatureOperation",&kind)!=BE_Result_Ok||
+       !operation.class_info||!kind.class_info||valueType(operation.class_info)||!enumBase(kind.class_info)||typeKind(enumBase(kind.class_info))!=0x08)
+        throw std::runtime_error("unverified native resource operation ABI");
+    operationAttempted=true;
+    auto hook=[&](const char* name,const char* parameters,const char* returns,unsigned count,BE_ResolvedMethodV1& method,void* callback,void** next) {
+        BE_MethodDescriptorV1 descriptor{"Gameplay.Beyond.dll","Beyond.Gameplay","NatureResourceManager",name,parameters,returns,count};
+        if(api->resolve_method(api->context,&descriptor,&method)!=BE_Result_Ok||!method.method_pointer)throw std::runtime_error("native resource operation observation signature unavailable");
+        std::uint64_t handle=0;if(host.hooks->create(host.hooks->context,id,method.method_pointer,callback,next,&handle)!=BE_Result_Ok)
+            throw std::runtime_error("native resource operation observation hook unavailable");
+    };
+    hook("InitOperation","Beyond.Gameplay.Core.Entity|Beyond.Gameplay.ENatureOperation|System.UInt64","Beyond.Gameplay.Operation",3,operationInitMethod,reinterpret_cast<void*>(operationInit),reinterpret_cast<void**>(&nextOperationInit));
+    hook("_OnOperationFinish","Beyond.Gameplay.Operation|System.Boolean","System.Void",2,operationFinishMethod,reinterpret_cast<void*>(operationFinish),reinterpret_cast<void**>(&nextOperationFinish));
+    operationHooked=true;
+}
 BE_Result BE_CALL init(const BE_ThirdPartyHostV1* input,const char*) {
     std::lock_guard lock(mutex);
     if(!input||input->version!=1||!input->module_id||std::string(input->module_id)!=id||!input->reply||
@@ -149,11 +204,13 @@ BE_Result BE_CALL message(const char* request,const char* body) {
         if(action=="capture") {install();captureResult=nullptr;requested=true;output={{"queued",true},{"gameplay_modified",false}};}
         else if(action=="trace") {
             const auto duration=command.value("duration_ms",600000u);if(duration<1000||duration>600000)throw std::runtime_error("trace duration outside limits");
-            installAttack();attackTrace=json::array();traceSequence=0;traceFaults=0;
-            if(command.value("one_shot",false))traceWindow.singleAttack();else traceWindow.timed(eflink::nowMs(),duration);
+            const auto collect=command.value("collect_ms",3000u);if(collect<1000||collect>30000)throw std::runtime_error("single capture duration outside limits");
+            installAttack();if(command.value("observe_operations",false))installOperations();
+            attackTrace=json::array();phaseCounts=json::object();traceSequence=0;traceFaults=0;
+            if(command.value("one_shot",false))traceWindow.singleAttack(collect);else traceWindow.timed(eflink::nowMs(),duration);
             output={{"observing",true},{"awaiting_attack",traceWindow.awaitingAttack()},{"duration_ms",duration},{"gameplay_modified",false},{"execution_adapter_verified",false}};}
         else if(action=="stop_trace") {traceWindow.stop();output={{"observing",false},{"gameplay_modified",false}};}
-        else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"observing",traceWindow.active(eflink::nowMs())},{"awaiting_attack",traceWindow.awaitingAttack()},
+        else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"phase_counts",phaseCounts},{"operations_hooked",operationHooked},{"observing",traceWindow.active(eflink::nowMs())},{"awaiting_attack",traceWindow.awaitingAttack()},
             {"game_version",observedVersion},{"trace_faults",traceFaults.load()},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
         else throw std::runtime_error("unknown resource observer action");
     }catch(const std::exception& e){code=BE_Result_InvalidArgument;output={{"error",e.what()}};}
@@ -163,7 +220,7 @@ void BE_CALL stop() {
     requested=false;traceWindow.stop();
     // Disable outside the inspector lock: a running tick may need that lock.
     if(host.hooks&&host.hooks->disable_module)host.hooks->disable_module(host.hooks->context,id);
-    std::lock_guard lock(mutex);initialized=false;hooked=attackHooked=attackAttempted=false;captureResult=nullptr;attackTrace=json::array();
+    std::lock_guard lock(mutex);initialized=false;hooked=attackHooked=attackAttempted=operationHooked=operationAttempted=false;captureResult=nullptr;attackTrace=json::array();phaseCounts=json::object();
 }
 const BE_ThirdPartyModuleV1 module{sizeof(BE_ThirdPartyModuleV1),1,id,init,configure,message,stop};
 }
