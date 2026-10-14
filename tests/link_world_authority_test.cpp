@@ -262,5 +262,31 @@ int main() {
     squadHost.revoke(2);check(squadHost.status()["pending"]==0&&!squadHost.replaceActors(2,7,squad),
         "disconnect revokes every party actor and cannot be undone by a replacement grant");
     squadHost.reset();
+    Host longHost;Fixture longAdapter;longHost.reset(scene(),"fixture-only");
+    longHost.observe("player",{{"operator","player",{{"hp",100},{"max_hp",100}},10}});
+    longHost.observe("mineral",{mineral()});
+    const auto longActor=longHost.find("player","operator")->ref,longOre=longHost.find("mineral","ore-12")->ref;
+    longHost.bind(2,1,longActor);longHost.resume(longAdapter);
+    bool continuous=true;
+    for(std::uint64_t index=1;index<=10020;++index) {
+        Intent input{scene(),2,1,index,index,1,1,longActor,longOre,"mine"};
+        const auto longTicket=longHost.submit(input.json(),2,longAdapter,index*2);
+        if(!longTicket) {continuous=false;break;}
+        longAdapter.result=Witness{*longTicket,10,20,index,mineral().state,longHost.captureNativeStamp()};
+        longHost.poll(index*2+1);
+    }
+    check(continuous&&longHost.status()["results_confirmed"]==10020,"a long session does not stop when command/event dedup reaches its memory window");
+    check(longHost.status()["dedup_commands"]==8192&&longHost.status()["dedup_event_paths"]==1,"long-session command and event history remains bounded");
+    Intent retired{scene(),2,1,10021,1,2,1,longActor,longOre,"mine"};
+    check(!longHost.submit(retired.json(),2,longAdapter,21000),"eviction cannot revive an old command with a new request number");
+    auto newest=retired;newest.action=10021;newest.strike=1;
+    const auto oldEventTicket=longHost.submit(newest.json(),2,longAdapter,21000);
+    check(oldEventTicket.has_value(),"new input continues after old commands retire");
+    if(oldEventTicket) {
+        longAdapter.result=Witness{*oldEventTicket,10,20,1,mineral().state,longHost.captureNativeStamp()};
+        longHost.poll(21001);
+        check(longHost.status()["results_confirmed"]==10020&&longHost.status()["pending"]==0,"event window rejects an evicted old native event even with a fresh capture stamp");
+    }
+    longHost.reset();
     return failures?1:0;
 }

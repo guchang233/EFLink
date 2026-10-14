@@ -126,11 +126,14 @@ inline bool validReceipt(const Json& value) {
 }
 struct Ticket {
     Scope scope;std::uint64_t serial=0,actorCookie=0,targetCookie=0,beforeVersion=0;Intent intent;std::uint64_t beginStamp=0;
+    std::string path;
 };
 struct Witness {
     // Adapter must associate the native callback with THIS execution. A generic
     // later census or function return cannot produce a witness. The private
     // capture stamp is issued at the actual callback, never when poll runs.
+    // Event nonces are monotonically issued within a compiled adapter path;
+    // they are not per-caster skill IDs or client-supplied hit identifiers.
     std::uint64_t serial=0,actorCookie=0,targetCookie=0,event=0;Json state;std::uint64_t nativeStamp=0;
 };
 class NativeAdapter {
@@ -168,8 +171,11 @@ class Host {
     std::map<std::uint16_t,Member> members;
     std::map<std::uint64_t,Pending> pending;
     using Strike=std::tuple<std::uint16_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t>;
-    std::map<Strike,std::uint64_t> strikes;
-    std::set<std::pair<std::string,std::uint64_t>> nativeEvents;
+    std::map<Strike,std::uint64_t> strikes;std::deque<Strike> strikeOrder;
+    using ActorCommand=std::tuple<std::uint16_t,std::uint64_t,std::uint64_t,std::uint64_t>;
+    std::map<ActorCommand,std::uint64_t> retiredActions;
+    struct EventWindow {std::uint64_t high=0;std::set<std::uint64_t> seen;};
+    std::map<std::string,EventWindow> nativeEvents;
     std::deque<Json> journal;
     std::uint64_t nextObject=0,nextLife=0,nextTicket=0,nextNativeStamp=0,revision=0,accepted=0,rejected=0,confirmed=0,expired=0;
     bool suspended=true;
@@ -179,6 +185,27 @@ class Host {
     }
     static void advance(std::uint64_t& n) {if(n==UINT64_MAX)throw std::runtime_error("authority identity exhausted");++n;}
     static std::string index(const std::string& kind,const std::string& key) {return kind+"/"+key;}
+    static ActorCommand actorCommand(const Intent& intent) {return {intent.peer,intent.member,intent.actor.id,intent.actor.life};}
+    bool commandRetired(const Intent& intent) const {
+        auto old=retiredActions.find(actorCommand(intent));return old!=retiredActions.end()&&intent.action<=old->second;
+    }
+    void rememberStrike(const Strike& strike,std::uint64_t request) {
+        while(strikeOrder.size()>=8192) {
+            const auto old=strikeOrder.front();strikeOrder.pop_front();strikes.erase(old);
+            const ActorCommand actor{std::get<0>(old),std::get<1>(old),std::get<2>(old),std::get<3>(old)};
+            retiredActions[actor]=(std::max)(retiredActions[actor],std::get<4>(old));
+        }
+        strikes[strike]=request;strikeOrder.push_back(strike);
+    }
+    bool repeatedEvent(const std::string& path,std::uint64_t event) const {
+        auto found=nativeEvents.find(path);if(found==nativeEvents.end())return nativeEvents.size()>=16;
+        const auto& window=found->second;
+        return window.seen.contains(event)||(window.high>8192&&event<=window.high-8192);
+    }
+    void rememberEvent(const std::string& path,std::uint64_t event) {
+        auto& window=nativeEvents[path];window.high=(std::max)(window.high,event);window.seen.insert(event);
+        while(!window.seen.empty()&&window.high>8192&&*window.seen.begin()<=window.high-8192)window.seen.erase(window.seen.begin());
+    }
     void record(const std::string& type,const Object& object,Json receipt=nullptr) {
         advance(revision);Json event={{"scope",scope_.json()},{"revision",revision},{"type",type},{"object",object.json()},{"receipt",std::move(receipt)}};
         journal.push_back(std::move(event));while(journal.size()>256)journal.pop_front();
@@ -203,6 +230,11 @@ class Host {
             target->state.value("active",true);
     }
     void invalidatePending() {
+        for(auto it=retiredActions.begin();it!=retiredActions.end();) {
+            const Ref actor{std::get<2>(it->first),std::get<3>(it->first)};
+            auto member=members.find(std::get<0>(it->first));
+            if(!find(actor)||member==members.end()||member->second.incarnation!=std::get<1>(it->first))it=retiredActions.erase(it);else ++it;
+        }
         for(auto it=pending.begin();it!=pending.end();) {
             const auto& t=it->second.ticket;const auto* a=find(t.intent.actor);const auto* o=find(t.intent.target);
             auto m=members.find(t.intent.peer);
@@ -218,7 +250,7 @@ public:
     // Adapter lifetime must exceed all pending tickets. Reset before destruction.
     void reset(Scope scope={},std::string gameVersion={}) {
         thread();cancelAll();scope_=std::move(scope);gameVersion_=std::move(gameVersion);objects.clear();members.clear();
-        strikes.clear();nativeEvents.clear();journal.clear();revision=0;suspended=true;
+        strikes.clear();strikeOrder.clear();retiredActions.clear();nativeEvents.clear();journal.clear();revision=0;suspended=true;
         // Allocators survive room/scene resets, including reuse of a network ID.
     }
     const Scope& scope() const {return scope_;}
@@ -287,18 +319,18 @@ public:
     // build and proven isolation/recovery. Observation support grants nothing.
     bool resume(const NativeAdapter& adapter) {
         thread();suspended=!(scope_.valid()&&!gameVersion_.empty()&&adapter.gameVersion()==gameVersion_&&!adapter.path().empty()&&
-            adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified());return !suspended;
+            adapter.path().size()<=128&&adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified());return !suspended;
     }
     std::optional<std::uint64_t> submit(const Json& body,std::uint16_t sender,NativeAdapter& adapter,std::uint64_t now) {
         thread();try {
             Intent intent=Intent::parse(body);
-            if(sender!=intent.peer||!usable(intent)||pending.size()>=128||strikes.size()>=8192||!adapter.executionVerified()||!adapter.isolationVerified()||
-                !adapter.recoveryVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()) {++rejected;return {};}
+            if(sender!=intent.peer||!usable(intent)||pending.size()>=128||commandRetired(intent)||!adapter.executionVerified()||!adapter.isolationVerified()||
+                !adapter.recoveryVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()||adapter.path().size()>128) {++rejected;return {};}
             auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
             Strike strike{sender,intent.member,intent.actor.id,intent.actor.life,intent.action,intent.target.id,intent.target.life,intent.strike};
             if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
-            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp()};
-            m.highRequest=intent.request;strikes[strike]=intent.request;
+            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp(),adapter.path()};
+            m.highRequest=intent.request;rememberStrike(strike,intent.request);
             if(now>UINT64_MAX-1500) {++rejected;return {};}
             pending.emplace(ticket.serial,Pending{ticket,&adapter,now+1500});
             // Consume request identity even when native dispatch fails: an
@@ -312,7 +344,7 @@ public:
         thread();invalidatePending();
         for(auto it=pending.begin();it!=pending.end();) {
             auto& p=it->second;const auto& t=p.ticket;
-            if(!p.adapter->executionVerified()||!p.adapter->isolationVerified()||!p.adapter->recoveryVerified()||p.adapter->gameVersion()!=gameVersion_) {
+            if(!p.adapter->executionVerified()||!p.adapter->isolationVerified()||!p.adapter->recoveryVerified()||p.adapter->gameVersion()!=gameVersion_||p.adapter->path()!=t.path) {
                 p.adapter->cancel(t);it=pending.erase(it);++rejected;continue;
             }
             if(now>=p.deadline) {p.adapter->cancel(t);it=pending.erase(it);++expired;continue;}
@@ -320,10 +352,10 @@ public:
             if(!witness) {++it;continue;}
             auto* existing=find(t.intent.target);
             if(witness->serial!=t.serial||witness->actorCookie!=t.actorCookie||witness->targetCookie!=t.targetCookie||!witness->event||
-                !validState(witness->state)||!existing||nativeEvents.contains({p.adapter->path(),witness->event})||
+                !validState(witness->state)||!existing||repeatedEvent(t.path,witness->event)||
                 !witness->nativeStamp||witness->nativeStamp<=t.beginStamp||witness->nativeStamp>nextNativeStamp||
                 (witness->nativeStamp==existing->nativeStamp&&witness->state!=existing->state)||
-                nativeEvents.size()>=8192||revision==UINT64_MAX) {
+                revision==UINT64_MAX) {
                 ++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;
             }
             auto& object=objects.at(index(existing->kind,existing->key));
@@ -336,7 +368,7 @@ public:
             candidate.nativeStamp=std::max(candidate.nativeStamp,witness->nativeStamp);
             auto full=baseline();for(auto& o:full["objects"])if(o.at("ref")==candidate.ref.json())o=candidate.json();
             if(full.dump().size()>maxWire) {++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;}
-            object=std::move(candidate);nativeEvents.emplace(p.adapter->path(),witness->event);
+            object=std::move(candidate);rememberEvent(t.path,witness->event);
             record(changed?"upsert":"receipt",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
             ++confirmed;it=pending.erase(it);
         }
@@ -349,6 +381,7 @@ public:
     }
     Json status() const {return {{"objects",objects.size()},{"revision",revision},{"pending",pending.size()},{"suspended",suspended},
         {"intents_accepted",accepted},{"intents_rejected",rejected},{"results_confirmed",confirmed},{"expired",expired},
+        {"dedup_commands",strikes.size()},{"dedup_event_paths",nativeEvents.size()},
         {"full_sync_verified",false},{"native_execution_supported",false},{"account_risk",true}};}
 };
 class Replica {
