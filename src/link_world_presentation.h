@@ -4,36 +4,20 @@
         std::uint64_t sampled=0,life=0;};
     std::map<int,PartySample> partySamples;std::uint64_t nextPartyLife=0,nextEffectLife=0;
     std::map<std::uint64_t,std::uint64_t> effectLives;
-    std::map<std::uint16_t,Json> extraMembers;
-    std::map<std::uint16_t,std::deque<TimedState>> extraPoses;
-    struct VisualEffect {void* effect=nullptr;std::uint32_t root=0,uid=0;bool loaded=false,expired=false;std::string name;};
-    std::map<std::pair<std::uint16_t,std::uint64_t>,VisualEffect> visualEffects;
     Json sampledParty=Json::array(),sampledEffects=Json::array();
     Json nativeCombatReadback=Json::array(),visualReadback=Json::array();
     std::uint64_t nativePoiseWrites=0,nativeCombatSampleAt=0;
     std::string presentationError,partySamplingError,effectSamplingError;std::uint64_t presentationSampleAt=0,effectsCreated=0,effectsReleased=0,effectsExpired=0;
     #include "link_world_material_vfx.h"
-    bool currentVisual(const VisualEffect& e) {
-        return e.effect&&api.value<std::uint32_t>(gm("EffectInstance","get_instanceUid","","System.UInt32","Beyond.Gameplay"),e.effect)==e.uid&&
-            !api.value<bool>(gm("EffectInstance","get_inPool","","System.Boolean","Beyond.Gameplay"),e.effect)&&
-            !api.value<bool>(gm("EffectInstance","get_recycled","","System.Boolean","Beyond.Gameplay"),e.effect);
-    }
     void* instanceObject(const char* name) {
         auto klass=api.klass("GameInstance","Gameplay.Beyond.dll","Beyond.Gameplay");
         auto* f=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,name);
         if(!f)throw std::runtime_error(std::string("GameInstance field unavailable: ")+name);
         void* value=nullptr;symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(f,&value);return value;
     }
-    void finishVisual(VisualEffect& e) {
-        try {if(currentVisual(e)) {
-            bool force=true,fade=false;api.call(gm("EffectInstance","Finish","System.Boolean|System.Boolean","System.Void","Beyond.Gameplay"),e.effect,{&force,&fade});
-        }}catch(...) {}
-        release(e.root);e.effect=nullptr;++effectsReleased;
-    }
     void clearPresentation() {
         clearMaterials();
-        for(auto& [key,e]:visualEffects)finishVisual(e);visualEffects.clear();
-        partySamples.clear();extraMembers.clear();extraPoses.clear();sampledParty=Json::array();sampledEffects=Json::array();effectLives.clear();visualReadback=Json::array();nativeCombatReadback=Json::array();
+        partySamples.clear();sampledParty=Json::array();sampledEffects=Json::array();effectLives.clear();visualReadback=Json::array();nativeCombatReadback=Json::array();
     }
     Json readPoise(void* ability) {
         const auto value=api.value<float>(gm("AbilitySystem","get_poise","","System.Single"),ability);
@@ -158,73 +142,8 @@
             nativeCombatReadback.push_back(std::move(row));
         }
     }
-    Snapshot presentationView(Snapshot view,Session& link) {
-        std::set<std::uint16_t> present;
-        const auto peers=view.peers;
-        for(const auto& peer:peers)if(!peer.local) {
-            auto frame=link.presentation(peer.id);if(frame.is_null())continue;
-            for(const auto& member:frame.at("members")) {
-                if(member.at("controlled").get<bool>())continue;
-                // Internal render keys cannot be confused with network peer IDs.
-                const auto key=std::uint16_t(0x8000+peer.id*4+member.at("slot").get<unsigned>());
-                present.insert(key);auto old=extraMembers.find(key);
-                if(old==extraMembers.end()||old->second.at("life")!=member.at("life")||old->second.at("model")!=member.at("model"))extraPoses[key].clear();
-                extraMembers[key]=member;
-                proto::PlayerState state;state.id=key;state.timeMs=std::uint32_t(frame.at("sample_time").get<std::uint64_t>());
-                state.mapHash=proto::fnv32(frame.at("map").get<std::string>());state.flags=member.at("flags").get<std::uint8_t>();
-                state.skeleton=std::uint16_t(proto::fnv32(member.at("model").get<std::string>()));
-                for(int i=0;i<3;++i){state.position[i]=member.at("position")[i].get<float>();state.rootOffset[i]=member.at("root")[i].get<float>();}
-                for(int i=0;i<4;++i)state.rotation[i]=member.at("rotation")[i].get<float>();
-                state.bones=member.at("bones").get<std::vector<std::int16_t>>();
-                auto& poses=extraPoses[key];auto received=frame.at("received").get<std::uint64_t>();
-                if(poses.empty()||poses.back().receivedMs!=received){poses.push_back({state,received});while(poses.size()>12)poses.pop_front();}
-                PeerView remote=peer;remote.id=key;remote.info.modelPath=member.at("model").get<std::string>();
-                remote.info.skeleton=state.skeleton;remote.info.bones=member.at("names").get<std::vector<std::string>>();remote.states=poses;
-                view.peers.push_back(std::move(remote));
-            }
-        }
-        for(auto it=extraMembers.begin();it!=extraMembers.end();)if(!present.contains(it->first)){extraPoses.erase(it->first);it=extraMembers.erase(it);}else ++it;
-        return view;
-    }
-    void replayEffects(const Snapshot& view,Session& link) {
-        visualReadback=Json::array();std::set<std::pair<std::uint16_t,std::uint64_t>> present;auto* manager=instanceObject("effectManager");if(!manager)return;
-        for(const auto& peer:view.peers)if(!peer.local) {
-            auto frame=link.presentation(peer.id);if(frame.is_null())continue;
-            for(const auto& state:frame.at("effects")) {
-                auto key=std::make_pair(peer.id,state.at("id").get<std::uint64_t>());present.insert(key);
-                auto& visual=visualEffects[key];auto p=state.at("position");V3 position{p[0].get<float>(),p[1].get<float>(),p[2].get<float>()};
-                auto r=state.at("rotation");Q rotation{r[0].get<float>(),r[1].get<float>(),r[2].get<float>(),r[3].get<float>()};
-                auto s=state.at("scale");V3 scale{s[0].get<float>(),s[1].get<float>(),s[2].get<float>()};
-                if(visual.effect&&!currentVisual(visual)) {
-                    release(visual.root);visual.effect=nullptr;visual.expired=true;visual.loaded=false;++effectsExpired;
-                }
-                if(visual.expired) {visualReadback.push_back({{"peer",peer.id},{"instance",key.second},{"expired",true},{"loaded",false}});continue;}
-                if(!visual.effect) {
-                    auto* boxed=api.call(gm("EffectManager","CreateStationaryEffect","System.String|UnityEngine.Vector3|UnityEngine.Quaternion|UnityEngine.Vector3","Beyond.ObjectPtr<Beyond.Gameplay.EffectInstance>","Beyond.Gameplay"),manager,{api.string(state.at("name").get<std::string>()),&position,&rotation,&scale});
-                    if(!boxed)throw std::runtime_error("native visual effect creation returned no handle");
-                    eflink::unity::Api::TemporaryRoot retain(runtime,boxed);
-                    auto klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(boxed);
-                    auto* f=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass,"obj");
-                    if(!f)throw std::runtime_error("native visual effect handle layout unavailable");
-                    void* effect=nullptr;symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value")(boxed,f,&effect);
-                    if(!effect)throw std::runtime_error("native visual effect handle is empty");
-                    visual.effect=effect;visual.root=rootOf(effect);visual.name=state.at("name").get<std::string>();
-                    float keepAlive=.5f;api.call(gm("EffectInstance","set_remainTime","System.Single","System.Void","Beyond.Gameplay"),effect,{&keepAlive});
-                    visual.uid=api.value<std::uint32_t>(gm("EffectInstance","get_instanceUid","","System.UInt32","Beyond.Gameplay"),effect);++effectsCreated;
-                }
-                float keepAlive=.5f;api.call(gm("EffectInstance","set_remainTime","System.Single","System.Void","Beyond.Gameplay"),visual.effect,{&keepAlive});
-                auto* go=api.call(gm("EffectInstance","get_effectObj","","UnityEngine.GameObject","Beyond.Gameplay"),visual.effect);
-                visual.loaded=go&&alive(go);
-                if(visual.loaded) {auto* t=api.call(getTransform,go);api.call(setPosition,t,{&position});api.call(setRotation,t,{&rotation});
-                    api.call(m("Transform","set_localScale","UnityEngine.Vector3","System.Void"),t,{&scale});}
-                visualReadback.push_back({{"peer",peer.id},{"instance",key.second},{"name",visual.name},{"loaded",visual.loaded},
-                    {"active",visual.loaded&&api.value<bool>(m("GameObject","get_activeInHierarchy","","System.Boolean"),go)}});
-            }
-        }
-        for(auto it=visualEffects.begin();it!=visualEffects.end();)if(!present.contains(it->first)){finishVisual(it->second);it=visualEffects.erase(it);}else ++it;
-    }
     void updatePresentation(Net& net,Session& link) {
-        if(!link.localSceneOperational()||!link.ready()||!character||link.snapshot().value("map",std::string{})!=mapId||link.snapshot().value("level",std::string{})!=levelId) {if(!partySamples.empty()||!visualEffects.empty()||!materialVisuals.empty())clearPresentation();return;}
+        if(!link.localSceneOperational()||!link.ready()||!character||link.snapshot().value("map",std::string{})!=mapId||link.snapshot().value("level",std::string{})!=levelId) {if(!partySamples.empty()||!materialLives.empty())clearPresentation();return;}
         try {
             if(nowMs()-presentationSampleAt>=50) {
                 presentationSampleAt=nowMs();

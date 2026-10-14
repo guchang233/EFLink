@@ -73,20 +73,6 @@ class World {
     bool backgroundLease=false,backgroundOriginal=false,simulationPaused=false,nativeSceneInitialized=false;
     float nativeTimeScale=1,nativeDeltaTime=0;
 
-    // Remote players.
-    struct Avatar {
-        std::uint16_t id=0;
-        std::string modelPath,name,error;
-        void* object=nullptr;void* transform=nullptr;std::uint32_t root=0;
-        std::uint16_t skeleton=0xFFFF;
-        std::vector<void*> bones;                 // indexed like the sender's bone list
-        std::map<std::string,void*> byName;
-        bool visible=false,native=false,entityPlaced=false;
-        std::uint64_t retryAt=0;
-        std::uint32_t poses=0,entityMoves=0;
-        V3 entityPosition{};
-    };
-    std::map<std::uint16_t,Avatar> avatars;
     struct Actor {
         std::uint64_t id=0,epoch=0,retry=0,presentationLife=0;std::uint16_t peer=0;
         std::string model,templateId,error;
@@ -1170,180 +1156,6 @@ private:
         net.setLocalState(std::move(state));++samples;
     }
 
-    // ---- remote players ----
-    void destroyAvatar(Avatar& a) {
-        if(a.object&&!a.native) {try {if(alive(a.object)) api.call(destroy,nullptr,{a.object});} catch(...) {}}
-        release(a.root);a.object=a.transform=nullptr;a.bones.clear();a.byName.clear();a.skeleton=0xFFFF;a.visible=false;
-        a.native=a.entityPlaced=false;
-    }
-    void spawn(Avatar& a) {
-        // Only operator model resources may be instantiated by a remote peer.
-        if(a.modelPath.find("chr_")==std::string::npos||a.modelPath.find("..")!=std::string::npos||a.modelPath.find(':')!=std::string::npos)
-            throw std::runtime_error("remote resource is not an operator model");
-        a.error.clear();
-        void* object=nullptr;
-        if(auto actor=actors.find(a.id);actor!=actors.end()&&actor->second.started&&currentActor(actor->second)) {
-            auto* component=api.call(entityModel,actor->second.entity);object=component?api.call(modelGo,component):nullptr;
-            if(object&&alive(object))a.native=true;
-        }
-        if(!object) {
-        if(!loader) {
-            auto klass=api.klass("SimpleAssetLoader","Common.Beyond.dll","Beyond.Resource");
-            loader=runtime->object_new(runtime->context,klass.class_info);loaderRoot=rootOf(loader);
-            int channel=0,category=0,priority=10; // ELogChannel.None, RootCategory.Main, Default
-            api.call(m("SimpleAssetLoader",".ctor","Beyond.ELogChannel|Beyond.Resource.RootCategory|Beyond.Resource.EResourceRequestPriority","System.Void","Common.Beyond.dll","Beyond.Resource"),loader,{&channel,&category,&priority});
-        }
-        auto* boxedPath=api.call(pathHash,nullptr,{api.string(a.modelPath)});
-        if(!boxedPath) throw std::runtime_error("path hash unavailable");
-        std::int64_t hash=0;std::memcpy(&hash,runtime->object_unbox(runtime->context,boxedPath),sizeof hash);
-        bool worldSpace=false;
-        auto* boxedHandle=api.call(instantiate,loader,{&hash,&worldSpace});
-        if(!boxedHandle) throw std::runtime_error("model load returned no handle");
-        eflink::unity::Api::TemporaryRoot handleRoot(runtime,boxedHandle);
-        // Value-type instance methods take the unboxed data as this.
-        object=api.call(handleGet,runtime->object_unbox(runtime->context,boxedHandle));
-        if(!object) throw std::runtime_error("model not found in game resources: "+a.modelPath);
-        }
-        a.object=object;a.root=rootOf(object);a.transform=api.call(getTransform,object);
-        api.call(m("Object","set_name","System.String","System.Void"),object,{api.string("EF Link · "+a.name)});
-        // A copy of the model must not think, aim or collide: animation, IK and gameplay view
-        // scripts would fight the network pose, and colliders would block the local player.
-        if(!a.native) for(auto* behaviour:components(object,"Behaviour")) {
-            const auto type=classOf(behaviour);
-            if(type=="UnityEngine.Animator"||type.rfind("RootMotion.",0)==0||type=="Beyond.Gameplay.View.Animation.AnimatorMono"||
-               type=="Beyond.Gameplay.View.TransformFollowDamper"||type=="Beyond.Gameplay.View.LookAtSetting") {
-                bool off=false;api.call(behaviourEnabled,behaviour,{&off});
-            }
-        }
-        if(!a.native) for(auto* collider:components(object,"Collider","UnityEngine.PhysicsModule.dll")) {bool off=false;api.call(colliderEnabled,collider,{&off});}
-        for(auto* transform:components(object,"Transform")) {
-            auto name=text(api.call(objectName,transform));
-            if(name.rfind("Bip001",0)==0) a.byName.emplace(name,transform);
-        }
-        a.skeleton=0xFFFF;a.visible=true;
-    }
-    static Q nlerp(Q a,Q b,float t) {
-        if(a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w<0) b={-b.x,-b.y,-b.z,-b.w};
-        Q r{a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t,a.z+(b.z-a.z)*t,a.w+(b.w-a.w)*t};
-        const float n=std::sqrt(r.x*r.x+r.y*r.y+r.z*r.z+r.w*r.w);
-        return n>1e-6f?Q{r.x/n,r.y/n,r.z/n,r.w/n}:Q{0,0,0,1};
-    }
-    static Q boneAt(const proto::PlayerState& s,std::size_t i) {
-        return {proto::dequantize(s.bones[i*4]),proto::dequantize(s.bones[i*4+1]),proto::dequantize(s.bones[i*4+2]),proto::dequantize(s.bones[i*4+3])};
-    }
-    // Keep the room actor's gameplay position (enemy targeting, hit volumes)
-    // on the drawn body. No native physics or steering acts on room actors.
-    void placeActor(Avatar& a,Actor& actor,V3 position) {
-        if(!actor.movement||!currentActor(actor))return;
-        if(a.entityPlaced) {
-            const float x=position.x-a.entityPosition.x,y=position.y-a.entityPosition.y,z=position.z-a.entityPosition.z;
-            if(x*x+y*y+z*z<1e-4f)return;
-        }
-        bool warning=false;api.call(gm("MovementComponent","TeleportTo","UnityEngine.Vector3|System.Boolean"),actor.movement,{&position,&warning});
-        a.entityPosition=position;a.entityPlaced=true;++a.entityMoves;
-    }
-    void pose(Avatar& a,const PeerView& peer,Actor* placeEntity) {
-        if(a.skeleton!=peer.info.skeleton) {
-            a.bones.assign(peer.info.bones.size(),nullptr);
-            for(std::size_t i=0;i<peer.info.bones.size();++i) if(auto f=a.byName.find(peer.info.bones[i]);f!=a.byName.end()) a.bones[i]=f->second;
-            a.skeleton=peer.info.skeleton;
-        }
-        // Draw 50 ms in the past, between the two snapshots around that moment,
-        // using the sender's own clock so network jitter does not shake the body.
-        const auto& states=peer.states;
-        const auto latestTime=states.back().state.timeMs;
-        auto unwrap=[latestTime](std::uint32_t time){return std::int64_t(latestTime)+std::int32_t(time-latestTime);};
-        std::int64_t offset=INT64_MAX;
-        for(const auto& s:states) offset=(std::min)(offset,std::int64_t(s.receivedMs)-unwrap(s.state.timeMs));
-        const std::int64_t target=std::int64_t(nowMs())-50-offset;
-        const proto::PlayerState* from=&states.front().state;const proto::PlayerState* to=from;float t=0;
-        for(std::size_t i=0;i+1<states.size();++i) {
-            const auto& s0=states[i].state;const auto& s1=states[i+1].state;
-            const auto time0=unwrap(s0.timeMs),time1=unwrap(s1.timeMs);
-            if(time0<=target&&target<=time1) {
-                from=&s0;to=&s1;t=time1>time0?float(target-time0)/float(time1-time0):1.f;break;
-            }
-            if(target>time1) {from=to=&s1;t=0;}
-        }
-        if(from->skeleton!=to->skeleton||from->bones.size()!=to->bones.size()) from=to;
-        const float dx=to->position[0]-from->position[0],dy=to->position[1]-from->position[1],dz=to->position[2]-from->position[2];
-        if(dx*dx+dy*dy+dz*dz>64) {from=to;t=0;} // a teleport: jump instead of sliding across the map
-        V3 position{from->position[0]+dx*t,from->position[1]+dy*t,from->position[2]+dz*t};
-        // The 30 Hz pose stream is the player's own body. The 5 Hz world snapshot
-        // is too coarse to draw from: it froze between packets and then jumped.
-        if(placeEntity)placeActor(a,*placeEntity,position);
-        Q rotation=nlerp({from->rotation[0],from->rotation[1],from->rotation[2],from->rotation[3]},{to->rotation[0],to->rotation[1],to->rotation[2],to->rotation[3]},t);
-        api.call(setPosition,a.transform,{&position});api.call(setRotation,a.transform,{&rotation});
-        if(to->skeleton!=peer.info.skeleton) return; // pose and bone list from different models
-        const auto count=(std::min)(a.bones.size(),to->bones.size()/4);
-        for(std::size_t i=0;i<count;++i) {
-            if(!a.bones[i]) continue;
-            auto q=nlerp(boneAt(*from,i),boneAt(*to,i),t);
-            api.call(setLocalRotation,a.bones[i],{&q});
-            if(i==0) {
-                V3 hips{from->rootOffset[0]+(to->rootOffset[0]-from->rootOffset[0])*t,from->rootOffset[1]+(to->rootOffset[1]-from->rootOffset[1])*t,
-                        from->rootOffset[2]+(to->rootOffset[2]-from->rootOffset[2])*t};
-                api.call(setLocalPosition,a.bones[i],{&hips});
-            }
-        }
-        ++a.poses;
-    }
-    void show(Avatar& a,bool value) {
-        if(a.object&&a.visible!=value) {api.call(setActive,a.object,{&value});a.visible=value;}
-    }
-    bool currentAvatar(const Avatar& avatar) {
-        if(!avatar.native)return true;
-        auto actor=actors.find(avatar.id);
-        if(actor==actors.end()||!currentActor(actor->second))return false;
-        auto* component=api.call(entityModel,actor->second.entity);
-        return component&&api.call(modelGo,component)==avatar.object;
-    }
-    void updateRemotes(const Snapshot& view,bool allowed) {
-        const auto now=nowMs();
-        std::set<std::uint16_t> present;
-        for(const auto& peer:view.peers) {
-            if(peer.local||!peer.hasInfo) continue;
-            present.insert(peer.id);
-            auto& a=avatars[peer.id];a.id=peer.id;a.name=peer.info.name;
-            const bool fresh=!peer.states.empty()&&now-peer.states.back().receivedMs<3000;
-            const auto* latest=fresh?&peer.states.back().state:nullptr;
-            const bool drawable=allowed&&latest&&(latest->flags&proto::StateValid)&&latest->mapHash==mapHash&&mapHash&&!peer.info.modelPath.empty();
-            if(a.native&&!currentAvatar(a))destroyAvatar(a);
-            if(a.object&&!alive(a.object)) {a.object=nullptr;release(a.root);a.transform=nullptr;a.byName.clear();a.bones.clear();a.skeleton=0xFFFF;a.visible=false;}
-            if(a.object&&a.modelPath!=peer.info.modelPath) destroyAvatar(a);
-            if(!a.native&&a.object) {
-                auto actor=actors.find(peer.id);
-                if(actor!=actors.end()&&actor->second.started&&currentActor(actor->second)) {destroyAvatar(a);a.retryAt=0;}
-            }
-            if(!drawable) {show(a,false);continue;}
-            if(!a.object) {
-                if(now<a.retryAt) continue;
-                a.modelPath=peer.info.modelPath;
-                try {spawn(a);}
-                catch(const std::exception& e) {a.error=e.what();a.retryAt=now+15000;if(a.object) destroyAvatar(a);continue;}
-            }
-            try {show(a,true);auto actor=actors.find(peer.id);
-                Actor* owned=a.native&&actor!=actors.end()&&actor->second.started?&actor->second:nullptr;
-                // While the host executes an admitted guest's native skill, its own
-                // root motion and animation drive that actor until the cast ends.
-                if(!(view.role==Role::Host&&owned&&owned->casting))pose(a,peer,owned);}
-            catch(const std::exception& e) {a.error=e.what();destroyAvatar(a);a.retryAt=now+5000;}
-        }
-        for(auto it=avatars.begin();it!=avatars.end();) {
-            if(present.contains(it->first)) {++it;continue;}
-            destroyAvatar(it->second);it=avatars.erase(it);
-        }
-    }
-
-    Enemy* ownedTargetController(void* controller) {
-        constexpr const char* ai="Beyond.Gameplay.AI";
-        auto* entity=readField<void*>(controller,"EnemyAITargetController","m_entity",ai);
-        Enemy* owned=nullptr;for(auto& [key,enemy]:enemies)if(enemy.entity==entity&&currentEnemy(enemy)) {owned=&enemy;break;}
-        if(!owned)return nullptr;
-        auto* component=api.call(gm("Entity","get_enemyAICom","","Beyond.Gameplay.AI.EnemyAIComponent"),entity);
-        auto* brain=component?api.call(gm("EnemyAIComponent","get_aiBrain","","Beyond.Gameplay.AI.EnemyAIBrain",ai),component):nullptr;
-        return brain&&api.call(gm("EnemyAIBrain","get_targetController","","Beyond.Gameplay.AI.EnemyAITargetController",ai),brain)==controller?owned:nullptr;
-    }
 public:
     nlohmann::json inspectNativeInteractiveAssociation(const BE_HostApiV1* host,void* message,void* resource) {
         runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
@@ -1767,11 +1579,7 @@ public:
         for(const auto& event:link.takePlayerCasts()) {lastPlayerCast=event;++playerCastEventsSeen;}
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
-        const auto remotesStart=std::chrono::steady_clock::now();
-        try {
-            if(!avatars.empty())clear(); // uncertified native views are unsupported
-        } catch(const std::exception& e) {localError=e.what();}
-        perf.remotesMs=elapsedMs(remotesStart);
+        perf.remotesMs=0; // no uncertified model/effect replay
         perf.frameMs=elapsedMs(frameStart);
         // Worst frame over the last two seconds.
         if(nowMs()-perf.windowStart>2000) {perf.frameMaxMs=perf.windowMax;perf.windowMax=0;perf.windowStart=nowMs();}
@@ -1781,8 +1589,6 @@ public:
     void clear() {
         clearPresentation();
         clearResources();
-        for(auto& [id,a]:avatars) {try {destroyAvatar(a);} catch(...) {}}
-        avatars.clear();
     }
     void shutdown() {
         clearResources();
@@ -1802,9 +1608,6 @@ public:
     }
     nlohmann::json status() const {
         nlohmann::json remote=nlohmann::json::array();
-        for(const auto& [id,a]:avatars) remote.push_back({{"id",id},{"name",a.name},{"model",a.modelPath},{"spawned",a.object!=nullptr},
-            {"visible",a.visible},{"native_entity",a.native},{"bones_matched",std::count_if(a.bones.begin(),a.bones.end(),[](void* b){return b!=nullptr;})},
-            {"poses",a.poses},{"position",{a.entityPosition.x,a.entityPosition.y,a.entityPosition.z}},{"entity_moves",a.entityMoves},{"error",a.error}});
         nlohmann::json spawnStatus=nlohmann::json::array();for(const auto& [key,s]:spawnedEnemies) spawnStatus.push_back({{"key",key},{"submitted",s.data!=nullptr},
             {"pipeline",s.pipeline},{"resources_complete",s.resourcesComplete},{"in_aoi",s.inAoi},{"preload",s.preload},{"started",s.started},
             {"native_data_ready",s.nativeDataReady},{"awaiting_native_entity",s.native&&s.nativeDataReady&&!s.started},
@@ -1826,7 +1629,7 @@ public:
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage",nativeWeaponLookupReady?"native_weapon_preview":"metadata_only"},
                 {"lookup_ready",nativeWeaponLookupReady},{"effects_replayed",false}}},
             {"presentation",{{"local_members",sampledParty},{"local_effects",sampledEffects},{"effects_created",effectsCreated},{"effects_released",effectsReleased},{"effects_expired",effectsExpired},
-                {"active_effects",visualEffects.size()},{"native_effects",visualReadback},{"native_combat",nativeCombatReadback},{"local_materials",sampledMaterials},{"native_materials",materialReadback},
+                {"active_effects",0},{"native_effects",visualReadback},{"native_combat",nativeCombatReadback},{"local_materials",sampledMaterials},{"native_materials",materialReadback},
                 {"materials_started",materialsStarted},{"materials_stopped",materialsStopped},{"material_error",materialError},{"poise_writes",nativePoiseWrites},
                 {"party_error",partySamplingError},{"effect_error",effectSamplingError},{"error",presentationError},{"native_skill_replay",false},{"full_sync_verified",false}}},
             {"player_casts",{{"events_sent",playerCastEventsSent},{"events_seen",playerCastEventsSeen},{"tracked",observedPlayerCasts.size()},
