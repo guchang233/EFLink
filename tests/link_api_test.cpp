@@ -52,7 +52,9 @@ int main(int argc,char** argv) {
     if(worldApi) {
         auto bytes=worldApi->get_world_json(nullptr,0);std::vector<char> copied(bytes);
         auto needed=worldApi->get_world_json(copied.data(),bytes);
-        check(needed==bytes&&json::parse(copied.data()).contains("session"),"world snapshots use caller-owned buffers");
+        const auto worldJson=json::parse(copied.data());
+        check(needed==bytes&&worldJson.contains("session")&&worldJson.at("objects").is_array(),
+              "world snapshots use caller-owned buffers and expose only the unified public object ledger");
     }
 
     BE_ThirdPartyHostV1 host{sizeof(BE_ThirdPartyHostV1),1,nullptr,moduleId.c_str(),"windows-x64","",nullptr,nullptr,log,reply,emit,noRuntime};

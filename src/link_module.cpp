@@ -289,7 +289,8 @@ const EFLink_ApiV1 publicApi{sizeof(EFLink_ApiV1),EFLINK_API_VERSION_1,apiGetSes
     apiAddListener,apiRemoveListener,apiHost,apiJoin,apiLeave};
 std::uint32_t EFLINK_CALL apiGetWorld(char* destination,std::uint32_t capacity) {
     std::lock_guard lock(worldMutex);
-    const auto text=json({{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}}).dump();
+    const auto text=json({{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")},
+        {"objects",session.sharedObjects()}}).dump();
     const auto required=std::uint32_t(text.size()+1);if(destination&&capacity>=required) std::memcpy(destination,text.c_str(),required);return required;
 }
 EFLink_Result EFLINK_CALL apiTeleport(std::uint16_t peer) {
@@ -316,7 +317,8 @@ json perform(const json& input) {
     else if(action=="outbound_capture"||action=="emergency_home"||action=="testing_invincible"||action=="feed_option")
         throw std::runtime_error("旧玩法/回放入口已移除；统一原生适配器尚未验收");
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
-    else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
+    else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},
+        {"native",world.status().at("world_replication")},{"objects",session.sharedObjects()}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe"||action=="meta_search"||action=="send_traces"||action=="teleport_marks"||action=="class_info") {
         std::lock_guard lock(worldMutex);world.queueDiagnostic(input);return {{"queued",true},{"diagnostic",true}};}

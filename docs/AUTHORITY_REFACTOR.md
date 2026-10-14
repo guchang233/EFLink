@@ -278,3 +278,11 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 契约 revision 17，V1/V2 ABI 不变。真实 localhost 检查覆盖心跳续期、稳定状态不重复发送/应用、重复序号、跨场景、不完整版本、完整基线修复和晚加入。首轮新增夹具在房主结果收据尚未到达客机时就开始统计应用次数，导致失败；已修正等待实际 replica revision 与操作门禁，不改生产逻辑规避断言，原失败日志保留。完整构建与匹配源指纹的 15 组检查、ABI 最终通过；这是传输验证，尚没有实机延迟、丢包或长期运行验收。
 
 只读核对角色复制/好友角色工厂：CloneCharInfo 除 DeepClone 外还执行容器登记；好友工厂涉及 clientCharInfos/clientItemBundles。没有调用这些路径或把它们当成账号隔离。检查器已停用，未要求玩家反复攻击。恢复包 SHA256 `C55BBCCE33A19D56C35473395277158A0644B58B5612AACB04D0F34F352F55D4`。原生生产执行、隔离/应用/恢复及完整系统仍未完成，不发布可用联机的声明。
+
+## 实际客户端读取回归与公共对象诊断（.67）
+
+两端已从已离房的 `.37` 替换为相同 `.66`，保留各自官方连接和原生世界。真实 1.5.3/map01_lv001 只读房间验证房主 45 个矿石基线与房客 replica revision=45，轻量心跳正常，双方 native handoff 保持 Personal、玩法门禁关闭，没有创建房间对象或应用到房客个人矿石；不把这称为矿石端到端同步。真实玩家读取发现 Entity.get_entityData() 为 null，`.58` 的玩家模板来源假设错误，因此此前离线构建不能证明原生玩家适配。
+
+`.67` 玩家模板改读实际 CharacterRootComponent.replicatedCharInfo.templateId，不创建角色信息或通过网络账号编号查询背包。V2 与 world_state 的既有 JSON 增加 objects 数组，暴露同一账本的公共 Ref/状态/关系供真实对比，不把私有指针或原生账号实体编号导出。加入可重复的两真实客户端只读校验工具，显式禁止玩法准入与共享世界切换，异常也离房并确认清理；工具不读取官方登录数据、不保存整个诊断状态。
+
+完整构建、15 组检查、源指纹与 ABI 通过，恢复包 SHA256 `E37C5AF27C7CF61EFA9E6D1683B2E18E5C220C2F35F8E72B69E69BFD39CA8B31`；实机回归进一步遇到 invalid native battle observation，拒绝发布不合法玩家状态，双方只读房间已退出。原生 getter 元数据已确认 HP/maxHP 为 Double、poise/maxPoise 为 Single，需要核对实际数值语义，不能靠夹紧或跳过错误伪造参数。尚未完成原生执行、隔离/应用/恢复及完整系统；本轮实机结果为发现缺陷，不列为玩家或矿石玩法验收通过。

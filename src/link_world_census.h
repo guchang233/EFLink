@@ -14,9 +14,24 @@
         eflink::unity::Api::TemporaryRoot entityRoot(runtime,entity);
         auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity);
         if(!ability)throw std::runtime_error("native battle ability state is unavailable");
-        auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity);
-        if(!data)throw std::runtime_error("native battle template is unavailable");
-        auto templateId=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
+        std::string templateId;
+        if(kind=="player") {
+            // SquadManager allocates characters directly; a real character can
+            // have no EntityManager BaseEntityData node. Read its actual native
+            // root's replicated metadata, without synthesizing a CharInfo or
+            // looking up another account/character by a transmitted identifier.
+            auto* root=api.call(gm("Entity","get_rootCom","","Beyond.Gameplay.Core.RootComponent"),entity);
+            if(!root||classOf(root)!="Beyond.Gameplay.Core.CharacterRootComponent")
+                throw std::runtime_error("native player root is unadapted");
+            auto* info=api.call(gm("CharacterRootComponent","get_replicatedCharInfo","","Beyond.Gameplay.CharInfo"),root);
+            if(!info)throw std::runtime_error("native player metadata is unavailable");
+            eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);
+            templateId=text(readField<void*>(info,"CharInfo","templateId","Beyond.Gameplay"));
+        }else {
+            auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity);
+            if(!data)throw std::runtime_error("native battle template is unavailable");
+            templateId=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
+        }
         auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),entity);
         const auto identity=identityOf(entity);
         if(!identity.captured||!identity.instance)throw std::runtime_error("native battle allocation is unavailable");
