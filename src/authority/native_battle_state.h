@@ -16,7 +16,11 @@ inline Observation nativeBattleObservation(const NativeBattleReading& native) {
     if(native.poise!=0||native.maxPoise!=0) {state["poise"]=native.poise;state["max_poise"]=native.maxPoise;}
     if((native.kind!="player"&&native.kind!="enemy")||native.key.empty()||native.key.size()>160||
        native.model.empty()||native.model.size()>256||!native.cookie||!validState(state))
-        throw std::runtime_error("invalid native battle observation");
+        // This diagnostic contains only the same public gameplay fields, not
+        // native pointers, cookies, account IDs or a managed-object field dump.
+        // Preserve the actual values so an unsupported native sentinel cannot
+        // silently be clamped into a plausible HP/poise bar.
+        throw std::runtime_error("invalid native battle observation: "+state.dump());
     return {native.key,native.kind,std::move(state),native.cookie};
 }
 }

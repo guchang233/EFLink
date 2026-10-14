@@ -286,3 +286,9 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 `.67` 玩家模板改读实际 CharacterRootComponent.replicatedCharInfo.templateId，不创建角色信息或通过网络账号编号查询背包。V2 与 world_state 的既有 JSON 增加 objects 数组，暴露同一账本的公共 Ref/状态/关系供真实对比，不把私有指针或原生账号实体编号导出。加入可重复的两真实客户端只读校验工具，显式禁止玩法准入与共享世界切换，异常也离房并确认清理；工具不读取官方登录数据、不保存整个诊断状态。
 
 完整构建、15 组检查、源指纹与 ABI 通过，恢复包 SHA256 `E37C5AF27C7CF61EFA9E6D1683B2E18E5C220C2F35F8E72B69E69BFD39CA8B31`；实机回归进一步遇到 invalid native battle observation，拒绝发布不合法玩家状态，双方只读房间已退出。原生 getter 元数据已确认 HP/maxHP 为 Double、poise/maxPoise 为 Single，需要核对实际数值语义，不能靠夹紧或跳过错误伪造参数。尚未完成原生执行、隔离/应用/恢复及完整系统；本轮实机结果为发现缺陷，不列为玩家或矿石玩法验收通过。
+
+## 原生数值失败证据（.68）
+
+不合法观察的错误诊断保留公开玩法字段的原值，不加入指针、cookie、账号编号或托管对象字段遍历。完整构建、15 组检查与 ABI 通过，两真实客户端 `.68` 只读测试自动发现玩家 HP=4412.32737219、maxHP=4412.327372185988；韧性容量为零，未造韧性条。HP 仅约 4e-9 的原生舍入差异就被 schema 的精确上限比较拒绝。诊断房间已在失败后自动离开并确认空账本/Personal；不需要用户攻击操作，不改变原始 HP。后续应统一调整原生浮点容量比较的精度容差，保留两数原值且仍拒绝显著超额与整数耐久超额，不能夹紧成相等值。
+
+同时只读确认 Entity.get_templateData 返回实际 EntityTemplateData，其 id/name 为资源模板字段；该发现尚未用于创建角色或开放执行。只读 inspector 已停用。恢复包 SHA256 `EA397F9EE3C2BE828F067BE49C0626122551BD4744A887FFAFD47D9FE0E34A8A`。生产原生执行、隔离应用、恢复和完整验收仍缺，目标保持未完成。
