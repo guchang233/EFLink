@@ -161,13 +161,13 @@ public:
     virtual void releasePersonal(std::uint64_t) noexcept {}
 };
 class Host {
-    struct Member {std::uint64_t incarnation=0,highRequest=0;Ref actor;bool active=false;};
+    struct Member {std::uint64_t incarnation=0,highRequest=0;std::vector<Ref> actors;bool active=false;};
     struct Pending {Ticket ticket;NativeAdapter* adapter=nullptr;std::uint64_t deadline=0;};
     Scope scope_;std::string gameVersion_;std::thread::id owner;
     std::map<std::string,Object> objects;
     std::map<std::uint16_t,Member> members;
     std::map<std::uint64_t,Pending> pending;
-    using Strike=std::tuple<std::uint16_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t>;
+    using Strike=std::tuple<std::uint16_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t,std::uint64_t>;
     std::map<Strike,std::uint64_t> strikes;
     std::set<std::pair<std::string,std::uint64_t>> nativeEvents;
     std::deque<Json> journal;
@@ -184,10 +184,21 @@ class Host {
         journal.push_back(std::move(event));while(journal.size()>256)journal.pop_front();
     }
     void cancelAll() noexcept {for(auto& [id,p]:pending)p.adapter->cancel(p.ticket);pending.clear();}
+    static bool owns(const Member& member,Ref actor) {return std::find(member.actors.begin(),member.actors.end(),actor)!=member.actors.end();}
+    bool ownedGroup(std::uint16_t peer,std::vector<Ref>& actors) const {
+        if(!peer||actors.empty()||actors.size()>4)return false;
+        std::sort(actors.begin(),actors.end(),[](Ref a,Ref b){return std::tie(a.id,a.life)<std::tie(b.id,b.life);});
+        if(std::adjacent_find(actors.begin(),actors.end())!=actors.end())return false;
+        for(const auto actor:actors) {
+            const auto* native=find(actor);if(!native||native->kind!="player")return false;
+            for(const auto& [other,m]:members)if(other!=peer&&m.active&&owns(m,actor))return false;
+        }
+        return true;
+    }
     bool usable(const Intent& intent) const {
         auto m=members.find(intent.peer);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
         return !suspended&&intent.scope==scope_&&m!=members.end()&&m->second.active&&m->second.incarnation==intent.member&&
-            m->second.actor==intent.actor&&actor&&actor->kind=="player"&&target&&intent.expectedVersion>0&&target->version>=intent.expectedVersion&&
+            owns(m->second,intent.actor)&&actor&&actor->kind=="player"&&target&&intent.expectedVersion>0&&target->version>=intent.expectedVersion&&
             !actor->state.value("dead",false)&&!actor->state.value("downed",false)&&!target->state.value("collected",false)&&
             target->state.value("active",true);
     }
@@ -196,7 +207,7 @@ class Host {
             const auto& t=it->second.ticket;const auto* a=find(t.intent.actor);const auto* o=find(t.intent.target);
             auto m=members.find(t.intent.peer);
             if(t.scope!=scope_||!a||!o||a->cookie!=t.actorCookie||o->cookie!=t.targetCookie||
-               m==members.end()||!m->second.active||m->second.incarnation!=t.intent.member||m->second.actor!=t.intent.actor) {
+               m==members.end()||!m->second.active||m->second.incarnation!=t.intent.member||!owns(m->second,t.intent.actor)) {
                 it->second.adapter->cancel(t);it=pending.erase(it);
             }else ++it;
         }
@@ -250,14 +261,24 @@ public:
         invalidatePending();
     }
     bool bind(std::uint16_t peer,std::uint64_t incarnation,Ref actor) {
-        thread();auto* object=find(actor);if(!peer||!incarnation||!object||object->kind!="player")return false;
-        for(const auto& [other,m]:members)if(other!=peer&&m.active&&m.actor==actor)return false;
+        return bindGroup(peer,incarnation,{actor});
+    }
+    bool bindGroup(std::uint16_t peer,std::uint64_t incarnation,std::vector<Ref> actors) {
+        thread();if(!incarnation||!ownedGroup(peer,actors))return false;
         auto it=members.find(peer);
         if(it!=members.end()) {
             if(incarnation<it->second.incarnation)return false;
-            if(incarnation==it->second.incarnation)return it->second.actor==actor&&it->second.active;
+            if(incarnation==it->second.incarnation)return it->second.actors==actors&&it->second.active;
         }
-        members[peer]={incarnation,0,actor,true};invalidatePending();return true;
+        members[peer]={incarnation,0,std::move(actors),true};invalidatePending();return true;
+    }
+    // Host-native party replacement is separate from membership admission.
+    // It preserves request deduplication and revokes tickets for removed actors.
+    // There is no room JSON/RPC entry point for granting arbitrary ownership.
+    bool replaceActors(std::uint16_t peer,std::uint64_t incarnation,std::vector<Ref> actors) {
+        thread();auto member=members.find(peer);
+        if(member==members.end()||!member->second.active||member->second.incarnation!=incarnation||!ownedGroup(peer,actors))return false;
+        member->second.actors=std::move(actors);invalidatePending();return true;
     }
     void revoke(std::uint16_t peer) {thread();auto it=members.find(peer);if(it!=members.end())it->second.active=false;invalidatePending();}
     void suspend() {thread();suspended=true;cancelAll();}
@@ -273,7 +294,7 @@ public:
             if(sender!=intent.peer||!usable(intent)||pending.size()>=128||strikes.size()>=8192||!adapter.executionVerified()||!adapter.isolationVerified()||
                 !adapter.recoveryVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()) {++rejected;return {};}
             auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
-            Strike strike{sender,intent.member,intent.action,intent.target.id,intent.target.life,intent.strike};
+            Strike strike{sender,intent.member,intent.actor.id,intent.actor.life,intent.action,intent.target.id,intent.target.life,intent.strike};
             if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
             advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp()};
             m.highRequest=intent.request;strikes[strike]=intent.request;
@@ -346,7 +367,8 @@ public:
                 if(next==revision&&candidate!=objects)return false;
                 for(const auto& [id,o]:candidate)if(auto it=objects.find(id);it!=objects.end()&&
                     (it->second.at("ref")!=o.at("ref")||it->second.at("kind")!=o.at("kind")||it->second.at("key")!=o.at("key")||
-                     o.at("version").get<std::uint64_t>()<it->second.at("version").get<std::uint64_t>()))return false;
+                     o.at("version").get<std::uint64_t>()<it->second.at("version").get<std::uint64_t>()||
+                     (o.at("version")==it->second.at("version")&&o.at("state")!=it->second.at("state"))))return false;
             }
             scope_=expected;objects=std::move(candidate);revision=next;missing=false;return true;
         }catch(...) {return false;}

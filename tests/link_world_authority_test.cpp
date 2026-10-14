@@ -104,6 +104,10 @@ int main() {
         "result receipts cannot carry rewards or private account fields");
     const auto beforeMalformed=guest.snapshot();auto corrupted=host.baseline();corrupted["objects"][0]["account_uid"]=123;
     check(!guest.baseline(corrupted,scene(),true)&&guest.snapshot()==beforeMalformed,"private fields reject whole baseline atomically");
+    auto sameVersionChanged=host.baseline();sameVersionChanged["revision"]=guest.version()+1;
+    sameVersionChanged["objects"][0]["state"]["hp_ratio"]=6000;
+    check(!guest.baseline(sameVersionChanged,scene(),true)&&guest.snapshot()==beforeMalformed,
+        "a later world revision cannot replace state while reusing the same object version");
     auto invalid=mineral();invalid.state["hp_ratio"]=-1;auto before=host.baseline();
     check(throws([&]{host.observe("mineral",{invalid});})&&host.baseline()==before,"invalid native census preserves all previous identities");
     check(throws([&]{host.observe("mineral",{mineral(),mineral()});})&&host.baseline()==before,"ambiguous native keys cannot partially replace world");
@@ -230,5 +234,33 @@ int main() {
     const auto privateWire=concurrent.baseline().dump();
     check(privateWire.find("nativeStamp")==std::string::npos&&privateWire.find("native_stamp")==std::string::npos&&privateWire.find("cookie")==std::string::npos,
         "native capture order and identities remain private to the host");
+    Host squadHost;Fixture squadAdapter;squadHost.reset(scene(),"fixture-only");
+    std::vector<Observation> nativeSquad;std::vector<Ref> squad;
+    for(unsigned slot=0;slot<5;++slot)nativeSquad.push_back({"slot-"+std::to_string(slot),"player",{{"active",true}},100+slot});
+    squadHost.observe("player",nativeSquad);squadHost.observe("mineral",{mineral()});
+    for(unsigned slot=0;slot<4;++slot)squad.push_back(squadHost.find("player","slot-"+std::to_string(slot))->ref);
+    check(squadHost.bindGroup(2,7,squad),"one authenticated member can own all four native party actors");
+    auto oversizedSquad=squad;oversizedSquad.push_back(squadHost.find("player","slot-4")->ref);
+    check(!squadHost.bindGroup(3,1,oversizedSquad)&&!squadHost.bindGroup(3,1,{squad.back()}),
+        "oversized or overlapping actor grants fail atomically without stealing another member's actors");
+    check(!squadHost.replaceActors(2,7,{squad.front(),squad.front()})&&!squadHost.replaceActors(2,6,{squad.front()}),
+        "duplicate actors and old member generations cannot replace a native squad");
+    squadHost.resume(squadAdapter);
+    const auto squadOre=squadHost.find("mineral","ore-12")->ref;
+    Intent companion{scene(),2,7,1,1,1,1,squad.back(),squadOre,"mine"};
+    check(squadHost.submit(companion.json(),2,squadAdapter,1).has_value(),"a verified fourth party actor can originate an operation");
+    auto primary=companion;primary.request=2;primary.actor=squad.front();
+    check(squadHost.submit(primary.json(),2,squadAdapter,2).has_value(),
+        "separate party actors cannot merge strikes just because their action identifiers match");
+    auto retained=squad;retained.pop_back();
+    check(squadHost.replaceActors(2,7,retained)&&squadHost.status()["pending"]==1&&squadAdapter.cancels==1,
+        "native party replacement revokes only tickets belonging to removed actors");
+    primary.request=1;primary.strike=2;
+    check(!squadHost.submit(primary.json(),2,squadAdapter,3),"party replacement does not reset member request deduplication");
+    companion.request=3;companion.strike=2;
+    check(!squadHost.submit(companion.json(),2,squadAdapter,3),"removed live actor cannot operate merely because its native object still exists");
+    squadHost.revoke(2);check(squadHost.status()["pending"]==0&&!squadHost.replaceActors(2,7,squad),
+        "disconnect revokes every party actor and cannot be undone by a replacement grant");
+    squadHost.reset();
     return failures?1:0;
 }
