@@ -1,6 +1,6 @@
 #pragma once
 // EF Link game side. Everything here runs on the game thread (CameraManager.TailLateTick):
-// it creates independent native room actors and samples local operator presentation.
+// it samples native world facts; gameplay requires a verified authority adapter.
 #include "link_net.h"
 #include "link_session.h"
 #include "unity_bridge.h"
@@ -726,59 +726,6 @@ class World {
             runtime->object_unbox(runtime->context,map),{&id}));
         if(result.empty()||result.size()>120||itemNumber(result)!=id)throw std::runtime_error("武器模板编号无法往返校验");return result;
     }
-    void applyActorAppearance(Actor& actor,const nlohmann::json& appearance) {
-        if(appearance==actor.appearance)return;
-        traceNative("actor.weapon.begin");
-        if(!nativeWeaponLookupReady)throw std::runtime_error("原生房间武器查询适配未就绪");
-        if(!currentActor(actor)||(!appearance.is_null()&&!validCharacterAppearance(appearance,actor.model)))throw std::runtime_error("远端武器资料身份无效");
-        const int number=appearance.is_null()?0:appearance.at("weapon_template").get<int>();
-        void* weapon=nullptr;std::unique_ptr<eflink::unity::Api::TemporaryRoot> weaponRoot;
-        if(number) {
-            const auto name=itemName(number);
-            constexpr const char* common="Common.Beyond.dll",*cfg="Beyond.Cfg";
-            auto* weapons=api.call(m("Tables","get_weaponBasicTable","","Beyond.Cfg.Tables.WeaponBasicTable",common,cfg));
-            eflink::unity::Api::TemporaryRoot weaponsRoot(runtime,weapons);
-            auto* weaponConfig=collection(weapons,"get_Item",{api.string(name)});eflink::unity::Api::TemporaryRoot weaponConfigRoot(runtime,weaponConfig);
-            auto* characters=api.call(m("Tables","get_characterTable","","Beyond.Cfg.Tables.CharacterTable",common,cfg));
-            eflink::unity::Api::TemporaryRoot charactersRoot(runtime,characters);
-            auto* characterConfig=collection(characters,"get_Item",{api.string(actor.templateId)});eflink::unity::Api::TemporaryRoot characterConfigRoot(runtime,characterConfig);
-            const auto weaponType=api.value<int>(m("WeaponBasicData","get_weaponType","","Beyond.GEnums.WeaponType",common,cfg),runtime->object_unbox(runtime->context,weaponConfig));
-            const auto characterType=api.value<int>(m("CharacterData","get_weaponType","","Beyond.GEnums.WeaponType",common,cfg),runtime->object_unbox(runtime->context,characterConfig));
-            if(weaponType!=characterType)throw std::runtime_error("武器类型与远端干员不兼容");
-            weapon=api.call(gm("InventorySystem","CreateInitialGachaPoolWeaponInst","System.String","Beyond.Gameplay.InventorySystem.WeaponInstData","Beyond.Gameplay"),nullptr,{api.string(name)});
-            if(!weapon)throw std::runtime_error("原生武器资料创建失败");
-            weaponRoot=std::make_unique<eflink::unity::Api::TemporaryRoot>(runtime,weapon);
-            field(weapon,"InventorySystem/ItemInstData","instId",actor.id,"Beyond.Gameplay");
-            field(weapon,"InventorySystem/WeaponInstData","equippedCharServerId",actor.id,"Beyond.Gameplay");
-        }
-        // Only the independent ClientCharInfo owned by this room actor is changed.
-        // It is never inserted into InventorySystem or the account's CharBag.
-        auto* previous=readField<void*>(actor.info,"ClientCharInfo","m_weaponData","Beyond.Gameplay");
-        eflink::unity::Api::TemporaryRoot previousRoot(runtime,previous);
-        const auto previousId=readField<std::uint64_t>(actor.info,"CharInfo","weaponInstId","Beyond.Gameplay");
-        auto* component=api.call(gm("Entity","get_weaponCom","","Beyond.Gameplay.View.WeaponComponent"),actor.entity);
-        if(!component)throw std::runtime_error("原生武器组件尚未就绪");
-        try {
-            field(actor.info,"ClientCharInfo","m_weaponData",weapon,"Beyond.Gameplay");
-            const auto weaponId=number?actor.id:std::uint64_t(0);field(actor.info,"CharInfo","weaponInstId",weaponId,"Beyond.Gameplay");
-            if(!number) {
-                // A missing instance would make native loading fall back to a
-                // preset/default weapon. Unequip/unknown must release that view.
-                bool immediate=true;api.call(gm("WeaponComponent","UnloadWeapons","System.Boolean","System.Void","Beyond.Gameplay.View"),component,{&immediate});
-            } else {
-            auto* bundles=readField<void*>(component,"WeaponComponent","m_weaponBundles","Beyond.Gameplay.View");
-            auto* count= bundles?collection(bundles,"get_Count"):nullptr;
-            const int modes=count?*static_cast<int*>(runtime->object_unbox(runtime->context,count)):0;
-            if(!modes)api.call(gm("WeaponComponent","_InitWeapon","","System.Void","Beyond.Gameplay.View"),component);
-            else {bool force=true;api.call(gm("WeaponComponent","ReloadWeapon","System.Boolean","System.Void","Beyond.Gameplay.View"),component,{&force});}
-            }
-        } catch(...) {
-            field(actor.info,"ClientCharInfo","m_weaponData",previous,"Beyond.Gameplay");field(actor.info,"CharInfo","weaponInstId",previousId,"Beyond.Gameplay");
-            throw;
-        }
-        actor.appearance=appearance;actor.weaponError.clear();++actor.weaponReloads;
-        actor.weaponState=-1;
-    }
     nlohmann::json localAppearance() {
         if(!character)return nullptr;
         if(lastAppearanceSample&&appearanceModel==localModel&&nowMs()-lastAppearanceSample<1000)return localAppearanceInfo;
@@ -907,252 +854,6 @@ class World {
         return state;
     }
 #endif
-    void createActor(Actor& actor,V3 position,int levelNumber) {
-        traceNative("actor.create.begin");
-        auto templateId=operatorTemplate(actor.model);if(templateId.empty())throw std::runtime_error("原生玩家模板标识不可用");
-        actor.templateId=templateId;
-        // Independent client character growth/gear data. It is never inserted into
-        // the account's CharBag/Squad, and cannot overwrite an account operator.
-        actor.info=api.call(gm("ClientCharInfo","CreateInitialGachaPoolCharInfo","System.String","Beyond.Gameplay.ClientCharInfo","Beyond.Gameplay"),nullptr,{api.string(templateId)});
-        if(!actor.info)throw std::runtime_error("原生玩家初始属性创建失败");
-        actor.infoRoot=rootOf(actor.info);field(actor.info,"CharInfo","instId",actor.id,"Beyond.Gameplay");
-        traceNative("actor.create.info_ready");
-        if(!actor.growth.is_null()) {
-            if(!validCharacterGrowth(actor.growth,actor.model))throw std::runtime_error("房间玩家成长资料与原生角色不匹配");
-            constexpr const char* common="Common.Beyond.dll",*cfg="Beyond.Cfg";
-            auto* limits=api.call(m("Tables","get_characterConst","","Beyond.Cfg.Tables.CharacterConst",common,cfg));
-            eflink::unity::Api::TemporaryRoot limitRoot(runtime,limits);
-            if(!limits)throw std::runtime_error("原生干员成长配置不可用");
-            int level=actor.growth.at("level").get<int>(),stage=actor.growth.at("break_stage").get<int>();
-            const auto potential=actor.growth.at("potential").get<std::uint32_t>();
-            if(level>api.value<int>(m("Tables/CharacterConst","get_maxLevel","","System.Int32",common,cfg),limits)||
-               stage>api.value<int>(m("Tables/CharacterConst","get_maxBreak","","System.Int32",common,cfg),limits)||
-               potential>std::uint32_t(api.value<int>(m("Tables/CharacterConst","get_maxPotential","","System.Int32",common,cfg),limits)))
-                throw std::runtime_error("房间玩家成长资料超过当前原生配置上限");
-            auto* stages=api.call(m("Tables","get_charBreakStageTable","","Beyond.Cfg.Tables.CharBreakStageTable",common,cfg));
-            eflink::unity::Api::TemporaryRoot stagesRoot(runtime,stages);
-            auto* contains=stages?collection(stages,"ContainsKey",{&stage}):nullptr;
-            auto* containsRaw=contains?runtime->object_unbox(runtime->context,contains):nullptr;
-            if(!containsRaw||!(*static_cast<bool*>(containsRaw)))throw std::runtime_error("原生干员突破阶段不存在");
-            auto* stageData=collection(stages,"get_Item",{&stage});
-            eflink::unity::Api::TemporaryRoot stageRoot(runtime,stageData);
-            auto* stageRaw=stageData?runtime->object_unbox(runtime->context,stageData):nullptr;
-            if(!stageRaw||level<api.value<int>(m("CharBreakStageData","get_minCharLevel","","System.Int32",common,cfg),stageRaw)||
-               level>api.value<int>(m("CharBreakStageData","get_maxCharLevel","","System.Int32",common,cfg),stageRaw))
-                throw std::runtime_error("干员等级与原生突破阶段配置不匹配");
-            field(actor.info,"CharInfo","level",level,"Beyond.Gameplay");field(actor.info,"CharInfo","breakStage",stage,"Beyond.Gameplay");
-            field(actor.info,"CharInfo","potentialLevel",potential,"Beyond.Gameplay");
-            // Factory presets already contain cached attributes. Recompute through
-            // native configuration after applying growth; never copy claimed HP.
-            api.call(gm("ClientCharInfo","InitClientCardSkill","","System.Void","Beyond.Gameplay"),actor.info);
-            api.call(gm("CharInfo","InitDeckData","","System.Void","Beyond.Gameplay"),actor.info);
-            bool force=true;api.call(gm("CharInfo","InitSkillData","System.Boolean","System.Void","Beyond.Gameplay"),actor.info,{&force});
-        }
-        auto* templateInfo=runtime->object_new(runtime->context,api.klass("CharacterInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot templateRoot(runtime,templateInfo);
-        api.call(gm("CharacterInfo",".ctor"),templateInfo);api.call(gm("BaseEntityData","OnAllocate"),templateInfo);
-        api.call(gm("BaseEntityData","SetDataBitForClientEntityFromTemplate"),templateInfo);
-        if(!api.value<bool>(gm("BaseEntityData","SetupTemplate","System.String","System.Boolean"),templateInfo,{api.string(templateId)}))throw std::runtime_error("原生玩家模板不存在: "+templateId);
-        auto* entityTemplate=api.call(gm("BaseEntityData","get_templateData","","Beyond.Gameplay.EntityTemplateData"),templateInfo);
-        auto* worldInfo=staticObject("worldInfo");auto* container=staticObject("objectContainer");
-        if(!worldInfo||!container||!entityTemplate)throw std::runtime_error("原生实体容器未就绪");
-        auto* allocator=api.call(gm("WorldInfo","get_entityAllocator","","Beyond.Gameplay.Core.EntityAllocator"),worldInfo);
-        auto* parameter=runtime->object_new(runtime->context,api.klass("EntityAllocator/AllocObjParam","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot paramRoot(runtime,parameter);auto* raw=runtime->object_unbox(runtime->context,parameter);V3 rotation{};
-        if(!raw)throw std::runtime_error("原生角色分配参数 ABI 不可用");
-        api.call(gm("EntityAllocator/AllocObjParam",".ctor","UnityEngine.Vector3|UnityEngine.Vector3"),raw,{&position,&rotation});
-        traceNative("actor.create.allocate");
-        actor.entity=api.call(gm("EntityAllocator","AllocateObject","Beyond.Gameplay.EntityTemplateData|System.UInt64|Beyond.Gameplay.Core.EntityAllocator.AllocObjParam|Beyond.Gameplay.LevelEntityData","Beyond.Gameplay.Core.Entity"),allocator,{entityTemplate,&actor.id,raw,nullptr});
-        if(!actor.entity)throw std::runtime_error("原生角色分配失败");
-        actor.entityRoot=rootOf(actor.entity);
-        actor.identity=identityOf(actor.entity);
-        auto* root=api.call(gm("Entity","get_rootCom","","Beyond.Gameplay.Core.RootComponent"),actor.entity);
-        if(!root||classOf(root)!="Beyond.Gameplay.Core.CharacterRootComponent")throw std::runtime_error("原生角色根组件类型不匹配");
-        traceNative("actor.create.server_data");
-        api.call(gm("CharacterRootComponent","InitServerData","Beyond.Gameplay.CharInfo"),root,{actor.info});
-        bool no=false;api.call(gm("CharacterRootComponent","set_isServer","System.Boolean"),root,{&no});
-        api.call(gm("Entity","set_levelId","System.Int32"),actor.entity,{&levelNumber});
-        auto generation=std::uint32_t(actor.epoch);api.call(gm("Entity","AssignServerGeneration","System.UInt32"),actor.entity,{&generation});
-        actor.identity=identityOf(actor.entity);
-        api.call(gm("Entity","set_serverCreated","System.Boolean"),actor.entity,{&no});
-        api.call(gm("ObjectContainer","Register","Beyond.Gameplay.Core.Entity|System.UInt64"),container,{actor.entity,&actor.id});actor.registered=true;
-        actor.identity=identityOf(actor.entity);
-        bool async=true;api.call(gm("Entity","Init","System.Boolean"),actor.entity,{&async});
-        api.call(gm("Entity","TryStart"),actor.entity);
-        traceNative("actor.create.started");
-    }
-    void updateActors(Net& net,Session& link) {
-        const auto view=presentationView(net.snapshot(),link);
-        if((view.role!=Role::Host&&view.role!=Role::Client)||!link.ready()||!character||!link.localSceneOperational()) {if(!actors.empty())dropActors();return;}
-        const auto& snapshot=link.snapshot();
-        if(snapshot.value("map",std::string{})!=mapId||snapshot.value("level",std::string{})!=levelId) {dropActors();return;}
-        std::set<std::uint16_t> present;
-        for(auto& [peer,grant]:link.takeActorTeleports())actorTravelGrants[peer]=std::move(grant);
-        for(auto it=actorTravelGrants.begin();it!=actorTravelGrants.end();) {
-            if(it->second.value("epoch",std::uint64_t{})!=link.generation()||nowMs()-it->second.value("issued",std::uint64_t{})>5000)
-                it=actorTravelGrants.erase(it);else ++it;
-        }
-        for(const auto& peer:view.peers) {
-            if(peer.local||!peer.hasInfo||peer.info.mapId!=mapId||peer.info.levelId!=levelId||peer.states.empty()||
-               !(peer.states.back().state.flags&proto::StateValid)||nowMs()-peer.states.back().receivedMs>3000)continue;
-            const bool extra=peer.id>=0x8000;
-            const auto id=extra?(0xEF20000000000000ull|(std::uint64_t(view.roomId)<<16)|peer.id):link.playerEntity(peer.id);if(!id)continue;
-            present.insert(peer.id);auto& actor=actors[peer.id];
-            auto growth=extra?extraMembers.at(peer.id).at("growth"):link.requestedGrowth(peer.id);
-            if(actor.id!=id||actor.model!=peer.info.modelPath||actor.epoch!=link.generation()||actor.growth!=growth||(extra&&actor.presentationLife!=extraMembers.at(peer.id).at("life").get<std::uint64_t>())) {
-                destroyActor(actor);actor=Actor{};actor.id=id;actor.peer=peer.id;actor.epoch=link.generation();actor.model=peer.info.modelPath;
-                actor.growth=std::move(growth);if(extra)actor.presentationLife=extraMembers.at(peer.id).at("life").get<std::uint64_t>();
-            }
-            auto& pose=peer.states.back().state;V3 position{pose.position[0],pose.position[1],pose.position[2]};
-            const auto authoritative=link.nativeState(peer.id);
-            if(view.role==Role::Client&&authoritative)position={float(authoritative->position[0]),float(authoritative->position[1]),float(authoritative->position[2])};
-            try {
-                if(!actor.entity) {
-                    if(nowMs()<actor.retry)continue;
-                    actor.retry=nowMs()+15000;
-                    auto spawnPosition=position;
-                    if(view.role==Role::Host) {const auto& p=snapshot.at("position");spawnPosition={p[0].get<float>(),p[1].get<float>(),p[2].get<float>()};}
-                    createActor(actor,spawnPosition,snapshot.value("level_num",0));
-                }
-                if(!currentActor(actor))throw std::runtime_error("原生角色已释放或分配给新的实体");
-                actor.inited=api.value<bool>(gm("Entity","get_hasInited","","System.Boolean"),actor.entity);
-                if(actor.inited&&!actor.started)api.call(gm("Entity","TryStart"),actor.entity);
-                actor.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),actor.entity);
-                if(!actor.started) {
-                    actor.error="等待原生角色组件启动";actor.waiting=nlohmann::json::array();
-                    auto* list=api.call(gm("Entity","DebugOnlyGetUnInitedComponents","","System.Collections.Generic.List<Beyond.Gameplay.Core.BaseComponent>"),actor.entity);
-                    if(list) {
-                        eflink::unity::Api::TemporaryRoot root(runtime,list);auto* countBox=collection(list,"get_Count");int count=0;
-                        if(countBox)std::memcpy(&count,runtime->object_unbox(runtime->context,countBox),sizeof count);
-                        for(int i=0;i<count&&i<32;++i) {auto* component=collection(list,"get_Item",{&i});if(component)actor.waiting.push_back(classOf(component));}
-                    }
-                    continue;
-                }
-                actor.waiting=nlohmann::json::array();
-                try {
-                    if(nowMs()>=actor.weaponRetry)applyActorAppearance(actor,extra?extraMembers.at(peer.id).at("appearance"):link.requestedAppearance(peer.id));
-                    if(auto* weapon=api.call(gm("Entity","get_weaponCom","","Beyond.Gameplay.View.WeaponComponent"),actor.entity))
-                        actor.weaponLoaded=readField<bool>(weapon,"WeaponComponent","m_weaponLoaded","Beyond.Gameplay.View");
-                    if(!extra)link.recordAppearance(peer.id,actor.id,actor.epoch,actor.appearance,actor.weaponError.empty()&&actor.weaponReloads&&
-                        !actor.appearance.is_null()&&actor.appearance.contains("weapon_template")&&(actor.weaponLoaded||actor.appearance.at("weapon_template")==0));
-                    if(actor.weaponLoaded&&(pose.flags&proto::StateWeaponValid)&&proto::weaponState(pose.flags)<=5&&actor.weaponState!=int(proto::weaponState(pose.flags))) {
-                        auto* weapon=api.call(gm("Entity","get_weaponCom","","Beyond.Gameplay.View.WeaponComponent"),actor.entity);
-                        int state=int(proto::weaponState(pose.flags)),priority=enumValue<int>("WeaponComponent/WeaponStatePriority","Perform","Beyond.Gameplay.View");bool immediate=true;
-                        api.call(gm("WeaponComponent","_ForceSetStateAll","Beyond.Gameplay.View.WeaponComponent.WeaponState|Beyond.Gameplay.View.WeaponComponent.WeaponStatePriority|System.Boolean","System.Int32","Beyond.Gameplay.View"),weapon,{&state,&priority,&immediate});
-                        actor.weaponState=state;
-                    }
-                }catch(const std::exception& e) {actor.weaponError=e.what();actor.weaponRetry=nowMs()+2000;}
-                auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),actor.entity);
-                auto* movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),actor.entity);
-                actor.movement=movement;
-                if(!ability||!movement) {actor.error="原生角色缺少能力或移动组件";continue;}
-                actor.hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
-                actor.maxHp=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
-                if(!std::isfinite(actor.hp)||!std::isfinite(actor.maxHp)||actor.maxHp<=0) {actor.error="原生角色属性未就绪";continue;}
-                if(!actor.hpInitialized) {
-                    bool skip=true;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&actor.maxHp,&skip});
-                    actor.hp=actor.maxHp;actor.hpInitialized=true;
-                }
-                if(!actor.aiPaused) {
-                    auto* ai=api.call(gm("Entity","get_charAICom","","Beyond.Gameplay.AI.CharacterAIComponent"),actor.entity);
-                    if(ai)api.call(gm("TickComponent","PauseTick"),ai);actor.aiPaused=true;
-                }
-                // Normal attacks do not necessarily set AbilitySystem.inSkill.
-                // Never teleport the caster back to a UDP pose during an actual
-                // Skill cast, or overwrite its native root motion/bone animation.
-                actor.casting=anySkillCasting(ability);
-                actor.abilityTicking=api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),ability);
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-                if(nowMs()-actor.lastDiagnostics>=1000) {actor.lastDiagnostics=nowMs();actor.movementDiagnostics=movementState(actor.entity);}
-#endif
-                // Each player owns their own body, as in an official co-op world:
-                // the actor follows that player's interpolated pose every frame
-                // (updateRemotes), so its animation and position match exactly.
-                // Steering it with CharacterController.MoveTo overshot and hunted
-                // around the target, making a standing guest jitter on the host.
-                // A travel grant needs no extra write; the guest's own pose arrives.
-                if(actorTravelGrants.erase(peer.id))++actor.teleports;
-                // Verify native lookup ownership instead of accepting a visible mesh.
-                auto* registered=api.call(gm("ObjectContainer","GetEntityById","System.UInt64","Beyond.Gameplay.Core.Entity"),staticObject("objectContainer"),{&actor.id});
-                if(registered!=actor.entity) {actor.error="原生角色未注册到实体容器";continue;}
-                if(!extra&&actor.catalog.empty())actor.catalog=skillCatalog(ability);
-                actor.skillCount=actor.catalog.size();
-                if(!extra&&view.role==Role::Host&&!actor.bound&&!actor.catalog.empty())actor.bound=link.bindPlayer(peer.id,actor.model,actor.catalog);
-                if(!extra&&view.role==Role::Host&&actor.bound) {
-                    if(auto confirmed=infoGrowth(actor.info,actor.model);!confirmed.is_null())link.recordGrowth(peer.id,actor.id,actor.epoch,confirmed);
-                    auto actual=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),actor.entity);
-                    link.observePlayer(peer.id,actor.id,actor.epoch,{{actual.x,actual.y,actual.z},actor.hp,actor.maxHp,api.value<bool>(entityAlive,actor.entity)});
-                }
-                actor.error.clear();
-            } catch(const std::exception& e) {auto error=std::string(e.what());destroyActor(actor);actor.error=error;actor.retry=nowMs()+15000;}
-        }
-        for(auto it=actors.begin();it!=actors.end();) {if(!present.contains(it->first)){destroyActor(it->second);it=actors.erase(it);}else ++it;}
-        if(view.role==Role::Host) {
-            auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);
-            if(ability) {
-                link.bindPlayer(view.localId,localModel,skillCatalog(ability));
-                if(auto growth=localGrowth();!growth.is_null())link.recordGrowth(view.localId,link.playerEntity(view.localId),link.generation(),growth);
-                auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
-                const auto hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability),max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
-                link.observePlayer(view.localId,link.playerEntity(view.localId),link.generation(),{{p.x,p.y,p.z},(std::max)(0.,hp),max,api.value<bool>(entityAlive,character)});
-            }
-        }
-    }
-    bool castNative(std::uint16_t peer,const std::string& key,const std::string& requested,bool diagnostic=false,bool moveOwned=false) {
-        auto actor=actors.find(peer);auto enemy=enemies.find(key);
-        if(actor==actors.end()||!actor->second.started||!actor->second.bound||!currentActor(actor->second)||
-           enemy==enemies.end()||!currentEnemy(enemy->second))throw std::runtime_error("原生施法角色或目标未就绪");
-        auto* caster=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),actor->second.entity);
-        auto* target=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),enemy->second.entity);
-        if(!caster||!target||!api.value<bool>(entityAlive,enemy->second.entity))throw std::runtime_error("原生施法目标无效");
-        void* skill=nullptr;
-        auto requestedId=requested;
-        if(requestedId.empty()&&diagnostic) {
-            auto* attacks=api.call(gm("AbilitySystem","get_curNormalAttackList","","System.Collections.Generic.List<System.String>"),caster);
-            if(attacks) {
-                eflink::unity::Api::TemporaryRoot attacksRoot(runtime,attacks);auto* countBox=collection(attacks,"get_Count");int count=0;
-                if(countBox)std::memcpy(&count,runtime->object_unbox(runtime->context,countBox),sizeof count);
-                if(count>0&&count<=64) {int first=0;requestedId=text(collection(attacks,"get_Item",{&first}));}
-            }
-        }
-        if(!requestedId.empty())api.value<bool>(gm("AbilitySystem","TryGetSkill","System.String|Beyond.Gameplay.Core.Skill&","System.Boolean"),caster,{api.string(requestedId),&skill});
-        if(!skill)throw std::runtime_error("原生技能不存在");
-        const auto id=text(api.call(gm("Skill","get_skillId","","System.String"),skill));
-        if(!skillCatalog(caster).contains(id))throw std::runtime_error("技能不在原生主动技能目录中");
-        const auto before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),target);
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-        if(diagnostic&&moveOwned) {
-            // Development-only test positioning affects our owned remote actor,
-            // never the host's operator or another module's entity.
-            auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),enemy->second.entity);p.z-=2;
-            auto* movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),actor->second.entity);
-            bool warning=false;api.call(gm("MovementComponent","TeleportTo","UnityEngine.Vector3|System.Boolean"),movement,{&p,&warning});
-        }
-#else
-        (void)moveOwned;
-#endif
-        // Let this actor's own native skill build an entity target. No client
-        // target pointer, damage amount, or host-character substitution is used.
-        float limit=120.f;auto* handle=api.call(gm("Skill","GetDefaultTarget","Beyond.Gameplay.Core.AbilitySystem|System.Single","Beyond.Gameplay.Core.TargetHandle"),skill,{target,&limit});
-        if(!handle)throw std::runtime_error("原生技能没有有效目标");
-        eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);
-        auto* view=runtime->object_new(runtime->context,api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* viewRaw=runtime->object_unbox(runtime->context,view);
-        api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});
-        if(!api.value<bool>(gm("TargetHandleView","Contains","Beyond.Gameplay.Core.AbilitySystem","System.Boolean"),viewRaw,{target}))
-            throw std::runtime_error("原生技能目标选择未包含房主实体");
-        bool no=false;
-        const bool can=api.value<bool>(gm("AbilitySystem","CanCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Boolean|System.Boolean|System.Boolean","System.Boolean"),caster,{api.string(id),viewRaw,&no,&no,&no});
-        auto cast=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(cast,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
-        auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);
-        const bool accepted=can&&api.value<bool>(cast,caster,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});
-        if(accepted){++nativeCasts;actor->second.casting=true;}else ++nativeCastRejected;
-        lastNativeCast={{"peer",peer},{"actor",actor->second.id},{"key",key},{"skill",id},{"diagnostic",diagnostic},
-            {"native_can_cast",can},{"native_accepted",accepted},{"target_hp_before",before},{"issued",nowMs()}};
-        return accepted;
-    }
     void observeNativeCast() {
         if(lastNativeCast.empty())return;
         auto enemy=enemies.find(lastNativeCast.value("key",std::string{}));if(enemy==enemies.end()||!currentEnemy(enemy->second))return;
@@ -1915,23 +1616,6 @@ public:
     void setGuestGates(bool ready,std::string error) {guestGatesReady=ready;guestGateError=std::move(error);}
     void setNativeEvidence(bool combatReady,bool isolationReady) {nativeCombatReady=combatReady;nativeIsolationReady=isolationReady;}
     void setWeaponLookupEvidence(bool ready) {nativeWeaponLookupReady=ready;}
-    void* roomCharacterInfo(std::uint64_t id) {
-        if(!session||!session->ready()||(id>>56)!=0xEF)return nullptr;
-        for(const auto& [peer,actor]:actors)if(actor.id==id&&(peer>=0x8000||actor.id==session->playerEntity(peer))&&actor.epoch==session->generation()&&actor.info&&currentActor(actor)) {++roomCharacterLookups;return actor.info;}
-        return nullptr;
-    }
-    bool roomWeaponModelPath(std::uint64_t id,void** output,bool& handled) {
-        auto* info=roomCharacterInfo(id);handled=info!=nullptr;
-        if(!handled||!output)return false;
-        *output=nullptr;
-        auto* weapon=readField<void*>(info,"ClientCharInfo","m_weaponData","Beyond.Gameplay");
-        if(!weapon)return false;
-        const auto name=text(readField<void*>(weapon,"InventorySystem/ItemInstData","templateId","Beyond.Gameplay"));
-        if(name.empty()||name.size()>120)return false;
-        bool overrideModel=false;
-        return api.value<bool>(gm("WeaponUtil","TryGetWeaponModelByTemplateId","System.String|System.Boolean|System.String&","System.Boolean","Beyond.Gameplay"),nullptr,
-            {api.string(name),&overrideModel,output});
-    }
     bool privateActionsRestricted(Net& net) const {
         if(!roomAdapterAvailable)return false;
         return restorationPending||(net.currentRole()==Role::Client&&session&&session->followHost)||home.has_value()||(travel&&travel->homeward);
@@ -2469,10 +2153,7 @@ public:
             nlohmann::json record={{"action",action},{"at",nowMs()},
                 {"command_id",command.value("command_id",std::string{})}};
             try {
-                if(action=="native_owner_probe")record["result"]=pinEnemyOwner(command);
-                else if(action=="native_travel_probe") {queueSelfTravel(command);record["result"]="queued";}
-                else if(action=="native_self_cast_probe")record["result"]=selfCast(command.value("automatic",false));
-                else if(action=="enemy_census")record["result"]=enemyCensus();
+                if(action=="enemy_census")record["result"]=enemyCensus();
                 else if(action=="meta_search")record["result"]=metadataIndex.search(command.at("method").get<std::string>(),command.value("class",std::string{}),(std::min)(std::size_t(400),command.value("limit",std::size_t(200))));
                 else if(action=="send_traces")record["result"]=resolveSendTraces();
                 else if(action=="teleport_marks")record["result"]=teleportMarks(command);
@@ -2576,86 +2257,9 @@ public:
     // Development only: this player's own operator casts its first normal
     // attack at the nearest room enemy, through the game's own cast path (the
     // same TryCastSkill a key press reaches). Exercises local hit resolution.
-    nlohmann::json selfCast(bool automatic=false) {
-        if(!character)throw std::runtime_error("当前角色未就绪");
-        auto* caster=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);
-        if(!caster)throw std::runtime_error("角色能力组件未就绪");
-        if(automatic) {
-            auto* battle=staticObject("battle");
-            auto* target=battle?api.call(gm("BattleManager","get_mainTarget","","Beyond.Gameplay.Core.AbilitySystem"),battle):nullptr;
-            auto* entity=target?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),target):nullptr;
-            std::string key;for(const auto& [id,e]:enemies)if(e.entity==entity&&currentEnemy(e)){key=id;break;}
-            const bool accepted=api.value<bool>(gm("AbilitySystem","TryCastNormalAttack","","System.Boolean"),caster);
-            return {{"automatic",true},{"accepted",accepted},{"target",key},{"private_target",privateEnemies.contains(entity)},
-                {"casting",anySkillCasting(caster)},
-                {"can_normal_attack",api.value<bool>(gm("AbilitySystem","CanCastNormalAttackAttack","","System.Boolean"),caster)},
-                {"normal_attack_cd",api.value<bool>(gm("AbilitySystem","CheckNormalAttackCd","","System.Boolean"),caster)}};
-        }
-        const auto here=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
-        std::string key;void* targetEntity=nullptr;double best=1e18;
-        for(const auto& [id,e]:enemies) {
-            if(!currentEnemy(e)||!roomEnemy(id)||!api.value<bool>(entityAlive,e.entity))continue;
-            const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
-            const double d=double(p.x-here.x)*(p.x-here.x)+double(p.y-here.y)*(p.y-here.y)+double(p.z-here.z)*(p.z-here.z);
-            if(d<best){best=d;key=id;targetEntity=e.entity;}
-        }
-        if(!targetEntity)throw std::runtime_error("附近没有房间敌人");
-        auto* target=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),targetEntity);
-        auto* attacks=api.call(gm("AbilitySystem","get_curNormalAttackList","","System.Collections.Generic.List<System.String>"),caster);
-        if(!attacks)throw std::runtime_error("没有普攻列表");
-        eflink::unity::Api::TemporaryRoot attacksRoot(runtime,attacks);int first=0;
-        const auto id=text(collection(attacks,"get_Item",{&first}));
-        void* skill=nullptr;api.value<bool>(gm("AbilitySystem","TryGetSkill","System.String|Beyond.Gameplay.Core.Skill&","System.Boolean"),caster,{api.string(id),&skill});
-        if(!skill)throw std::runtime_error("普攻技能不存在");
-        float limit=120.f;auto* handle=api.call(gm("Skill","GetDefaultTarget","Beyond.Gameplay.Core.AbilitySystem|System.Single","Beyond.Gameplay.Core.TargetHandle"),skill,{target,&limit});
-        auto* view=runtime->object_new(runtime->context,api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* viewRaw=runtime->object_unbox(runtime->context,view);
-        if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});}
-        auto castMethod=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(castMethod,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
-        auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
-        eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);bool no=false;
-        const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),target);
-        const bool accepted=api.value<bool>(castMethod,caster,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});
-        return {{"skill",id},{"key",key},{"distance",std::sqrt(best)},{"accepted",accepted},{"target_hp_before",before}};
-    }
     // Development only: move this player within the current level (test setup).
-    void queueSelfTravel(const nlohmann::json& command) {
-        if(!command.contains("position")||!validVector(command.at("position")))throw std::runtime_error("位置无效");
-        if(!character||mapId.empty())throw std::runtime_error("当前角色未就绪");
-        auto* info=staticObject("worldInfo");if(!info)throw std::runtime_error("世界未就绪");
-        const auto& p=command.at("position");
-        travel=Travel{mapId,levelId,{p[0].get<float>(),p[1].get<float>(),p[2].get<float>()},nowMs()+60000,false,api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)};
-        travelState="queued";
-    }
     // Development only: hand a room enemy to a player for 30 s (host).
-    nlohmann::json pinEnemyOwner(const nlohmann::json& command) {
-        const auto peer=command.at("peer").get<std::uint16_t>();std::string key=command.value("key",std::string{});
-        if(key.empty()) {
-            // Nearest live room enemy to that player.
-            void* body=peer==localPeer?character:nullptr;
-            if(auto actor=actors.find(peer);actor!=actors.end()&&currentActor(actor->second))body=actor->second.entity;
-            if(!body)throw std::runtime_error("该玩家没有原生角色");
-            const auto from=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),body);double best=1e18;
-            for(const auto& [id,e]:enemies) {
-                if(!currentEnemy(e)||!roomEnemy(id)||!api.value<bool>(entityAlive,e.entity))continue;
-                const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),e.entity);
-                const double d=double(p.x-from.x)*(p.x-from.x)+double(p.y-from.y)*(p.y-from.y)+double(p.z-from.z)*(p.z-from.z);
-                if(d<best){best=d;key=id;}
-            }
-            if(key.empty())throw std::runtime_error("附近没有房间敌人");
-            ownerPins[key]={peer,nowMs()+30000};return {{"key",key},{"distance",std::sqrt(best)}};
-        }
-        ownerPins[key]={peer,nowMs()+30000};return {{"key",key}};
-    }
-    void queueNativeCast(nlohmann::json command) {
-        throw std::runtime_error("统一原生执行适配器尚未验收，旧技能执行入口已停用");
-        if(diagnosticCast)throw std::runtime_error("原生诊断正在排队");
-        if(!command.contains("peer")||!command.at("peer").is_number_unsigned()||!command.contains("key")||
-           !command.at("key").is_string()||command.at("key").get<std::string>().size()>128||command.value("skill",std::string{}).size()>128)
-            throw std::runtime_error("原生技能诊断参数无效");
-        diagnosticCast=std::move(command);
-    }
+    void queueNativeCast(nlohmann::json) {throw std::runtime_error("统一原生执行适配器尚未验收，旧技能执行入口已删除");}
 #endif
     bool showRemote=true,showMarkers=true;
     // Called only from the game's native damage detour, under the world mutex.
