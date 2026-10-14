@@ -69,6 +69,16 @@ int main() {
         const auto prior=graph.baseline();auto forged=graph.baseline();
         forged["objects"][0]["relations"]["parent"]={{"id",9999},{"life",1}};
         check(!joined.baseline(forged,scene(),true),"baseline cannot introduce an unresolved provenance reference");
+        auto changedOrigin=graph.baseline();changedOrigin["revision"]=joined.version()+1;
+        Json altered;
+        for(auto& object:changedOrigin["objects"])if(object["kind"]=="skill") {
+            object["version"]=object["version"].get<std::uint64_t>()+1;object["relations"]["origin"]=originalCaster.json();altered=object;
+        }
+        check(!joined.baseline(changedOrigin,scene(),true),"higher baseline version cannot change a native instance's origin");
+        Replica originReplica;originReplica.baseline(graph.baseline(),scene(),true);
+        Json originDelta={{"scope",scene().json()},{"base",originReplica.version()},{"revision",originReplica.version()+1},
+            {"events",Json::array({{{"scope",scene().json()},{"revision",originReplica.version()+1},{"type","upsert"},{"object",altered},{"receipt",nullptr}}})}};
+        check(!originReplica.delta(originDelta,true)&&originReplica.needsBaseline(),"delta cannot disguise a different origin as the next state version");
         auto cyclic=nativeFrame;cyclic["skill"][0].relations["parent"]={"effect","beam",40,1};
         check(throws([&]{graph.observeFrame(cyclic);})&&graph.baseline()==prior,"cyclic native parentage rejects the whole frame atomically");
         auto wrongCaster=nativeFrame;wrongCaster["skill"][0].relations["caster"]={"effect","beam",40,1};
@@ -78,13 +88,22 @@ int main() {
             "recycling a caster cannot silently attach its old skill graph to the new allocation");
         auto rebound=nativeFrame;rebound["player"]={caster};rebound["skill"][0].relations["caster"].cookie=11;
         rebound["projectile"][0].relations["caster"].cookie=11;
+        check(throws([&]{graph.observeFrame(rebound);})&&graph.baseline()==prior,
+            "one cast instance cannot switch to a recycled caster even inside an otherwise complete native frame");
+        rebound["skill"][0].nativeLife=2;rebound["projectile"][0].nativeLife=2;
+        rebound["projectile"][0].relations["parent"].nativeLife=2;rebound["effect"][0].relations["parent"].nativeLife=2;
         const auto oldRevision=joined.version();graph.observeFrame(rebound);
-        check(graph.find("player","caster")->ref!=originalCaster&&graph.find("skill","cast")->ref==originalCast&&
-              graph.find("skill","cast")->version==2,"native relation changes advance versions without inventing child lifetimes");
+        check(graph.find("player","caster")->ref!=originalCaster&&graph.find("skill","cast")->ref!=originalCast&&
+              graph.find("effect","beam")->version==2,"observed new caster and cast lifetimes replace provenance while reparenting only advances state");
         check(joined.delta(*graph.changesSince(oldRevision),true)&&joined.snapshot()==graph.baseline()["objects"],
             "one complete delta atomically retires the old caster and updates all native relations");
         const auto retained=graph.baseline();
         check(throws([&]{graph.observe("skill",{});})&&graph.baseline()==retained,"partial teardown cannot strand live native descendants");
+        auto retarget=rebound;retarget["skill"][0].relations["target"]={"player","caster",11,1};graph.observeFrame(retarget);
+        auto retargetAgain=retarget;retargetAgain["skill"][0].relations["target"]={"projectile","bolt",30,2};
+        const auto sameCast=graph.find("skill","cast")->ref;graph.observeFrame(retargetAgain);
+        check(graph.find("skill","cast")->ref==sameCast&&graph.find("skill","cast")->version==3,
+            "native retargeting advances the cast state without rebinding its immutable caster");
         graph.observeFrame({{"effect",{}},{"projectile",{}},{"skill",{}},{"player",{caster}}});
         check(graph.baseline()["objects"].size()==1,"shared teardown retires an entire native dependency subtree");
         auto oldDelta=graph.changesSince(joined.version());oldDelta->at("events").erase(oldDelta->at("events").begin());

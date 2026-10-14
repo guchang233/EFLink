@@ -256,3 +256,9 @@ Replica 在完整基线/增量结束后校验整个关系图，允许同一事�
 SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角色候选入口继续仅作只读核对。现有 ScopeName 为 Main/Blackbox/RpgDungeon/Training/WeekRaid，没有据此得到房间隔离证据；不会恢复已删除的背包查找替换或临时物品构造来绕过边界。未创建 NPC/角色，未发起采集，未宣称端到端成功。
 
 `.63` 完整构建、当前 15 组检查、源指纹及 ABI 通过，恢复包 SHA256 `4416722639465F19A2EE146EA0B7B49C45788C6C896298DF2634F18F8A9E059F`。生产执行、隔离/应用及恢复仍缺少实现和实际验收，持续目标未完成。
+
+## 同一实例不能换绑施法来源（.64）
+
+收紧 `.62` 中过宽的关系更新：caster/origin 是实例来源，同一 Ref 生命周期中不能以提高 version 或更换关系锚的方式改绑；必须由原生分配/明确 nativeLife 证明新实例。target/controller/parent 等实际状态变化仍可提高版本，不能强行造新身份。Host 的整帧和 Replica 的基线/增量均执行该约束，角色编号复用不能让旧技能或投射物转到新施法者。
+
+回归覆盖完整帧中换绑也拒绝、来源关系伪装成更高基线/增量版本拒绝、真实新原生生命周期替换、合法重定目标和父子关系更新。`.64` 完整构建、15 组检查、源指纹与 ABI 通过；恢复包 SHA256 `3F5668CFF839C381DFF75D80B34B2FC8863917D9FF4FD7A6BBADEF4B6624FAB7`。这只是统一约束修正，生产原生执行、隔离/应用与恢复尚缺，矿石真实双客户端端到端未完成，整体目标未完成。

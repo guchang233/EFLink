@@ -99,6 +99,10 @@ inline bool validRelations(const Json& value) {
         return true;
     }catch(...) {return false;}
 }
+inline bool sameProvenance(const Json& a,const Json& b) {
+    for(const char* name:{"caster","origin"})if(a.value(name,Json{})!=b.value(name,Json{}))return false;
+    return true;
+}
 // Private native anchors, resolved only after all kinds in a frame have been
 // enumerated. Cookies/lifecycle numbers never appear in public relations.
 struct NativeRelation {
@@ -377,7 +381,14 @@ public:
         for(auto& [key,o]:candidate) {
             auto old=objects.find(key);
             if(old==objects.end()||old->second.ref!=o.ref)events.emplace_back("upsert",o);
-            else if(o.state!=old->second.state||o.relations!=old->second.relations) {advance(o.version);events.emplace_back("upsert",o);}
+            else {
+                // Caster/origin describe the native instance's provenance.
+                // Retargeting/control/reparenting may change state, but a new
+                // caster requires an actually observed native lifecycle.
+                if(!sameProvenance(o.relations,old->second.relations))
+                    throw std::runtime_error("native provenance changed without a new lifecycle");
+                if(o.state!=old->second.state||o.relations!=old->second.relations) {advance(o.version);events.emplace_back("upsert",o);}
+            }
         }
         if(events.size()>UINT64_MAX-revision)throw std::runtime_error("authority revision exhausted");
         Json list=Json::array();for(const auto& [key,o]:candidate)list.push_back(o.json());
@@ -499,6 +510,7 @@ public:
                 for(const auto& [id,o]:candidate)if(auto it=objects.find(id);it!=objects.end()&&
                     (it->second.at("ref")!=o.at("ref")||it->second.at("kind")!=o.at("kind")||it->second.at("key")!=o.at("key")||
                      o.at("version").get<std::uint64_t>()<it->second.at("version").get<std::uint64_t>()||
+                     !sameProvenance(o.at("relations"),it->second.at("relations"))||
                      (o.at("version")==it->second.at("version")&&(o.at("state")!=it->second.at("state")||o.at("relations")!=it->second.at("relations")))))return false;
             }
             scope_=expected;objects=std::move(candidate);revision=next;missing=false;return true;
@@ -519,7 +531,8 @@ public:
                     if(prior==candidate.end()||prior->second.at("ref")!=ref.json()) {missing=true;return false;}candidate.erase(prior);
                 }else if(event.at("type")=="upsert") {
                     if(prior!=candidate.end()&&(prior->second.at("ref")!=ref.json()||prior->second.at("kind")!=o.at("kind")||prior->second.at("key")!=o.at("key")||
-                        prior->second.at("version").get<std::uint64_t>()==UINT64_MAX||o.at("version")!=prior->second.at("version").get<std::uint64_t>()+1)) {missing=true;return false;}
+                        prior->second.at("version").get<std::uint64_t>()==UINT64_MAX||o.at("version")!=prior->second.at("version").get<std::uint64_t>()+1||
+                        !sameProvenance(o.at("relations"),prior->second.at("relations")))) {missing=true;return false;}
                     if(prior==candidate.end()&&o.at("version")!=1) {missing=true;return false;}candidate[ref.id]=o;
                 }else if(event.at("type")=="receipt") {
                     // A correlated result already covered by a later native
