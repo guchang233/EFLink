@@ -292,7 +292,7 @@ public:
 #endif
 private:
     void replication(Net& net,Session& link) {
-        session=&link;link.update(net);link.setAuthority({});
+        session=&link;link.update(net);
         // Transport and read-only discovery remain available. No replica world,
         // native enemy creation, account-world withdrawal, shared teleport,
         // actor skill execution or local result projection is admitted here.
@@ -315,7 +315,6 @@ private:
             const auto& st=p.states.back().state;
             if(p.info.mapId!=mapId||p.info.levelId!=levelId) {markers.push_back({{"id",p.id},{"name",p.info.name},{"other_map",true},{"map",p.info.mapId}});continue;}
             V3 position{st.position[0],st.position[1],st.position[2]};
-            if(session)if(auto state=session->nativeState(p.id);state)position={float(state->position[0]),float(state->position[1]),float(state->position[2])};
             float dx=position.x-own.x,dy=position.y-own.y,dz=position.z-own.z;position.y+=2.f;
             auto screen=api.value<V3>(m("Camera","WorldToScreenPoint","UnityEngine.Vector3","UnityEngine.Vector3"),camera,{&position});
             markers.push_back({{"id",p.id},{"name",p.info.name},{"host",p.host},{"other_map",false},

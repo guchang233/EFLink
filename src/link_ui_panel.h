@@ -159,8 +159,7 @@ struct UiPanel {
     std::string roomTitle() const {const auto text=uid::stringAt(roomInfo(),"name");return text.empty()?"未加入房间":text;}
     bool mapChangePending() const {return role()=="client"&&uid::boolAt(mapChange(),"pending",false);}
     bool hostSceneSupported() const {
-        for(const auto& blocker:uid::stringsAt(entry(),"blockers")) if(blocker=="host_scene_rules") return false;
-        return true;
+        return uid::boolAt(replication(),"scene_travel_supported",false);
     }
 
     // ---- chrome -----------------------------------------------------------

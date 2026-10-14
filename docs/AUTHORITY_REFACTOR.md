@@ -214,3 +214,13 @@
 同时删除用 dead/active/collected 布尔变化猜测新生命周期的规则。原生分配 cookie 或编译适配提供的明确 nativeLife 才可换公共身份；角色复活与机关启停保留身份和队伍归属。nativeLife 不能由 JSON 意图提供或在房间消息中泄露，旧生命周期回退拒绝整个枚举。新增原生状态翻译及跨类别生命周期回归。
 
 `.58` 完整构建、20 组检查、源指纹及 V1/V2 ABI 通过，恢复包 SHA256 `60347B0F91EEB502E0969642254E6D852920F4A9FB060F1077688F598CECD5D6`。这是生产读取/统一发布代码接入，尚未替换两端运行主模块或实机证明读取路径；更不代表原生执行、客机应用、账号隔离和恢复已经支持。新增 native_census 各种类诊断均显式 read_only=true、execution_supported=false、dual_client_verified=false。整体目标仍未完成。
+
+## 删除 Session 的并行准入与玩法协议（.59）
+
+生产 Session 重写，删除 Realm、RoomEntityLedger、RoomCastLedger、HitClaimLedger 实例，以及 AuthorityFacts/ReplicaFacts 布尔准入、旧角色绑定/数值观察、技能命令队列、命中声明队列、技能广播、直接传送授权和成长/外观确认入口。旧 entry_prepare/result、player_cast、skill_intent、hit_claim、enemy_state/cast、teleport 等协议在两端统一拒绝，不再存在第二套可形成世界操作的通道。历史类/实验源文件还有后续清理工作；本阶段不将其测试当成当前玩法能力。
+
+场景清单只含地图与只读连接成员，不能承载敌人 HP、施法结果、虚构原生角色编号或认证字段。原生对象只从统一基线/增量传输，操作只从 world_intent 进入已注册原生适配器。V2 入口保留但未验收传送明确失败，契约升为 revision 15。界面入场按钮的可用性改看实际 scene_travel_supported，缺少旧 blocker 不再默认支持。
+
+房间测试改为真实 localhost 传输验收只读清单、旧协议双向拒绝、伪造基线/认证、增量缺口、晚加入、同名地图重载、换图、版本冲突及离房引用清理；原生执行/结果证据的测试继续由独立 authority session fixture 覆盖。测试场景持续刷新原生账本，防止晚加入检查偶然依赖旧样本仍在租期内。完整 DLL 构建、20 组检查和 ABI 通过，修改后房间回归单独复编译通过；恢复包 SHA256 `E02B666A388F95B639409379E0DD844C67CBEDB0E69F85C2D2788A6EAF781C4E`。
+
+运行游戏仍 `.37`，未要求新攻击采样或用户操作。原生房主执行、房客隔离/应用及个人恢复仍缺少生产实现与实机验收，完整目标没有完成，full_sync_verified 继续 false。
