@@ -63,10 +63,13 @@ class Session {
     std::map<std::uint16_t,std::uint64_t> nativeMembers;Json nativeGrant;std::uint64_t nativeRequest=0;
     std::string worldIncarnation;
     std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0,authoritySeen=0;bool authoritySent=false;
+    std::uint64_t authoritySequence=0,receivedAuthoritySequence=0;
+    std::uint64_t authorityBaselines=0,authorityDeltas=0,authorityHeartbeats=0,authorityBytes=0;
     void resetSharedObjects() {
         nativeHandoff.withdraw();
         nativeMembers.clear();nativeGrant=nullptr;nativeRequest=0;
         nativeAuthority.reset();nativeReplica.reset();sentAuthorityRevision=lastAuthorityPublish=lastAuthorityBaseline=authoritySeen=0;authoritySent=false;
+        authoritySequence=receivedAuthoritySequence=0;
     }
     bool adapterReady() const {
         return nativeAdapter&&!adapterVersion.empty()&&nativeAdapter->gameVersion()==adapterVersion&&
@@ -163,13 +166,24 @@ public:
                 if(!validWorld(candidate,true)) {if(kind=="snapshot_delta") {baselineMissing=true;nativeHandoff.withdraw();}++rejected;continue;}
                 if(e!=epoch) {resetSharedObjects();presentations.clear();}
                 epoch=e;revision=r;world=std::move(candidate);seenAt=nowMs();baselineMissing=false;++received;
-            }else if(kind=="authority_baseline"||kind=="authority_delta") {
-                if(b.size()!=6||role!=Role::Client||packet.from!=proto::kHostId||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(proto::kHostId)||
+            }else if(kind=="authority_baseline"||kind=="authority_delta"||kind=="authority_heartbeat") {
+                if(b.size()!=7||role!=Role::Client||packet.from!=proto::kHostId||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(proto::kHostId)||
+                   !worldauthority::positive(b.at("seq"))||b.at("seq").get<std::uint64_t>()<=receivedAuthoritySequence||
                    b.at("map")!=world.at("map")||b.at("level")!=world.at("level")) {++rejected;continue;}
                 const worldauthority::Scope expected{room,worldIncarnation,epoch};
-                if(!expected.valid()||(kind=="authority_baseline"?!nativeReplica.baseline(b.at("baseline"),expected,true):
+                if(kind=="authority_heartbeat") {
+                    const auto& heartbeat=b.at("heartbeat");
+                    if(!expected.valid()||!worldauthority::exactFields(heartbeat,{"scope","revision"})||
+                       worldauthority::Scope::parse(heartbeat.at("scope"))!=expected||nativeReplica.scope()!=expected||
+                       !heartbeat.at("revision").is_number_unsigned()||nativeReplica.needsBaseline()) {++rejected;continue;}
+                    const auto reported=heartbeat.at("revision").get<std::uint64_t>();
+                    if(reported!=nativeReplica.version()) {
+                        if(reported>nativeReplica.version()) {nativeReplica.requireBaseline();nativeHandoff.withdraw();}
+                        ++rejected;continue;
+                    }
+                }else if(!expected.valid()||(kind=="authority_baseline"?!nativeReplica.baseline(b.at("baseline"),expected,true):
                     worldauthority::Scope::parse(b.at("delta").at("scope"))!=expected||!nativeReplica.delta(b.at("delta"),true))) {++rejected;continue;}
-                authoritySeen=nowMs();
+                receivedAuthoritySequence=b.at("seq").get<std::uint64_t>();authoritySeen=nowMs();
             }else if(kind=="authority_grant") {
                 if(b.size()!=4||role!=Role::Client||packet.from!=proto::kHostId||!protocolCompatible(proto::kHostId)||!ready()||!localSceneOperational()||!nativeAdapter) {++rejected;continue;}
                 const auto& grant=b.at("grant");
@@ -244,17 +258,21 @@ public:
     bool publishAuthority(Net& net,bool force=false) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return false;
         if(!force&&(nowMs()-lastAuthorityPublish<50||net.transmitPressure()>64u*1024))return false;
-        Json message={{"map",world.at("map")},{"level",world.at("level")}};
-        const auto baseline=nativeAuthority.baseline();const auto nativeRevision=baseline.at("revision").get<std::uint64_t>();
+        if(authoritySequence==UINT64_MAX) {nativeAuthority.suspend();error="authority packet sequence exhausted";return false;}
+        Json message={{"map",world.at("map")},{"level",world.at("level")},{"seq",++authoritySequence}};
+        const auto nativeRevision=nativeAuthority.version();
         bool full=force||!authoritySent||nowMs()-lastAuthorityBaseline>=1000;
-        auto delta=full?std::optional<Json>{}:nativeAuthority.changesSince(sentAuthorityRevision);
-        if(!delta)full=true;
-        if(full) {message["kind"]="authority_baseline";message["baseline"]=baseline;}
-        else {message["kind"]="authority_delta";message["delta"]=std::move(*delta);}
-        // An unchanged baseline is a heartbeat; an empty delta cannot revive a
-        // stale replica. Reliable critical events never use presentation coalescing.
-        if(!full&&nativeRevision==sentAuthorityRevision) {message.erase("delta");message["kind"]="authority_baseline";message["baseline"]=baseline;full=true;}
+        bool heartbeat=!full&&nativeRevision==sentAuthorityRevision;
+        if(heartbeat) {message["kind"]="authority_heartbeat";message["heartbeat"]={{"scope",nativeAuthority.scope().json()},{"revision",nativeRevision}};}
+        else {
+            auto delta=full?std::optional<Json>{}:nativeAuthority.changesSince(sentAuthorityRevision);
+            if(!delta)full=true;
+            if(full) {message["kind"]="authority_baseline";message["baseline"]=nativeAuthority.baseline();}
+            else {message["kind"]="authority_delta";message["delta"]=std::move(*delta);}
+        }
+        const auto bytes=message.dump().size();
         if(!send(net,std::move(message))) {nativeAuthority.suspend();return false;}
+        authorityBytes+=bytes;if(full)++authorityBaselines;else if(heartbeat)++authorityHeartbeats;else ++authorityDeltas;
         authoritySent=true;sentAuthorityRevision=nativeRevision;lastAuthorityPublish=nowMs();if(full)lastAuthorityBaseline=nowMs();return true;
     }
     Json sharedObjects() const {
@@ -392,6 +410,8 @@ public:
             {"hit_claims",{{"accepted",0},{"legacy_removed",true},{"legacy_packets_rejected",legacyRejected},{"native_verification_required",true}}},
             {"world_authority",{{"host",nativeAuthority.status()},{"observed",sharedObjects().size()},{"replica_revision",nativeReplica.version()},{"handoff",nativeHandoff.status()},
                 {"baseline_required",nativeReplica.needsBaseline()},{"age_ms",authoritySeen?nowMs()-authoritySeen:0},{"operation_adapter_verified",adapterReady()},
+                {"transport",{{"baselines_sent",authorityBaselines},{"deltas_sent",authorityDeltas},{"heartbeats_sent",authorityHeartbeats},
+                    {"bytes_sent",authorityBytes},{"last_sent_sequence",authoritySequence},{"last_received_sequence",receivedAuthoritySequence}}},
                 {"replica_adapter_verified",adapterReady()&&nativeAdapter->dualClientVerified()},{"full_sync_verified",false},{"account_risk",true}}},
             {"age_ms",seenAt?nowMs()-seenAt:0},{"snapshots_received",received},{"skill_intents_accepted",0},{"hits_accepted",0},{"rejected",rejected},{"entry",entryStatus()},{"error",error}};
     }

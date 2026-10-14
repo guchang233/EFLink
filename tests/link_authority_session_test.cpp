@@ -8,7 +8,7 @@ template<class F> static bool wait(F f) {for(int i=0;i<200;++i) {if(f())return t
 struct Fixture final:NativeAdapter {
     Session* session=nullptr;bool certified=true,saved=false,restoreReady=false,restoreStarted=false,acceptCast=false;
     Json lastInput;
-    std::uint64_t revision=0,event=0;unsigned begins=0,cancels=0;std::optional<Witness> result;
+    std::uint64_t revision=0,event=0;unsigned begins=0,cancels=0,applications=0;std::optional<Witness> result;
     std::string gameVersion() const override{return "fixture-game";}
     std::string path() const override{return "transport-fixture-only";}
     bool executionVerified() const override{return certified;}
@@ -29,7 +29,7 @@ struct Fixture final:NativeAdapter {
     bool personalRetained(std::uint64_t handle) const override{return saved&&handle==11;}
     bool beginShared(std::uint64_t,const Scope&) override{return true;}
     bool nativeInitialized(const Scope&) const override{return true;}
-    bool applyBaseline(const Scope&,std::uint64_t value,const Json&) override{revision=value;return true;}
+    bool applyBaseline(const Scope&,std::uint64_t value,const Json&) override{revision=value;++applications;return true;}
     bool baselineObserved(const Scope&,std::uint64_t value) const override{return revision==value;}
     bool beginRestore(std::uint64_t) override{restoreStarted=true;return true;}
     bool restoreObserved(std::uint64_t) const override{return restoreReady;}
@@ -122,6 +122,15 @@ int run() {
     check(!h.submitNativeIntent(host,hostActor,target,"mine",2,1)&&ha.begins==3,
           "host input closes immediately when native verification is withdrawn");
     ha.certified=true;
+    check(h.publishAuthority(host,true)&&wait([&]{tick();return g.sharedObjects()==h.sharedObjects()&&g.canAct(2)&&
+              g.status()["world_authority"]["replica_revision"]==h.authorityBaseline().at("revision");}),
+          "full authoritative state remains available alongside compact renewal");
+    const auto steady=h.status()["world_authority"]["transport"];
+    const auto applications=ga.applications;
+    check(wait([&]{tick();return h.status()["world_authority"]["transport"]["heartbeats_sent"].get<std::uint64_t>()>=
+                                steady["heartbeats_sent"].get<std::uint64_t>()+3;})&&
+          h.status()["world_authority"]["transport"]["baselines_sent"]==steady["baselines_sent"]&&ga.applications==applications&&g.canAct(2),
+          "unchanged native objects renew with compact heartbeats without resending or reapplying the entire baseline");
     graphEnabled=true;
     check(wait([&]{tick();return g.sharedObjects().size()==5&&g.sharedObjects()==h.sharedObjects();}),
         "caster, target and projectile parentage cross the same unified transport baseline and delta");

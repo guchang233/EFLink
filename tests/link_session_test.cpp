@@ -37,11 +37,35 @@ int run() {
     check(h.observeNativeObjects("mineral",{{"ore","mineral",nativeOre,55}})&&h.publishAuthority(host,true)&&
         wait([&]{tick();return g.sharedObjects()==h.sharedObjects();}),"native object facts use the common ledger without gameplay admission");
     const auto before=h.sharedObjects();
-    auto forged=Json{{"kind","authority_baseline"},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"map","map01"},{"level","level01"},{"baseline",h.authorityBaseline()}};
+    auto forged=Json{{"kind","authority_baseline"},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"map","map01"},{"level","level01"},
+        {"seq",h.status()["world_authority"]["transport"]["last_sent_sequence"].get<std::uint64_t>()+1},{"baseline",h.authorityBaseline()}};
     auto rejected=h.status()["rejected"].get<std::uint64_t>();raw(guest,forged,1);
     check(wait([&]{tick();return h.status()["rejected"].get<std::uint64_t>()>rejected;})&&h.sharedObjects()==before,"guest cannot submit world outcomes as a baseline");
     rejected=g.status()["rejected"].get<std::uint64_t>();forged["baseline"]["scope"]["epoch"]=h.generation()+1;raw(host,forged,2);
     check(wait([&]{tick();return g.status()["rejected"].get<std::uint64_t>()>rejected;})&&g.sharedObjects()==before,"another scene cannot overwrite current native objects");
+    censusEnabled=false;
+    Json heartbeat={{"kind","authority_heartbeat"},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"map","map01"},{"level","level01"},
+        {"seq",g.status()["world_authority"]["transport"]["last_received_sequence"]},
+        {"heartbeat",{{"scope",h.authorityBaseline().at("scope")},{"revision",g.status()["world_authority"]["replica_revision"]}}}};
+    rejected=g.status()["rejected"].get<std::uint64_t>();raw(host,heartbeat,2);
+    check(wait([&]{g.update(guest);return g.status()["rejected"].get<std::uint64_t>()>rejected;})&&g.sharedObjects()==before,
+        "replayed authority sequence cannot renew the guest lease");
+    heartbeat["seq"]=h.status()["world_authority"]["transport"]["last_sent_sequence"].get<std::uint64_t>()+1;
+    heartbeat["heartbeat"]["scope"]["epoch"]=h.generation()+1;
+    rejected=g.status()["rejected"].get<std::uint64_t>();raw(host,heartbeat,2);
+    check(wait([&]{g.update(guest);return g.status()["rejected"].get<std::uint64_t>()>rejected;})&&g.sharedObjects()==before,
+        "heartbeat from another scene cannot renew current objects or poison sequence tracking");
+    heartbeat["heartbeat"]["scope"]=h.authorityBaseline().at("scope");
+    heartbeat["heartbeat"]["revision"]=g.status()["world_authority"]["replica_revision"].get<std::uint64_t>()+1;
+    raw(host,heartbeat,2);
+    check(wait([&]{g.update(guest);return g.status()["world_authority"]["baseline_required"].get<bool>();})&&g.sharedObjects().empty(),
+        "heartbeat cannot manufacture a missing authoritative version");
+    heartbeat["heartbeat"]["revision"]=h.authorityBaseline().at("revision");
+    rejected=g.status()["rejected"].get<std::uint64_t>();raw(host,heartbeat,2);
+    check(wait([&]{g.update(guest);return g.status()["rejected"].get<std::uint64_t>()>rejected;})&&g.sharedObjects().empty(),
+        "a heartbeat cannot repair a missing baseline or reopen operations");
+    censusEnabled=true;check(h.publishAuthority(host,true)&&wait([&]{tick();return g.sharedObjects()==before;}),
+        "complete native baseline repairs a missing authoritative version");
     for(const char* kind:{"entry_prepare","entry_result","player_cast","skill_intent","hit_claim","hit","player_hit","enemy_state","enemy_cast","resource_baseline","character_growth","character_appearance","location","teleport_request","teleport","teleport_error"}) {
         const auto hr=h.status()["rejected"].get<std::uint64_t>(),gr=g.status()["rejected"].get<std::uint64_t>();
         Json packet={{"kind",kind},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"active",true},{"amount",999},{"epoch",h.generation()}};

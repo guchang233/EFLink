@@ -330,6 +330,7 @@ public:
         // Allocators survive room/scene resets, including reuse of a network ID.
     }
     const Scope& scope() const {return scope_;}
+    std::uint64_t version() const {return revision;}
     // Native adapters call this on the game thread at capture time. A delayed
     // callback may acknowledge its ticket, but cannot roll back a newer census.
     // This clock and native cookies are private and never accepted from JSON.
@@ -549,6 +550,7 @@ public:
         }catch(...) {missing=true;return false;}
     }
     bool needsBaseline() const {return missing;}
+    void requireBaseline() {missing=true;}
     std::uint64_t version() const {return revision;}
     Json snapshot() const {Json list=Json::array();if(!missing)for(const auto& [id,o]:objects)list.push_back(o);return list;}
 };

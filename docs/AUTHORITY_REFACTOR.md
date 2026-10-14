@@ -270,3 +270,11 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 真实 localhost 传输测试新增房主未授权、抢占房客角色、身份冒用、正常本地输入与 fixture Witness、重复请求及撤销认证的检查；完整 15 组检查、源指纹与 V1/V2 ABI 通过，恢复包 SHA256 `4E4C7BD052372001DBE61EF9871705E366BB829E8DD47B4CBE61D1C2899681B1`。Fixture 仍不编译进生产 DLL，该轮不是游戏端到端验证。
 
 只读核对 1.5.3 的 GameWorld 管理器字段为全局静态；GameplayManagerContext 是引擎更新/流式场景上下文，不是已经证明的第二个独立房间世界。SquadManager._CreateCharacter 调用 CharBagSystem.GetCharInfo，不能假定它接受任意房客角色或自动隔离账号。没有调用这些工厂，audit63 已再次停用。实际游戏执行、房客世界隔离、原生应用和恢复仍缺，完整目标继续有效。
+
+## 无变化状态的轻量续期（.66）
+
+修复统一对象状态没有变化时仍每 50 毫秒广播完整基线的问题。改为只携带 scope/revision 的可靠心跳；有变化发送统一增量，首次、强制、历史缺失及每秒恢复基线仍发送完整对象。心跳不枚举或重新序列化完整对象，也不重新调用客机原生应用。所有三类消息共用场景内单调 seq，重复/乱序序号拒绝；心跳只能续期已拥有相同 scope 和 revision 的完整基线，不能制造缺失版本。若房主心跳版本领先，客机立即关闭操作并要求完整基线。
+
+契约 revision 17，V1/V2 ABI 不变。真实 localhost 检查覆盖心跳续期、稳定状态不重复发送/应用、重复序号、跨场景、不完整版本、完整基线修复和晚加入。首轮新增夹具在房主结果收据尚未到达客机时就开始统计应用次数，导致失败；已修正等待实际 replica revision 与操作门禁，不改生产逻辑规避断言，原失败日志保留。完整构建与匹配源指纹的 15 组检查、ABI 最终通过；这是传输验证，尚没有实机延迟、丢包或长期运行验收。
+
+只读核对角色复制/好友角色工厂：CloneCharInfo 除 DeepClone 外还执行容器登记；好友工厂涉及 clientCharInfos/clientItemBundles。没有调用这些路径或把它们当成账号隔离。检查器已停用，未要求玩家反复攻击。恢复包 SHA256 `C55BBCCE33A19D56C35473395277158A0644B58B5612AACB04D0F34F352F55D4`。原生生产执行、隔离/应用/恢复及完整系统仍未完成，不发布可用联机的声明。
