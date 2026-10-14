@@ -6,6 +6,7 @@
 #include "unity_bridge.h"
 #include "authority/native_build_policy.h"
 #include "authority/native_resource_state.h"
+#include "authority/native_object_bindings.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_native_feed.h"
@@ -112,6 +113,7 @@ class World {
     std::map<std::uint16_t,Actor> actors;
     std::map<std::uint16_t,nlohmann::json> actorTravelGrants;
     Session* session=nullptr;
+    worldauthority::NativeObjectBindings nativeObjectBindings;
     bool nativeCombatReady=false,nativeIsolationReady=false;
     bool nativeWeaponLookupReady=false;
     std::uint64_t roomCharacterLookups=0;

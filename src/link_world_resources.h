@@ -3,17 +3,19 @@
     std::uint32_t resourceRoom=0;std::uint64_t resourceEpoch=0,lastResourceScan=0;
     nlohmann::json nativeResourceCensus=nlohmann::json::array();
     std::map<std::string,std::size_t> resourceNativeTypes;
-    std::string resourceError;std::uint64_t resourceScans=0,resourceUnknown=0,nextResourceCookie=0,lastResourceSuccess=0;
+    std::string resourceError;std::uint64_t resourceScans=0,resourceUnknown=0,lastResourceSuccess=0;
     struct NativeResource {void* object=nullptr;std::uint32_t root=0,component=0;std::uint64_t incarnation=0,natureId=0;
         NativeIdentity identity;std::string type,space,key;};
     std::map<std::string,NativeResource> nativeResources;
     void clearResources() {
+        nativeObjectBindings.retireKind("mineral");
         for(auto& [key,resource]:nativeResources)release(resource.root);
         nativeResources.clear();nativeResourceCensus=nlohmann::json::array();
         resourceRoom=0;resourceEpoch=lastResourceScan=lastResourceSuccess=0;
     }
     std::vector<worldauthority::Observation> sampleResources() {
         std::vector<worldauthority::Observation> result;
+        std::vector<worldauthority::NativeBindingInput> bindings;
         std::map<std::string,NativeResource> sampled;
         auto cleanup=[&] {for(auto& [key,value]:sampled)release(value.root);};
         try {
@@ -56,10 +58,10 @@
                 resourceTemplate=text(readField<void*>(object,type.c_str(),"m_doodadId",space.c_str()));
                 if(resourceTemplate.empty()){++resourceUnknown;continue;}
                 natureId=api.value<std::uint64_t>(gm(type.c_str(),"get_natureResourceId","","System.UInt64",space.c_str()),object);
-                auto old=nativeResources.find(key);
-                if(old!=nativeResources.end()&&old->second.object==object&&old->second.component==component&&
-                   old->second.natureId==natureId&&old->second.identity.matches(identity))incarnation=old->second.incarnation;
-                else {if(nextResourceCookie==UINT64_MAX)throw std::runtime_error("native mineral allocation cookie exhausted");incarnation=++nextResourceCookie;}
+                // Commit identity only after the entire census and its native
+                // state have passed validation. The allocator is shared by all
+                // world kinds; minerals do not maintain a parallel lifecycle.
+                incarnation=1; // provisional; never published before reconcile
                 const auto position=api.value<V3>(gm(type.c_str(),"get_natureResourcePosition","","UnityEngine.Vector3",space.c_str()),object);
                 const auto hp=readField<int>(object,type.c_str(),"m_hpRatio",space.c_str());
                 const auto max=enumValue<int>(type.c_str(),"MAX_HP_RATIO",space.c_str());
@@ -67,12 +69,20 @@
                 auto observation=worldauthority::mineralObservation({key,resourceTemplate,{position.x,position.y,position.z},incarnation,hp,
                     readField<int>(object,type.c_str(),"m_hpRatioRuntime",space.c_str()),max,collected});
                 if(sampled.contains(key))throw std::runtime_error("multiple native minerals share an identity");
-                const auto root=rootOf(object);if(!root)throw std::runtime_error("native mineral rooting failed");
-                sampled.emplace(key,NativeResource{object,root,component,incarnation,natureId,identity,type,space,key});
+                auto root=rootOf(object);if(!root)throw std::runtime_error("native mineral rooting failed");
+                try {sampled.emplace(key,NativeResource{object,root,component,incarnation,natureId,identity,type,space,key});}
+                catch(...) {release(root);throw;}
+                bindings.push_back({key,{reinterpret_cast<std::uintptr_t>(object),identity.instance,component,
+                    identity.generation,identity.server,natureId}});
                 result.push_back(std::move(observation));
                 if(result.size()>512)throw std::runtime_error("native mineral baseline exceeds capacity");
             }
             if(!complete)throw std::runtime_error("native resource census truncated; previous baseline retained");
+            nativeObjectBindings.reconcile("mineral",bindings);
+            for(auto& observation:result) {
+                const auto cookie=nativeObjectBindings.find("mineral",observation.key)->cookie;
+                observation.cookie=cookie;sampled.at(observation.key).incarnation=cookie;
+            }
             for(auto& [key,value]:nativeResources)release(value.root);
             nativeResources=std::move(sampled);return result;
         }catch(...) {cleanup();throw;}
