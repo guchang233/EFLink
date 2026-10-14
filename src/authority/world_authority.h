@@ -230,6 +230,7 @@ public:
     const Object* find(const std::string& kind,const std::string& key) const {auto it=objects.find(index(kind,key));return it==objects.end()?nullptr:&it->second;}
     Json baseline() const {
         Json list=Json::array();for(const auto& [key,o]:objects)list.push_back(o.json());
+        std::sort(list.begin(),list.end(),[](const Json& a,const Json& b){return a.at("ref").at("id").get<std::uint64_t>()<b.at("ref").at("id").get<std::uint64_t>();});
         return {{"scope",scope_.json()},{"revision",revision},{"objects",std::move(list)}};
     }
     // Complete enumeration for this kind only, transactionally validated. An
@@ -441,6 +442,11 @@ public:
     }
     bool admit(const Replica& replica,const std::string& gameVersion) {
         thread();
+        if(phase_==Phase::Shared) {
+            if(!verified(gameVersion)||gameVersion!=gameVersion_||replica.scope()!=scope_||replica.needsBaseline()||!adapter->nativeInitialized(scope_)) {withdraw();return false;}
+            if(replica.version()==appliedRevision)return true;
+            phase_=Phase::Loading;baselineSubmitted=false;
+        }
         if(phase_!=Phase::Loading||!verified(gameVersion)||gameVersion!=gameVersion_||replica.scope()!=scope_||replica.needsBaseline()||!adapter->nativeInitialized(scope_))return false;
         if(baselineSubmitted) {
             if(!adapter->baselineObserved(scope_,appliedRevision))return false;

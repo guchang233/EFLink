@@ -123,11 +123,17 @@ class Session {
     std::uint64_t presentationSequence=0,lastPresentation=0,presentationReceived=0,presentationSkipped=0,presentationRawBytes=0,presentationWireBytes=0,presentationPacked=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
     worldauthority::Host nativeAuthority;worldauthority::Replica nativeReplica;worldauthority::WorldHandoff nativeHandoff;
+    // Compiled game adapters register here on the game thread. RPC/configuration
+    // cannot supply an adapter, grant a party or assert native recovery.
+    worldauthority::NativeAdapter* nativeAdapter=nullptr;
+    std::map<std::uint16_t,std::uint64_t> nativeMembers;
+    Json nativeGrant;std::uint64_t nativeRequest=0;
     std::string worldIncarnation;
     std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0,authoritySeen=0;
     bool authoritySent=false;
     void resetSharedObjects() {
         nativeHandoff.withdraw(); // a retained personal snapshot must outlive room/scene ledger reset
+        nativeMembers.clear();nativeGrant=nullptr;nativeRequest=0;
         nativeAuthority.reset();nativeReplica.reset();sentAuthorityRevision=lastAuthorityPublish=lastAuthorityBaseline=authoritySeen=0;authoritySent=false;
     }
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
@@ -266,10 +272,25 @@ public:
                     if(!expected.valid()||(kind=="authority_baseline"?!nativeReplica.baseline(b.at("baseline"),expected,true):
                         worldauthority::Scope::parse(b.at("delta").at("scope"))!=expected||!nativeReplica.delta(b.at("delta"),true))) {++rejected;continue;}
                     authoritySeen=nowMs();
-                } else if(kind=="world_intent"||kind=="resource_baseline") {
-                    // No native execution adapter has passed isolation/recovery
-                    // acceptance. Legacy per-object authority is not negotiated.
-                    ++rejected;
+                } else if(kind=="authority_grant") {
+                    if(b.size()!=4||role!=Role::Client||packet.from!=proto::kHostId||!protocolCompatible(proto::kHostId)||
+                       !ready()||!localSceneOperational()||!nativeAdapter) {++rejected;continue;}
+                    const auto& grant=b.at("grant");
+                    if(!worldauthority::exactFields(grant,{"scope","member","actors"})||
+                       worldauthority::Scope::parse(grant.at("scope"))!=worldauthority::Scope{room,worldIncarnation,epoch}||
+                       !worldauthority::positive(grant.at("member"))||!grant.at("actors").is_array()||
+                       grant.at("actors").empty()||grant.at("actors").size()>4) {++rejected;continue;}
+                    std::set<std::pair<std::uint64_t,std::uint64_t>> actors;
+                    for(const auto& value:grant.at("actors")) {auto ref=worldauthority::Ref::parse(value);if(!actors.emplace(ref.id,ref.life).second)throw std::runtime_error("duplicate native party grant");}
+                    if(!nativeGrant.is_null()&&nativeGrant.at("scope")==grant.at("scope")&&nativeGrant.at("member")!=grant.at("member")) {++rejected;continue;}
+                    nativeGrant=grant;
+                } else if(kind=="world_intent") {
+                    if(b.size()!=4||role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||
+                       !protocolCompatible(packet.from)||!nativeAdapter||!nativeMembers.contains(packet.from)||
+                       !authoritySeen||nowMs()-authoritySeen>1500||!nativeAuthority.resume(*nativeAdapter)||
+                       !nativeAuthority.submit(b.at("intent"),packet.from,*nativeAdapter,nowMs()))++rejected;
+                } else if(kind=="resource_baseline") {
+                    ++rejected; // retired per-kind authority protocol
                 } else if(kind=="presentation") {
                     const auto owner=b.at("peer").get<std::uint16_t>();const auto* p=find(s,owner);
                     if(!ready()||!protocolCompatible(role==Role::Host?packet.from:proto::kHostId)||
@@ -429,6 +450,7 @@ public:
                 } else ++rejected;
             } catch(...) {++rejected;}
         }
+        updateNativeAuthority(net,s);
     }
     bool publish(Net& net,Json value,bool force=false) {
         if(role!=Role::Host||!localSceneReady||!validWorld(value)) return false;
@@ -519,7 +541,7 @@ public:
     }
     bool publishAuthority(Net& net,bool force=false) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return false;
-        if(!force&&(nowMs()-lastAuthorityPublish<250||net.transmitPressure()>64u*1024))return false;
+        if(!force&&(nowMs()-lastAuthorityPublish<50||net.transmitPressure()>64u*1024))return false;
         Json message={{"map",world.at("map")},{"level",world.at("level")}};
         const auto baseline=nativeAuthority.baseline();const auto nativeRevision=baseline.at("revision").get<std::uint64_t>();
         bool full=force||!authoritySent||nowMs()-lastAuthorityBaseline>=1000;
@@ -538,6 +560,68 @@ public:
         return role==Role::Host?nativeAuthority.baseline().at("objects"):nativeReplica.snapshot();
     }
     Json authorityBaseline() const {return nativeAuthority.baseline();}
+    std::uint64_t captureNativeResultStamp() {
+        if(role!=Role::Host)throw std::runtime_error("native result clock belongs to the host");
+        return nativeAuthority.captureNativeStamp();
+    }
+    // Adapter lifetime must exceed pending executions and retained personal
+    // recovery. Detachment cancels host tickets but never discards a snapshot.
+    void attachNativeAdapter(worldauthority::NativeAdapter* adapter) {
+        if(adapter==nativeAdapter)return;
+        if(nativeHandoff.recoveryRetained())throw std::runtime_error("native recovery must finish before replacing its adapter");
+        nativeAuthority.suspend();nativeMembers.clear();nativeGrant=nullptr;
+        nativeAdapter=adapter;
+    }
+    bool grantNativeParty(Net& net,std::uint16_t peer,std::uint64_t member,std::vector<worldauthority::Ref> actors) {
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
+           !authoritySeen||nowMs()-authoritySeen>1500||!protocolCompatible(peer)||
+           !nativeAuthority.resume(*nativeAdapter))return false;
+        if(auto old=nativeMembers.find(peer);old!=nativeMembers.end()) {
+            if(old->second!=member||!nativeAuthority.replaceActors(peer,member,actors))return false;
+        }else if(!nativeAuthority.bindGroup(peer,member,actors))return false;
+        Json refs=Json::array();for(const auto actor:actors)refs.push_back(actor.json());
+        Json grant={{"scope",nativeAuthority.scope().json()},{"member",member},{"actors",std::move(refs)}};
+        if(!send(net,{{"kind","authority_grant"},{"grant",std::move(grant)}},peer)) {nativeAuthority.revoke(peer);nativeMembers.erase(peer);return false;}
+        nativeMembers[peer]=member;return true;
+    }
+    bool submitNativeIntent(Net& net,worldauthority::Ref actor,worldauthority::Ref target,const std::string& operation,
+                            std::uint64_t action,std::uint64_t strike) {
+        const worldauthority::Scope scope{room,worldIncarnation,epoch};
+        if(role!=Role::Client||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
+           !protocolCompatible(proto::kHostId)||nativeGrant.is_null()||!nativeHandoff.roomOperationAllowed(scope)||
+           !authoritySeen||nowMs()-authoritySeen>1500||nativeReplica.needsBaseline()||nativeRequest==UINT64_MAX)return false;
+        if(nativeGrant.at("scope")!=scope.json()||std::find(nativeGrant.at("actors").begin(),nativeGrant.at("actors").end(),actor.json())==nativeGrant.at("actors").end())return false;
+        const auto objects=nativeReplica.snapshot();const Json* found=nullptr;bool actorLive=false;
+        for(const auto& object:objects) {
+            if(object.at("ref")==target.json())found=&object;
+            if(object.at("ref")==actor.json()&&object.at("kind")=="player"&&!object.at("state").value("dead",false)&&!object.at("state").value("downed",false))actorLive=true;
+        }
+        if(!found||!actorLive)return false;
+        worldauthority::Intent intent{scope,net.snapshot().localId,nativeGrant.at("member").get<std::uint64_t>(),++nativeRequest,
+            action,strike,found->at("version").get<std::uint64_t>(),actor,target,operation};
+        try {worldauthority::Intent::parse(intent.json());}catch(...) {return false;}
+        return send(net,{{"kind","world_intent"},{"intent",intent.json()}},proto::kHostId);
+    }
+private:
+    void updateNativeAuthority(Net& net,const Snapshot& s) {
+        const bool fresh=ready()&&localSceneOperational()&&followHost&&combat&&authoritySeen&&nowMs()-authoritySeen<=1500;
+        if(role==Role::Host) {
+            for(auto it=nativeMembers.begin();it!=nativeMembers.end();) {
+                if(!find(s,it->first)||!protocolCompatible(it->first)) {nativeAuthority.revoke(it->first);it=nativeMembers.erase(it);}else ++it;
+            }
+            if(!fresh||!nativeAdapter||!nativeAuthority.resume(*nativeAdapter)) {nativeAuthority.suspend();return;}
+            nativeAuthority.poll(nowMs());publishAuthority(net);
+        }else if(role==Role::Client) {
+            const worldauthority::Scope scope{room,worldIncarnation,epoch};
+            if(!fresh||!nativeAdapter||!protocolCompatible(proto::kHostId)||nativeReplica.needsBaseline())nativeHandoff.withdraw();
+            else {
+                if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Personal)nativeHandoff.begin(scope,*nativeAdapter,adapterVersion);
+                nativeHandoff.admit(nativeReplica,adapterVersion);
+            }
+            if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Restoring)nativeHandoff.restore();
+        }else {nativeHandoff.withdraw();if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Restoring)nativeHandoff.restore();}
+    }
+public:
     Json presentation(std::uint16_t peer) const {
         auto it=presentations.find(peer);
         if(it==presentations.end()||nowMs()-it->second.seen>500||it->second.data.value("epoch",std::uint64_t{})!=epoch)return Json{};
@@ -659,6 +743,7 @@ public:
     void setAdapterVersion(std::string version) {
         if(version.size()>64)version.clear();if(version==adapterVersion)return;
         adapterVersion=std::move(version);compatibility.clear();lastHello=0;admitted=false;
+        resetSharedObjects();if(role==Role::Host&&!world.empty())sceneResetPending=true;
         playerCasts.clear();castEvents.clear();hitClaimLedger.clear();
         for(auto& [id,entry]:entries)entry.active=false;
         commands.clear();hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();
