@@ -57,7 +57,8 @@ int run() {
         h.update(host);g.update(guest);h.publish(host,scene);
         if(h.ready()) {
             std::map<std::string,std::vector<Observation>> frame={
-                {"player",{{"guest-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},3}}},
+                {"player",{{"guest-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},3},
+                           {"host-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},7}}},
                 {"mineral",{{"ore","mineral",{{"template","ore"},{"hp_ratio",ha.begins?9000:10000},{"max_hp_ratio",10000},{"collected",false}},4}}}};
             if(graphEnabled) {
                 Observation cast{"native-cast","skill",{{"active",true}},5};cast.relations["caster"]={"player","guest-character",3,1};
@@ -70,13 +71,16 @@ int run() {
             h.publishAuthority(host);
         }
     };
-    const bool baselineReady=wait([&]{tick();return h.protocolCompatible(2)&&g.protocolCompatible(1)&&g.sharedObjects().size()==2;});
+    const bool baselineReady=wait([&]{tick();return h.protocolCompatible(2)&&g.protocolCompatible(1)&&g.sharedObjects().size()==3;});
     if(!baselineReady)std::cerr<<"baseline fixture diagnostic host_ready="<<h.ready()<<" guest_ready="<<g.ready()<<" host_protocol="<<h.protocolCompatible(2)<<" guest_protocol="<<g.protocolCompatible(1)<<" host_objects="<<h.sharedObjects().size()<<" guest_objects="<<g.sharedObjects().size()<<" guest_error="<<g.status().at("error")<<std::endl;
     check(baselineReady,"native object baseline crosses authenticated room transport");
-    Ref actor,target;
+    Ref actor,target,hostActor;
     const auto baseline=h.authorityBaseline();
     for(const auto& object:baseline.at("objects")) {
-        auto ref=Ref::parse(object.at("ref"));if(object.at("kind")=="player")actor=ref;else target=ref;
+        auto ref=Ref::parse(object.at("ref"));
+        if(object.at("key")=="guest-character")actor=ref;
+        else if(object.at("key")=="host-character")hostActor=ref;
+        else if(object.at("kind")=="mineral")target=ref;
     }
     check(!g.submitNativeIntent(guest,actor,target,"mine",1,1),"guest cannot submit before a host party grant");
     ha.certified=false;
@@ -103,9 +107,23 @@ int run() {
     check(!g.submitNativeIntent(guest,actor,target,"cast",2,1,{{"slot",2},{"phase","press"},{"damage",500}}),
         "guest input serialization rejects result fields before sending");
     check(g.submitNativeIntent(guest,actor,target,"cast",2,1,controls)&&
-          wait([&]{tick();return ha.begins==2&&ha.lastInput==controls;}),"typed native controls cross the actual authenticated transport");
+          wait([&]{tick();return ha.begins==2&&ha.lastInput==controls&&h.status()["world_authority"]["host"]["results_confirmed"]==2;}),
+          "typed native controls cross the actual authenticated transport");
+    check(!h.submitNativeIntent(host,hostActor,target,"mine",1,1),"host input cannot bypass native ownership admission");
+    check(!h.grantNativeParty(host,1,11,{actor}),"host cannot take over a character granted to the guest");
+    check(h.grantNativeParty(host,1,11,{hostActor})&&h.canAct(1),"native adapter admits the host party without sending itself a grant");
+    check(!h.submitNativeIntent(host,actor,target,"mine",1,1),"host local input cannot impersonate a guest character");
+    check(h.submitNativeIntent(host,hostActor,target,"mine",1,1)&&ha.begins==3&&
+          wait([&]{tick();return h.status()["world_authority"]["host"]["results_confirmed"]==3&&g.sharedObjects()==h.sharedObjects();}),
+          "host input executes through the same native ticket and observed-result path");
+    check(!h.submitNativeIntent(host,hostActor,target,"mine",1,1)&&ha.begins==3,
+          "host repeated input cannot bypass strike deduplication using a new request");
+    ha.certified=false;
+    check(!h.submitNativeIntent(host,hostActor,target,"mine",2,1)&&ha.begins==3,
+          "host input closes immediately when native verification is withdrawn");
+    ha.certified=true;
     graphEnabled=true;
-    check(wait([&]{tick();return g.sharedObjects().size()==4&&g.sharedObjects()==h.sharedObjects();}),
+    check(wait([&]{tick();return g.sharedObjects().size()==5&&g.sharedObjects()==h.sharedObjects();}),
         "caster, target and projectile parentage cross the same unified transport baseline and delta");
     g.setLocalSceneReady(false);g.update(guest);
     check(ga.saved&&ga.restoreStarted&&!g.submitNativeIntent(guest,actor,target,"mine",3,1),"loading closes intents and retains personal recovery until observed");

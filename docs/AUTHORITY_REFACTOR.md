@@ -262,3 +262,11 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 收紧 `.62` 中过宽的关系更新：caster/origin 是实例来源，同一 Ref 生命周期中不能以提高 version 或更换关系锚的方式改绑；必须由原生分配/明确 nativeLife 证明新实例。target/controller/parent 等实际状态变化仍可提高版本，不能强行造新身份。Host 的整帧和 Replica 的基线/增量均执行该约束，角色编号复用不能让旧技能或投射物转到新施法者。
 
 回归覆盖完整帧中换绑也拒绝、来源关系伪装成更高基线/增量版本拒绝、真实新原生生命周期替换、合法重定目标和父子关系更新。`.64` 完整构建、15 组检查、源指纹与 ABI 通过；恢复包 SHA256 `3F5668CFF839C381DFF75D80B34B2FC8863917D9FF4FD7A6BBADEF4B6624FAB7`。这只是统一约束修正，生产原生执行、隔离/应用与恢复尚缺，矿石真实双客户端端到端未完成，整体目标未完成。
+
+## 房主输入共用权威入口（.65）
+
+修复 Session 只接受房客输入、房主自身无法通过统一授权的问题。原生适配器可为房主授予实际已登记角色，不向自身发送授权消息；房主输入同样生成 Intent，并经过 Host.submit 的角色归属、场景、目标生命周期、类型化输入、请求/动作去重和原生 Witness 确认，不能直接跳到 begin 或改写结果。没有原生适配器/认证时仍关闭。加入当前角色所在地图/关卡与原生初始化、连接姿态新鲜度检查，处理消息前就拒绝离开该场景的成员，避免先执行再撤销。
+
+真实 localhost 传输测试新增房主未授权、抢占房客角色、身份冒用、正常本地输入与 fixture Witness、重复请求及撤销认证的检查；完整 15 组检查、源指纹与 V1/V2 ABI 通过，恢复包 SHA256 `4E4C7BD052372001DBE61EF9871705E366BB829E8DD47B4CBE61D1C2899681B1`。Fixture 仍不编译进生产 DLL，该轮不是游戏端到端验证。
+
+只读核对 1.5.3 的 GameWorld 管理器字段为全局静态；GameplayManagerContext 是引擎更新/流式场景上下文，不是已经证明的第二个独立房间世界。SquadManager._CreateCharacter 调用 CharBagSystem.GetCharInfo，不能假定它接受任意房客角色或自动隔离账号。没有调用这些工厂，audit63 已再次停用。实际游戏执行、房客世界隔离、原生应用和恢复仍缺，完整目标继续有效。

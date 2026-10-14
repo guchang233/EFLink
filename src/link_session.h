@@ -72,6 +72,12 @@ class Session {
         return nativeAdapter&&!adapterVersion.empty()&&nativeAdapter->gameVersion()==adapterVersion&&
             !nativeAdapter->path().empty()&&nativeAdapter->executionVerified()&&nativeAdapter->isolationVerified()&&nativeAdapter->recoveryVerified();
     }
+    bool nativeMemberPresent(const Snapshot& snapshot,std::uint16_t peer) const {
+        const auto* member=find(snapshot,peer);
+        if(!fresh(member)||member->info.mapId!=world.value("map",std::string{})||
+           member->info.levelId!=world.value("level",std::string{}))return false;
+        return peer==localPeer?role==Role::Host:protocolCompatible(peer);
+    }
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
         body["schema"]=coopWorldSchema;body["room"]=room;
         const auto plain=body.dump();const bool presentation=body.value("kind",Json{})=="presentation";
@@ -175,6 +181,7 @@ public:
                 nativeGrant=grant;
             }else if(kind=="world_intent") {
                 if(b.size()!=4||role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(packet.from)||!nativeAdapter||!nativeMembers.contains(packet.from)||
+                   !nativeMemberPresent(s,packet.from)||
                    !authoritySeen||nowMs()-authoritySeen>1500||!nativeAuthority.resume(*nativeAdapter)||!nativeAuthority.submit(b.at("intent"),packet.from,*nativeAdapter,nowMs()))++rejected;
             }else if(kind=="presentation") {
                 const auto owner=b.at("peer").get<std::uint16_t>();const auto* p=find(s,owner);
@@ -269,11 +276,14 @@ public:
     }
     bool grantNativeParty(Net& net,std::uint16_t peer,std::uint64_t member,std::vector<worldauthority::Ref> actors) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
-           !authoritySeen||nowMs()-authoritySeen>1500||!protocolCompatible(peer)||
+           !authoritySeen||nowMs()-authoritySeen>1500||!nativeMemberPresent(net.snapshot(),peer)||
            !nativeAuthority.resume(*nativeAdapter))return false;
         if(auto old=nativeMembers.find(peer);old!=nativeMembers.end()) {
             if(old->second!=member||!nativeAuthority.replaceActors(peer,member,actors))return false;
         }else if(!nativeAuthority.bindGroup(peer,member,actors))return false;
+        // Local ownership is granted by the native adapter, exactly as for a
+        // remote member. The host never sends itself a network authorization.
+        if(peer==localPeer) {nativeMembers[peer]=member;return true;}
         Json refs=Json::array();for(const auto actor:actors)refs.push_back(actor.json());
         Json grant={{"scope",nativeAuthority.scope().json()},{"member",member},{"actors",std::move(refs)}};
         if(!send(net,{{"kind","authority_grant"},{"grant",std::move(grant)}},peer)) {nativeAuthority.revoke(peer);nativeMembers.erase(peer);return false;}
@@ -282,6 +292,17 @@ public:
     bool submitNativeIntent(Net& net,worldauthority::Ref actor,worldauthority::Ref target,const std::string& operation,
                             std::uint64_t action,std::uint64_t strike,const Json& input=Json::object()) {
         const worldauthority::Scope scope{room,worldIncarnation,epoch};
+        if(role==Role::Host) {
+            if(!canAct(localPeer)||!nativeMemberPresent(net.snapshot(),localPeer)||nativeRequest==UINT64_MAX)return false;
+            const auto* object=nativeAuthority.find(target);
+            if(!object)return false;
+            worldauthority::Intent intent{scope,localPeer,nativeMembers.at(localPeer),++nativeRequest,
+                action,strike,object->version,actor,target,operation,input};
+            // No shortcut to begin(): the host's input uses the same authority
+            // validation, ownership, request/strike history and result witness.
+            return nativeAuthority.resume(*nativeAdapter)&&
+                nativeAuthority.submit(intent.json(),localPeer,*nativeAdapter,nowMs()).has_value();
+        }
         if(role!=Role::Client||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
            !protocolCompatible(proto::kHostId)||nativeGrant.is_null()||!nativeHandoff.roomOperationAllowed(scope)||
            !authoritySeen||nowMs()-authoritySeen>1500||nativeReplica.needsBaseline()||nativeRequest==UINT64_MAX)return false;
@@ -302,7 +323,7 @@ private:
         const bool fresh=ready()&&localSceneOperational()&&followHost&&combat&&authoritySeen&&nowMs()-authoritySeen<=1500;
         if(role==Role::Host) {
             for(auto it=nativeMembers.begin();it!=nativeMembers.end();) {
-                if(!find(s,it->first)||!protocolCompatible(it->first)) {nativeAuthority.revoke(it->first);it=nativeMembers.erase(it);}else ++it;
+                if(!nativeMemberPresent(s,it->first)) {nativeAuthority.revoke(it->first);it=nativeMembers.erase(it);}else ++it;
             }
             if(!fresh||!nativeAdapter||!nativeAuthority.resume(*nativeAdapter)) {nativeAuthority.suspend();return;}
             nativeAuthority.poll(nowMs());publishAuthority(net);
@@ -342,7 +363,7 @@ public:
         if(!ready()||publishBlocked||!localSceneReady||!followHost||!combat||!adapterReady()||!authoritySeen||nowMs()-authoritySeen>1500)return false;
         if(role==Role::Client)return (id==0||id==localPeer)&&protocolCompatible(proto::kHostId)&&!nativeGrant.is_null()&&!nativeReplica.needsBaseline()&&
             nativeHandoff.roomOperationAllowed({room,worldIncarnation,epoch});
-        return role==Role::Host&&nativeMembers.contains(id)&&protocolCompatible(id);
+        return role==Role::Host&&nativeMembers.contains(id)&&(id==localPeer||protocolCompatible(id));
     }
     Json entryStatus() const {
         const bool active=canAct(localPeer);
