@@ -3,6 +3,7 @@
 // operation, field write, input event or account/network request is performed.
 #include "../link_world.h"
 #include "../runtime_scope.h"
+#include "native_trace_window.h"
 #include "BetterEndfield/ThirdPartyModule.h"
 #include <atomic>
 #include <mutex>
@@ -16,7 +17,7 @@ BE_ThirdPartyHostV1 host{};
 std::mutex mutex;bool initialized=false,hooked=false;
 std::atomic<bool> requested=false;
 json captureResult;
-std::atomic<std::uint64_t> traceUntil{0};bool attackHooked=false,attackAttempted=false;std::uint64_t traceSequence=0;
+eflink::worldauthority::NativeTraceWindow traceWindow;bool attackHooked=false,attackAttempted=false;std::uint64_t traceSequence=0;
 json attackTrace=json::array();std::string observedVersion;std::atomic<std::uint64_t> traceFaults{0};
 BE_ResolvedMethodV1 attackMethod{};
 using Attack=void(__fastcall*)(void*,void*,void*);Attack nextAttack=nullptr;
@@ -38,11 +39,12 @@ json observeAttack(void* self,void* board) noexcept {
     catch(...) {++traceFaults;return nullptr;}
 }
 bool observing(void* self,void* info,const BE_ResolvedMethodV1& method) {
-    const auto until=traceUntil.load();return until&&eflink::nowMs()<until&&self&&(!info||info==method.method_info);
+    return traceWindow.active(eflink::nowMs())&&self&&(!info||info==method.method_info)&&
+        (!traceWindow.awaitingAttack()||&method==&attackMethod||&method==&receiveMethod);
 }
 void appendTrace(const char* phase,json before,json after) noexcept {
     try {
-        std::lock_guard lock(mutex);if(!initialized||!traceUntil.load())return;
+        std::lock_guard lock(mutex);if(!initialized||!traceWindow.active(eflink::nowMs()))return;
         attackTrace.push_back({{"phase",phase},{"sequence",++traceSequence},{"at",eflink::nowMs()},{"before",std::move(before)},{"after",std::move(after)}});
         if(attackTrace.size()>64)attackTrace.erase(attackTrace.begin());
     }catch(...) {++traceFaults;}
@@ -52,6 +54,7 @@ void __fastcall attack(void* self,void* board,void* info) {
     // mutates fields, invokes attacks or sends official/room network requests.
     const bool active=observing(self,info,attackMethod);
     json before;if(active)before=observeAttack(self,board);
+    if(active&&before.is_object()&&before.contains("key"))traceWindow.nativeAttack(eflink::nowMs());
     if(nextAttack)nextAttack(self,board,info);
     if(!active)return;
     auto after=observeAttack(self,nullptr);
@@ -59,6 +62,7 @@ void __fastcall attack(void* self,void* board,void* info) {
 }
 void __fastcall receive(void* self,void* board,void* state,void* info) {
     const bool active=observing(self,info,receiveMethod);json before;if(active)before=observeAttack(self,board);
+    if(active&&before.is_object()&&before.contains("key"))traceWindow.nativeAttack(eflink::nowMs());
     if(nextReceive)nextReceive(self,board,state,info);
     if(active)appendTrace("receive",std::move(before),observeAttack(self,nullptr));
 }
@@ -145,17 +149,18 @@ BE_Result BE_CALL message(const char* request,const char* body) {
         if(action=="capture") {install();captureResult=nullptr;requested=true;output={{"queued",true},{"gameplay_modified",false}};}
         else if(action=="trace") {
             const auto duration=command.value("duration_ms",600000u);if(duration<1000||duration>600000)throw std::runtime_error("trace duration outside limits");
-            installAttack();attackTrace=json::array();traceSequence=0;traceFaults=0;traceUntil=eflink::nowMs()+duration;
-            output={{"observing",true},{"duration_ms",duration},{"gameplay_modified",false},{"execution_adapter_verified",false}};}
-        else if(action=="stop_trace") {traceUntil=0;output={{"observing",false},{"gameplay_modified",false}};}
-        else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"observing",traceUntil.load()>eflink::nowMs()},
+            installAttack();attackTrace=json::array();traceSequence=0;traceFaults=0;
+            if(command.value("one_shot",false))traceWindow.singleAttack();else traceWindow.timed(eflink::nowMs(),duration);
+            output={{"observing",true},{"awaiting_attack",traceWindow.awaitingAttack()},{"duration_ms",duration},{"gameplay_modified",false},{"execution_adapter_verified",false}};}
+        else if(action=="stop_trace") {traceWindow.stop();output={{"observing",false},{"gameplay_modified",false}};}
+        else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"observing",traceWindow.active(eflink::nowMs())},{"awaiting_attack",traceWindow.awaitingAttack()},
             {"game_version",observedVersion},{"trace_faults",traceFaults.load()},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
         else throw std::runtime_error("unknown resource observer action");
     }catch(const std::exception& e){code=BE_Result_InvalidArgument;output={{"error",e.what()}};}
     const auto text=output.dump();return host.reply(host.context,request,code,text.c_str());
 }
 void BE_CALL stop() {
-    requested=false;traceUntil=0;
+    requested=false;traceWindow.stop();
     // Disable outside the inspector lock: a running tick may need that lock.
     if(host.hooks&&host.hooks->disable_module)host.hooks->disable_module(host.hooks->context,id);
     std::lock_guard lock(mutex);initialized=false;hooked=attackHooked=attackAttempted=false;captureResult=nullptr;attackTrace=json::array();

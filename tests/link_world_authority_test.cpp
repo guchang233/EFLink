@@ -1,6 +1,7 @@
 #include "authority/world_authority.h"
 #include "authority/native_build_policy.h"
 #include "authority/native_resource_state.h"
+#include "authority/native_trace_window.h"
 #include <atomic>
 #include <cstdio>
 using namespace eflink::worldauthority;
@@ -43,6 +44,15 @@ struct PerTicketFixture:Fixture {
     }
 };
 int main() {
+    NativeTraceWindow trace;
+    trace.singleAttack();check(trace.active(1000000)&&trace.awaitingAttack()&&!trace.collecting(1000000),
+        "single native capture waits for a delayed human operation without collecting idle state");
+    trace.nativeAttack(1000000);trace.nativeAttack(1002000);
+    check(trace.collecting(1002999)&&!trace.active(1003000),"following party hits cannot extend one-shot capture indefinitely");
+    trace.singleAttack();trace.stop();trace.nativeAttack(2000000);
+    check(!trace.active(2000000),"native callback after diagnostic stop cannot restart capture");
+    trace.timed(5,1000);trace.nativeAttack(200);
+    check(trace.active(1004)&&!trace.active(1005)&&!trace.awaitingAttack(),"timed capture preserves its original bound");
     MineralReading reading{"ore","quartz",{1,2,3},9,1490,1356,10000,false};
     const auto committed=mineralObservation(reading);
     check(committed.state["hp_ratio"]==1490&&!committed.state.contains("runtime_hp_ratio")&&mineralReadback(reading)["runtime_diverged"]==true,
