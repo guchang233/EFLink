@@ -230,6 +230,10 @@ public:
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
         nativeAuthority.observe(kind,values);authoritySeen=nowMs();return true;
     }
+    bool observeNativeFrame(const std::map<std::string,std::vector<worldauthority::Observation>>& frame) {
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
+        nativeAuthority.observeFrame(frame);authoritySeen=nowMs();return true;
+    }
     bool publishAuthority(Net& net,bool force=false) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return false;
         if(!force&&(nowMs()-lastAuthorityPublish<50||net.transmitPressure()>64u*1024))return false;

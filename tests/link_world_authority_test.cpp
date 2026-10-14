@@ -50,6 +50,48 @@ struct InputFixture:Fixture {
     bool begin(const Ticket& ticket) override {received=ticket.intent.input;return Fixture::begin(ticket);}
 };
 int main() {
+    {
+        Host graph;graph.reset(scene(),"fixture-only");
+        Observation caster{"caster","player",{{"active",true}},10};
+        Observation cast{"cast","skill",{{"active",true},{"phase","begin"}},20};
+        cast.relations["caster"]={"player","caster",10,1};
+        Observation projectile{"bolt","projectile",{{"active",true}},30};
+        projectile.relations["parent"]={"skill","cast",20,1};projectile.relations["caster"]={"player","caster",10,1};
+        Observation effect{"beam","effect",{{"active",true}},40};effect.relations["parent"]={"projectile","bolt",30,1};
+        const std::map<std::string,std::vector<Observation>> nativeFrame={{"effect",{effect}},{"player",{caster}},{"projectile",{projectile}},{"skill",{cast}}};
+        graph.observeFrame(nativeFrame);
+        const auto originalCaster=graph.find("player","caster")->ref,originalCast=graph.find("skill","cast")->ref;
+        check(graph.find("projectile","bolt")->relations["parent"]==originalCast.json()&&
+              graph.find("effect","beam")->relations["parent"]==graph.find("projectile","bolt")->ref.json(),
+            "one native frame resolves caster, cast, projectile and persistent effect across all kinds");
+        Replica joined;check(joined.baseline(graph.baseline(),scene(),true)&&joined.snapshot().size()==4,
+            "late join receives a complete typed dependency graph");
+        const auto prior=graph.baseline();auto forged=graph.baseline();
+        forged["objects"][0]["relations"]["parent"]={{"id",9999},{"life",1}};
+        check(!joined.baseline(forged,scene(),true),"baseline cannot introduce an unresolved provenance reference");
+        auto cyclic=nativeFrame;cyclic["skill"][0].relations["parent"]={"effect","beam",40,1};
+        check(throws([&]{graph.observeFrame(cyclic);})&&graph.baseline()==prior,"cyclic native parentage rejects the whole frame atomically");
+        auto wrongCaster=nativeFrame;wrongCaster["skill"][0].relations["caster"]={"effect","beam",40,1};
+        check(throws([&]{graph.observeFrame(wrongCaster);})&&graph.baseline()==prior,"a visual effect cannot masquerade as a native caster");
+        caster.cookie=11;
+        check(throws([&]{graph.observe("player",{caster});})&&graph.baseline()==prior,
+            "recycling a caster cannot silently attach its old skill graph to the new allocation");
+        auto rebound=nativeFrame;rebound["player"]={caster};rebound["skill"][0].relations["caster"].cookie=11;
+        rebound["projectile"][0].relations["caster"].cookie=11;
+        const auto oldRevision=joined.version();graph.observeFrame(rebound);
+        check(graph.find("player","caster")->ref!=originalCaster&&graph.find("skill","cast")->ref==originalCast&&
+              graph.find("skill","cast")->version==2,"native relation changes advance versions without inventing child lifetimes");
+        check(joined.delta(*graph.changesSince(oldRevision),true)&&joined.snapshot()==graph.baseline()["objects"],
+            "one complete delta atomically retires the old caster and updates all native relations");
+        const auto retained=graph.baseline();
+        check(throws([&]{graph.observe("skill",{});})&&graph.baseline()==retained,"partial teardown cannot strand live native descendants");
+        graph.observeFrame({{"effect",{}},{"projectile",{}},{"skill",{}},{"player",{caster}}});
+        check(graph.baseline()["objects"].size()==1,"shared teardown retires an entire native dependency subtree");
+        auto oldDelta=graph.changesSince(joined.version());oldDelta->at("events").erase(oldDelta->at("events").begin());
+        check(!joined.delta(*oldDelta,true)&&joined.needsBaseline(),"an incomplete dependency delta withdraws the whole replica graph");
+        check(graph.baseline().dump().find("cookie")==std::string::npos,"public graph references do not serialize native allocation anchors");
+        graph.reset();
+    }
     NativeBattleReading battle{"enemy","boss","enemy_template",9,{1,2,3},700,1000,25,100,true};
     auto battleFact=nativeBattleObservation(battle);
     check(battleFact.state["hp"]==700&&battleFact.state["poise"]==25&&battleFact.state["max_poise"]==100,

@@ -88,21 +88,65 @@ struct Ref {
         return {j.at("id").get<std::uint64_t>(),j.at("life").get<std::uint64_t>()};
     }
 };
+inline bool relationName(const std::string& name) {
+    static const std::set<std::string> names={"owner","caster","parent","target","controller","origin"};
+    return names.contains(name);
+}
+inline bool validRelations(const Json& value) {
+    try {
+        if(!value.is_object()||value.size()>6)return false;
+        for(auto it=value.begin();it!=value.end();++it) {if(!relationName(it.key()))return false;Ref::parse(it.value());}
+        return true;
+    }catch(...) {return false;}
+}
+// Private native anchors, resolved only after all kinds in a frame have been
+// enumerated. Cookies/lifecycle numbers never appear in public relations.
+struct NativeRelation {
+    std::string kind,key;std::uint64_t cookie=0,nativeLife=1;
+};
+using NativeRelations=std::map<std::string,NativeRelation>;
 struct Observation {
-    std::string key,kind;Json state;std::uint64_t cookie=0,nativeLife=1;
+    std::string key,kind;Json state;std::uint64_t cookie=0,nativeLife=1;NativeRelations relations;
 };
 struct Object {
     Ref ref;std::string key,kind;Json state;std::uint64_t cookie=0,version=0,nativeStamp=0,nativeLife=1;
-    Json json() const {return {{"ref",ref.json()},{"key",key},{"kind",kind},{"version",version},{"state",state}};}
+    NativeRelations nativeRelations;Json relations=Json::object();
+    Json json() const {return {{"ref",ref.json()},{"key",key},{"kind",kind},{"version",version},{"state",state},{"relations",relations}};}
     static bool validWire(const Json& j) {
         try {
             Ref::parse(j.at("ref"));
-            return exactFields(j,{"ref","key","kind","version","state"})&&positive(j.at("version"))&&j.at("key").is_string()&&
+            return exactFields(j,{"ref","key","kind","version","state","relations"})&&positive(j.at("version"))&&j.at("key").is_string()&&
                 !j.at("key").get_ref<const std::string&>().empty()&&j.at("key").get_ref<const std::string&>().size()<=160&&
-                knownKind(j.at("kind").get<std::string>())&&validState(j.at("state"));
+                knownKind(j.at("kind").get<std::string>())&&validState(j.at("state"))&&validRelations(j.at("relations"));
         }catch(...) {return false;}
     }
 };
+inline bool validGraph(const std::map<std::uint64_t,Json>& objects) {
+    try {
+        for(const auto& [id,object]:objects)for(auto it=object.at("relations").begin();it!=object.at("relations").end();++it) {
+            const auto ref=Ref::parse(it.value());auto target=objects.find(ref.id);
+            if(target==objects.end()||target->second.at("ref")!=ref.json()||(it.key()=="parent"&&ref.id==id))return false;
+            if(it.key()=="caster") {
+                const auto kind=target->second.at("kind").get<std::string>();
+                if(kind!="player"&&kind!="enemy"&&kind!="summon")return false;
+            }
+        }
+        // Parentage is a forest. Iterative traversal avoids stack exhaustion
+        // from a hostile or malformed baseline with a long dependency chain.
+        std::set<std::uint64_t> finished;
+        for(const auto& [id,object]:objects) {
+            std::set<std::uint64_t> active;auto cursor=id;
+            while(!finished.contains(cursor)) {
+                if(!active.insert(cursor).second)return false;
+                const auto& links=objects.at(cursor).at("relations");
+                if(!links.contains("parent"))break;
+                cursor=Ref::parse(links.at("parent")).id;
+            }
+            finished.insert(active.begin(),active.end());
+        }
+        return true;
+    }catch(...) {return false;}
+}
 struct Intent {
     Scope scope;std::uint16_t peer=0;std::uint64_t member=0,request=0,action=0,strike=0,expectedVersion=0;
     Ref actor,target;std::string operation;Json input=Json::object();
@@ -293,35 +337,55 @@ public:
         std::sort(list.begin(),list.end(),[](const Json& a,const Json& b){return a.at("ref").at("id").get<std::uint64_t>()<b.at("ref").at("id").get<std::uint64_t>();});
         return {{"scope",scope_.json()},{"revision",revision},{"objects",std::move(list)}};
     }
-    // Complete enumeration for this kind only, transactionally validated. An
-    // incomplete adapter scan must never call this with a partial collection.
-    void observe(const std::string& kind,const std::vector<Observation>& observations) {
-        thread();if(!scope_.valid()||!knownKind(kind)||observations.size()>maxObjects)throw std::runtime_error("unavailable native census");
-        const auto stamp=captureNativeStamp();
-        auto candidate=objects;auto id=nextObject,life=nextLife;std::set<std::string> seen;std::vector<std::pair<std::string,Object>> events;
-        for(const auto& v:observations) {
-            if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!v.nativeLife||!validState(v.state)||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
-            const auto key=index(kind,v.key);auto it=candidate.find(key);
-            // Revive, opening a mechanism and reactivating an effect are state
-            // changes. Only the native allocation/lifecycle observer can issue
-            // a new lifetime; gameplay booleans cannot fabricate a respawn.
-            if(it!=candidate.end()&&it->second.cookie==v.cookie&&v.nativeLife<it->second.nativeLife)
-                throw std::runtime_error("native lifecycle observation regressed");
-            if(it==candidate.end()||it->second.cookie!=v.cookie||it->second.nativeLife!=v.nativeLife) {
-                if(it!=candidate.end())events.emplace_back("retire",it->second);
-                advance(id);advance(life);Object object{{id,life},v.key,kind,v.state,v.cookie,1,stamp,v.nativeLife};candidate[key]=object;events.emplace_back("upsert",object);
-            }else {
-                it->second.nativeStamp=stamp;
-                if(it->second.state!=v.state) {advance(it->second.version);it->second.state=v.state;events.emplace_back("upsert",it->second);}
+    // Complete censuses for the named kinds, committed as ONE native frame.
+    // Unmentioned kinds are retained. Dependencies must resolve to actual live
+    // allocations in the candidate graph, never guessed native/entity numbers.
+    void observeFrame(const std::map<std::string,std::vector<Observation>>& frame) {
+        thread();if(!scope_.valid()||frame.empty()||frame.size()>11)throw std::runtime_error("unavailable native frame");
+        const auto stamp=captureNativeStamp();auto candidate=objects;auto id=nextObject,life=nextLife;
+        for(const auto& [kind,observations]:frame) {
+            if(!knownKind(kind)||observations.size()>maxObjects)throw std::runtime_error("unavailable native census");
+            std::set<std::string> seen;
+            for(const auto& v:observations) {
+                if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!v.nativeLife||!validState(v.state)||
+                   v.relations.size()>6||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
+                for(const auto& [name,target]:v.relations)if(!relationName(name)||!knownKind(target.kind)||target.key.empty()||target.key.size()>160||!target.cookie||!target.nativeLife)
+                    throw std::runtime_error("invalid native relation anchor");
+                const auto key=index(kind,v.key);auto it=candidate.find(key);
+                if(it!=candidate.end()&&it->second.cookie==v.cookie&&v.nativeLife<it->second.nativeLife)throw std::runtime_error("native lifecycle observation regressed");
+                if(it==candidate.end()||it->second.cookie!=v.cookie||it->second.nativeLife!=v.nativeLife) {
+                    advance(id);advance(life);candidate[key]=Object{{id,life},v.key,kind,v.state,v.cookie,1,stamp,v.nativeLife,v.relations};
+                }else {it->second.nativeStamp=stamp;it->second.state=v.state;it->second.nativeRelations=v.relations;}
             }
+            for(auto it=candidate.begin();it!=candidate.end();)if(it->second.kind==kind&&!seen.contains(it->first))it=candidate.erase(it);else ++it;
         }
-        for(auto it=candidate.begin();it!=candidate.end();)if(it->second.kind==kind&&!seen.contains(it->first)) {events.emplace_back("retire",it->second);it=candidate.erase(it);}else ++it;
-        if(candidate.size()>maxObjects||events.size()>UINT64_MAX-revision)throw std::runtime_error("authority capacity exhausted");
+        if(candidate.size()>maxObjects)throw std::runtime_error("authority capacity exhausted");
+        std::map<std::uint64_t,Json> graph;
+        for(auto& [key,o]:candidate) {
+            o.relations=Json::object();
+            for(const auto& [name,target]:o.nativeRelations) {
+                auto resolved=candidate.find(index(target.kind,target.key));
+                if(resolved==candidate.end()||resolved->second.cookie!=target.cookie||resolved->second.nativeLife!=target.nativeLife)
+                    throw std::runtime_error("native provenance target is unavailable or recycled; whole frame retained");
+                o.relations[name]=resolved->second.ref.json();
+            }
+            graph.emplace(o.ref.id,o.json());
+        }
+        if(!validGraph(graph))throw std::runtime_error("invalid native dependency graph");
+        std::vector<std::pair<std::string,Object>> events;
+        for(const auto& [key,o]:objects) {auto next=candidate.find(key);if(next==candidate.end()||next->second.ref!=o.ref)events.emplace_back("retire",o);}
+        for(auto& [key,o]:candidate) {
+            auto old=objects.find(key);
+            if(old==objects.end()||old->second.ref!=o.ref)events.emplace_back("upsert",o);
+            else if(o.state!=old->second.state||o.relations!=old->second.relations) {advance(o.version);events.emplace_back("upsert",o);}
+        }
+        if(events.size()>UINT64_MAX-revision)throw std::runtime_error("authority revision exhausted");
         Json list=Json::array();for(const auto& [key,o]:candidate)list.push_back(o.json());
         if(list.dump().size()>maxWire-512)throw std::runtime_error("native baseline exceeds transport budget");
-        objects=std::move(candidate);nextObject=id;nextLife=life;for(const auto& [type,o]:events)record(type,o);
-        invalidatePending();
+        objects=std::move(candidate);nextObject=id;nextLife=life;
+        for(const auto& [type,o]:events)record(type,o);invalidatePending();
     }
+    void observe(const std::string& kind,const std::vector<Observation>& observations) {observeFrame({{kind,observations}});}
     bool bind(std::uint16_t peer,std::uint64_t incarnation,Ref actor) {
         return bindGroup(peer,incarnation,{actor});
     }
@@ -429,12 +493,13 @@ public:
             std::map<std::uint64_t,Json> candidate;std::set<std::pair<std::string,std::string>> keys;
             for(const auto& o:packet.at("objects"))if(!Object::validWire(o)||!candidate.emplace(o.at("ref").at("id").get<std::uint64_t>(),o).second||
                 !keys.emplace(o.at("kind").get<std::string>(),o.at("key").get<std::string>()).second)return false;
+            if(!validGraph(candidate))return false;
             if(scope_==expected) {
                 if(next==revision&&candidate!=objects)return false;
                 for(const auto& [id,o]:candidate)if(auto it=objects.find(id);it!=objects.end()&&
                     (it->second.at("ref")!=o.at("ref")||it->second.at("kind")!=o.at("kind")||it->second.at("key")!=o.at("key")||
                      o.at("version").get<std::uint64_t>()<it->second.at("version").get<std::uint64_t>()||
-                     (o.at("version")==it->second.at("version")&&o.at("state")!=it->second.at("state"))))return false;
+                     (o.at("version")==it->second.at("version")&&(o.at("state")!=it->second.at("state")||o.at("relations")!=it->second.at("relations")))))return false;
             }
             scope_=expected;objects=std::move(candidate);revision=next;missing=false;return true;
         }catch(...) {return false;}
@@ -465,6 +530,7 @@ public:
             if(next!=end||candidate.size()>Host::maxObjects) {missing=true;return false;}
             std::set<std::pair<std::string,std::string>> keys;
             Json all=Json::array();for(const auto& [id,o]:candidate) {if(!keys.emplace(o.at("kind").get<std::string>(),o.at("key").get<std::string>()).second){missing=true;return false;}all.push_back(o);}
+            if(!validGraph(candidate)) {missing=true;return false;}
             if(all.dump().size()>Host::maxWire-512) {missing=true;return false;}
             objects=std::move(candidate);revision=end;return true;
         }catch(...) {missing=true;return false;}

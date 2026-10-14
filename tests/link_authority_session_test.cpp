@@ -51,12 +51,22 @@ int run() {
     HostOptions options;options.port=48841;host.host(options);
     check(wait([&]{return host.currentRole()==Role::Host;}),"authority host starts");
     guest.join("127.0.0.1:48841","");check(wait([&]{return guest.currentRole()==Role::Client;}),"authority guest joins");
+    bool graphEnabled=false;
     auto tick=[&] {
         pose.timeMs=std::uint32_t(nowMs());host.setLocalState(pose);guest.setLocalState(pose);
         h.update(host);g.update(guest);h.publish(host,scene);
         if(h.ready()) {
-            h.observeNativeObjects("player",{{"guest-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},3}});
-            h.observeNativeObjects("mineral",{{"ore","mineral",{{"template","ore"},{"hp_ratio",ha.begins?9000:10000},{"max_hp_ratio",10000},{"collected",false}},4}});
+            std::map<std::string,std::vector<Observation>> frame={
+                {"player",{{"guest-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},3}}},
+                {"mineral",{{"ore","mineral",{{"template","ore"},{"hp_ratio",ha.begins?9000:10000},{"max_hp_ratio",10000},{"collected",false}},4}}}};
+            if(graphEnabled) {
+                Observation cast{"native-cast","skill",{{"active",true}},5};cast.relations["caster"]={"player","guest-character",3,1};
+                cast.relations["target"]={"mineral","ore",4,1};
+                Observation projectile{"native-projectile","projectile",{{"active",true}},6};
+                projectile.relations["parent"]={"skill","native-cast",5,1};
+                frame["skill"]={cast};frame["projectile"]={projectile};
+            }
+            h.observeNativeFrame(frame);
             h.publishAuthority(host);
         }
     };
@@ -94,6 +104,9 @@ int run() {
         "guest input serialization rejects result fields before sending");
     check(g.submitNativeIntent(guest,actor,target,"cast",2,1,controls)&&
           wait([&]{tick();return ha.begins==2&&ha.lastInput==controls;}),"typed native controls cross the actual authenticated transport");
+    graphEnabled=true;
+    check(wait([&]{tick();return g.sharedObjects().size()==4&&g.sharedObjects()==h.sharedObjects();}),
+        "caster, target and projectile parentage cross the same unified transport baseline and delta");
     g.setLocalSceneReady(false);g.update(guest);
     check(ga.saved&&ga.restoreStarted&&!g.submitNativeIntent(guest,actor,target,"mine",3,1),"loading closes intents and retains personal recovery until observed");
     bool detachRejected=false;try {g.attachNativeAdapter(nullptr);}catch(...) {detachRejected=true;}
