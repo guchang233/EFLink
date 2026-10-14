@@ -1388,6 +1388,22 @@ private:
         return out;
     }
 public:
+    nlohmann::json inspectNativeInteractiveAssociation(const BE_HostApiV1* host,void* message,void* resource) {
+        runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
+        if(!message||classOf(message)!="Proto.SC_SCENE_UPDATE_INTERACTIVE_PROPERTY"||!resource||
+           classOf(resource)!="Beyond.Gameplay.Core.InteractiveDoodadCommonComponent")throw std::runtime_error("unverified native property callback association");
+        authority::MetadataIndex metadata;auto* boxedId=metadata.fieldObject(message,"id_","System.UInt64");std::uint64_t id=0;
+        if(!boxedId)throw std::runtime_error("native message identity unavailable");
+        std::memcpy(&id,runtime->object_unbox(runtime->context,boxedId),sizeof id);
+        auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),resource);
+        if(!usable(entity))throw std::runtime_error("native property callback target already released");
+        auto* data=api.call(gm("Entity","get_inLevelData","","Beyond.Gameplay.LevelEntityData"),entity);std::uint64_t logic=0;
+        if(data) {auto* value=metadata.fieldObject(data,"levelLogicId","System.UInt64");if(value)std::memcpy(&logic,runtime->object_unbox(runtime->context,value),sizeof logic);}
+        return {{"handler_active",true},{"message_matches_level_logic",id&&logic==id},
+            {"message_matches_entity_id",id&&api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity)==id},
+            {"message_matches_nature_id",id&&api.value<std::uint64_t>(gm("InteractiveDoodadCommonComponent","get_natureResourceId","","System.UInt64"),resource)==id},
+            {"gameplay_modified",false}};
+    }
     nlohmann::json inspectNativeInteractiveMessage(const BE_HostApiV1* host,void* message) {
         runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");resolve();
         if(!message||classOf(message)!="Proto.SC_SCENE_UPDATE_INTERACTIVE_PROPERTY")throw std::runtime_error("unverified native interactive message class");

@@ -23,6 +23,12 @@ json phaseCounts=json::object();bool operationHooked=false,operationAttempted=fa
 std::atomic<DWORD> gameThread{0};std::atomic<std::uint64_t> wrongThread{0};
 bool propertyHooked=false,propertyAttempted=false;BE_ResolvedMethodV1 propertyMethod{};
 using PropertyMessage=void(__fastcall*)(void*,void*,void*);PropertyMessage nextPropertyMessage=nullptr;
+thread_local void* incomingPropertyMessage=nullptr;
+struct IncomingPropertyScope {
+    void* previous;
+    explicit IncomingPropertyScope(void* message):previous(incomingPropertyMessage) {incomingPropertyMessage=message;}
+    ~IncomingPropertyScope(){incomingPropertyMessage=previous;}
+};
 BE_ResolvedMethodV1 operationInitMethod{},operationFinishMethod{};
 using OperationInit=void*(__fastcall*)(void*,void*,int,std::uint64_t,void*);OperationInit nextOperationInit=nullptr;
 using OperationFinish=void(__fastcall*)(void*,void*,bool,void*);OperationFinish nextOperationFinish=nullptr;
@@ -44,6 +50,14 @@ bool camera(void* object) noexcept {
 json observeAttack(void* self,void* board) noexcept {
     if(!gameThread.load()||gameThread.load()!=GetCurrentThreadId()) {++wrongThread;return nullptr;}
     try {eflink::World inspector;return inspector.inspectNativeMineralAttack(runtime(),self,board);}
+    catch(...) {++traceFaults;return nullptr;}
+}
+json observeAssociation(void* self) noexcept {
+    try {
+        if(!incomingPropertyMessage)return {{"handler_active",false}};
+        if(!gameThread.load()||gameThread.load()!=GetCurrentThreadId()) {++wrongThread;return nullptr;}
+        eflink::World inspector;return inspector.inspectNativeInteractiveAssociation(runtime(),incomingPropertyMessage,self);
+    }
     catch(...) {++traceFaults;return nullptr;}
 }
 bool observing(void* self,void* info,const BE_ResolvedMethodV1& method) {
@@ -82,6 +96,7 @@ void __fastcall runtimeHp(void* self,void* info) {
 }
 void __fastcall serverHp(void* self,void* name,int oldValue,int newValue,void* info) {
     const bool active=observing(self,info,serverHpMethod);json before;if(active)before=observeAttack(self,nullptr);
+    try {if(active&&before.is_object())before["incoming_association"]=observeAssociation(self);}catch(...) {++traceFaults;}
     if(nextServerHp)nextServerHp(self,name,oldValue,newValue,info);
     if(active)appendTrace("server_hp",std::move(before),observeAttack(self,nullptr));
 }
@@ -119,6 +134,7 @@ json observeMessage(void* message) noexcept {
 }
 void __fastcall propertyMessage(void* self,void* message,void* info) {
     const bool active=observing(self,info,propertyMethod);json before;if(active)before=observeMessage(message);
+    IncomingPropertyScope scope(active?message:nullptr);
     if(nextPropertyMessage)nextPropertyMessage(self,message,info);
     if(active)appendTrace("network_property",std::move(before),observeMessage(message));
 }
