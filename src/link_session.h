@@ -60,6 +60,7 @@ class Session {
     std::uint64_t rejected=0,received=0,legacyRejected=0;std::string error;
     worldauthority::Host nativeAuthority;worldauthority::Replica nativeReplica;worldauthority::WorldHandoff nativeHandoff;
     worldauthority::NativeAdapter* nativeAdapter=nullptr;
+    bool shutdownBarrierAvailable=false;
     std::map<std::uint16_t,std::uint64_t> nativeMembers;Json nativeGrant;std::uint64_t nativeRequest=0;
     std::string worldIncarnation;
     std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0,authoritySeen=0;bool authoritySent=false;
@@ -72,7 +73,7 @@ class Session {
         authoritySequence=receivedAuthoritySequence=0;
     }
     bool adapterReady() const {
-        return nativeAdapter&&!adapterVersion.empty()&&nativeAdapter->gameVersion()==adapterVersion&&
+        return shutdownBarrierAvailable&&nativeAdapter&&!adapterVersion.empty()&&nativeAdapter->gameVersion()==adapterVersion&&
             !nativeAdapter->path().empty()&&nativeAdapter->executionVerified()&&nativeAdapter->isolationVerified()&&nativeAdapter->recoveryVerified();
     }
     bool nativeMemberPresent(const Snapshot& snapshot,std::uint16_t peer) const {
@@ -289,11 +290,25 @@ public:
     void attachNativeAdapter(worldauthority::NativeAdapter* adapter) {
         if(adapter==nativeAdapter)return;
         if(nativeHandoff.recoveryRetained())throw std::runtime_error("native recovery must finish before replacing its adapter");
+        if(adapter&&!shutdownBarrierAvailable)throw std::runtime_error("native adapter requires a host shutdown barrier");
         nativeAuthority.suspend();nativeMembers.clear();nativeGrant=nullptr;
         nativeAdapter=adapter;
     }
+    void setShutdownBarrierAvailable(bool value) {
+        if(!value&&nativeHandoff.recoveryRetained())throw std::runtime_error("cannot remove native shutdown barrier while recovery is retained");
+        shutdownBarrierAvailable=value;
+        if(!value)nativeAuthority.suspend();
+    }
+    // Called on the game thread before the host removes callbacks and hooks.
+    // A pending or failed native restore keeps the module active and the gate
+    // closed; only observed restoration permits teardown.
+    bool prepareNativeShutdown() {
+        nativeAuthority.suspend();nativeHandoff.withdraw();
+        if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Restoring&&!nativeHandoff.restore())return false;
+        return nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Personal&&!nativeHandoff.recoveryRetained();
+    }
     bool grantNativeParty(Net& net,std::uint16_t peer,std::uint64_t member,std::vector<worldauthority::Ref> actors) {
-        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!adapterReady()||
            !authoritySeen||nowMs()-authoritySeen>1500||!nativeMemberPresent(net.snapshot(),peer)||
            !nativeAuthority.resume(*nativeAdapter))return false;
         if(auto old=nativeMembers.find(peer);old!=nativeMembers.end()) {
@@ -343,11 +358,11 @@ private:
             for(auto it=nativeMembers.begin();it!=nativeMembers.end();) {
                 if(!nativeMemberPresent(s,it->first)) {nativeAuthority.revoke(it->first);it=nativeMembers.erase(it);}else ++it;
             }
-            if(!fresh||!nativeAdapter||!nativeAuthority.resume(*nativeAdapter)) {nativeAuthority.suspend();return;}
+            if(!fresh||!adapterReady()||!nativeAuthority.resume(*nativeAdapter)) {nativeAuthority.suspend();return;}
             nativeAuthority.poll(nowMs());publishAuthority(net);
         }else if(role==Role::Client) {
             const worldauthority::Scope scope{room,worldIncarnation,epoch};
-            if(!fresh||!nativeAdapter||!protocolCompatible(proto::kHostId)||nativeReplica.needsBaseline())nativeHandoff.withdraw();
+            if(!fresh||!adapterReady()||!protocolCompatible(proto::kHostId)||nativeReplica.needsBaseline())nativeHandoff.withdraw();
             else {
                 if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Personal)nativeHandoff.begin(scope,*nativeAdapter,adapterVersion);
                 nativeHandoff.admit(nativeReplica,adapterVersion);
@@ -409,7 +424,8 @@ public:
             {"player_casts",{{"accepted",0},{"active",Json::array()},{"legacy_removed",true},{"replay_enabled",false}}},
             {"hit_claims",{{"accepted",0},{"legacy_removed",true},{"legacy_packets_rejected",legacyRejected},{"native_verification_required",true}}},
             {"world_authority",{{"host",nativeAuthority.status()},{"observed",sharedObjects().size()},{"replica_revision",nativeReplica.version()},{"handoff",nativeHandoff.status()},
-                {"baseline_required",nativeReplica.needsBaseline()},{"age_ms",authoritySeen?nowMs()-authoritySeen:0},{"operation_adapter_verified",adapterReady()},
+                {"baseline_required",nativeReplica.needsBaseline()},{"age_ms",authoritySeen?nowMs()-authoritySeen:0},
+                {"host_shutdown_barrier",shutdownBarrierAvailable},{"operation_adapter_verified",adapterReady()},
                 {"transport",{{"baselines_sent",authorityBaselines},{"deltas_sent",authorityDeltas},{"heartbeats_sent",authorityHeartbeats},
                     {"bytes_sent",authorityBytes},{"last_sent_sequence",authoritySequence},{"last_received_sequence",receivedAuthoritySequence}}},
                 {"replica_adapter_verified",adapterReady()&&nativeAdapter->dualClientVerified()},{"full_sync_verified",false},{"account_risk",true}}},

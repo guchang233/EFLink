@@ -38,6 +38,9 @@ struct Fixture final:NativeAdapter {
 int run() {
     Net host,guest;Session h,g;Fixture ha,ga;ha.session=&h;ga.session=&g;
     host.setName("authority-host");guest.setName("authority-guest");
+    bool unguardedRejected=false;try {g.attachNativeAdapter(&ga);}catch(...) {unguardedRejected=true;}
+    check(unguardedRejected,"native adapter cannot attach without a host shutdown barrier");
+    h.setShutdownBarrierAvailable(true);g.setShutdownBarrierAvailable(true);
     h.attachNativeAdapter(&ha);g.attachNativeAdapter(&ga);h.setAdapterVersion("fixture-game");g.setAdapterVersion("fixture-game");
     host.onData=[&](auto peer,auto channel,auto data,auto count){if(channel==worldChannel)h.receive(peer,data,count);};
     guest.onData=[&](auto peer,auto channel,auto data,auto count){if(channel==worldChannel)g.receive(peer,data,count);};
@@ -136,9 +139,11 @@ int run() {
         "caster, target and projectile parentage cross the same unified transport baseline and delta");
     g.setLocalSceneReady(false);g.update(guest);
     check(ga.saved&&ga.restoreStarted&&!g.submitNativeIntent(guest,actor,target,"mine",3,1),"loading closes intents and retains personal recovery until observed");
+    check(!g.prepareNativeShutdown()&&ga.saved,"module disable must wait for native restoration evidence");
     bool detachRejected=false;try {g.attachNativeAdapter(nullptr);}catch(...) {detachRejected=true;}
     check(detachRejected,"adapter replacement cannot discard retained personal world");
-    ga.restoreReady=true;g.update(guest);check(!ga.saved,"native restoration evidence releases the retained personal snapshot");
+    ga.restoreReady=true;check(g.prepareNativeShutdown()&&!ga.saved&&g.prepareNativeShutdown(),
+        "observed restoration completes the shutdown barrier idempotently");
     g.attachNativeAdapter(nullptr);h.attachNativeAdapter(nullptr);guest.stop();host.stop();
     return 0;
 }

@@ -3,6 +3,7 @@
 // CameraManager.TailLateTick; the module page and other modules control it through messages
 // and the exported EFLink_GetApiV1 table.
 #include "link_world.h"
+#include "authority/efml_lifecycle.h"
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "EndfieldLink/EndfieldLink.h"
 #include "runtime_scope.h"
@@ -31,6 +32,7 @@ eflink::Session session;
 eflink::Gui gui;
 std::recursive_mutex worldMutex;
 std::atomic<bool> hooked=false,canvasHooked=false,cleanupRequested=false,cleanupDone=false;
+bool cleanupNetworkStopped=false; // protected by lifecycle
 std::jthread hookWorker;
 json configuration=json::object();
 std::string hookError;
@@ -72,6 +74,11 @@ bool isCameraManager(void* instance) {
     } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
     return false;
 }
+void cleanupOnGameThread(const BE_HostApiV1* api) {
+    if(cleanupDone.load())return;
+    if(!session.prepareNativeShutdown())return;
+    gui.shutdownGame(api);world.shutdown();cleanupDone.store(true);
+}
 void __fastcall onTick(void* instance,float delta,void* info) {
     if(nextTick) nextTick(instance,delta,info);
     // Identical native bodies can be folded together; only CameraManager's tick counts.
@@ -79,7 +86,7 @@ void __fastcall onTick(void* instance,float delta,void* info) {
     std::lock_guard lock(worldMutex);
     auto* api=runtime();if(!api) return;
     if(cleanupRequested.load()) {
-        if(!canvasHooked.load()&&!cleanupDone.load()) {try {world.shutdown();cleanupDone.store(true);} catch(...) {}}
+        try {cleanupOnGameThread(api);} catch(const std::exception& e) {hookError=e.what();}
         return;
     }
     world.tick(api,net,session);
@@ -96,7 +103,7 @@ void __fastcall onCanvas(void* info) {
     rendering=true;
     try {
         if(cleanupRequested.load()) {
-            if(!cleanupDone.load()) {gui.shutdownGame(api);world.shutdown();cleanupDone=true;}
+            cleanupOnGameThread(api);
         } else if(initialized) {if(world.takeHostMapNotice())gui.open();gui.tickGame(api);world.menu(api,gui.visible());}
     } catch(...) {}
     rendering=false;
@@ -358,8 +365,9 @@ BE_Result BE_CALL initialize(const BE_ThirdPartyHostV1* input,const char* config
         net.version=kVersion;net.onData=deliver;net.onPeer=peerChanged;
         eflink::migrateMenuKey(parsed);
         applyConfiguration(parsed);
+        session.setShutdownBarrierAvailable(eflink::worldauthority::hasShutdownBarrier(input));
         if(!net.start()) {host={};return BE_Result_Failed;}
-        cleanupRequested=false;cleanupDone=false;
+        cleanupRequested=false;cleanupDone=false;cleanupNetworkStopped=false;
         hookError.clear();guiError.clear();
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         {std::lock_guard nativeLoggerLock(worldMutex);world.setNativeOperationLogger([](const std::string& message){if(host.log)host.log(host.context,message.c_str());});}
@@ -399,6 +407,17 @@ BE_Result BE_CALL message(const char* request,const char* body) {
         return BE_Result_Ok;
     } catch(const std::exception& e) {reply(request,BE_Result_InvalidArgument,{{"error",e.what()}});return BE_Result_Ok;}
 }
+BE_Result BE_CALL prepareShutdown() {
+    std::lock_guard lock(lifecycle);
+    if(!initialized)return BE_Result_Ok;
+    if(!cleanupNetworkStopped) {
+        // Stop room input before the game thread begins native restoration.
+        std::lock_guard lockWorld(worldMutex);
+        cleanupRequested.store(true);
+        net.stop();cleanupNetworkStopped=true;
+    }
+    return cleanupDone.load()||(!hooked.load()&&!canvasHooked.load())?BE_Result_Ok:BE_Result_NotReady;
+}
 void BE_CALL shutdown() {
     {std::lock_guard lock(lifecycle);if(!initialized) return;initialized=false;}
     // Never join the GUI or network while holding lifecycle: callbacks may be finishing.
@@ -416,8 +435,10 @@ void BE_CALL shutdown() {
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     std::lock_guard lock(lifecycle);std::lock_guard lockWorld(worldMutex);host={};
 }
-const BE_ThirdPartyModuleV1 module{sizeof(module),1,kId,initialize,configure,message,shutdown};
+const eflink::worldauthority::EfmlModuleWithShutdownBarrierV1 module{
+    {sizeof(module),1,kId,initialize,configure,message,shutdown},prepareShutdown};
 }
-BE_EXPORT const BE_ThirdPartyModuleV1* BE_CALL BetterEndfield_GetThirdPartyModuleV1() {return &module;}
+BE_EXPORT const BE_ThirdPartyModuleV1* BE_CALL EFML_GetModuleV1() {return &module.base;}
+BE_EXPORT const BE_ThirdPartyModuleV1* BE_CALL BetterEndfield_GetThirdPartyModuleV1() {return &module.base;}
 extern "C" __declspec(dllexport) const EFLink_ApiV1* EFLINK_CALL EFLink_GetApiV1() {return &publicApi;}
 extern "C" __declspec(dllexport) const EFLink_ApiV2* EFLINK_CALL EFLink_GetApiV2() {return &worldApi;}

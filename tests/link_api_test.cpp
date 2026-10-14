@@ -2,6 +2,7 @@
 // module page do, and joins its room with a second network stack to check the public API.
 #include "link_net.h"
 #include "BetterEndfield/ThirdPartyModule.h"
+#include "authority/efml_lifecycle.h"
 #include "EndfieldLink/EndfieldLink.h"
 #include "nlohmann/json.hpp"
 #include <cstdio>
@@ -46,6 +47,16 @@ int main(int argc,char** argv) {
     check(entry&&getApi,"Better-Endfield entry and EFLink_GetApiV1 are exported");if(!entry||!getApi) return 1;
     module=entry();const auto* api=getApi();
     check(module&&module->id==moduleId&&api&&api->struct_size==sizeof(EFLink_ApiV1)&&api->version==EFLINK_API_VERSION_1,"ABI identity matches");
+    auto efmlEntry=reinterpret_cast<BE_GetThirdPartyModuleV1Fn>(GetProcAddress(library,"EFML_GetModuleV1"));
+    check(efmlEntry&&efmlEntry()==module&&module->struct_size==sizeof(eflink::worldauthority::EfmlModuleWithShutdownBarrierV1)&&
+        reinterpret_cast<const eflink::worldauthority::EfmlModuleWithShutdownBarrierV1*>(module)->prepare_shutdown,
+        "EFML shutdown barrier extends the unchanged V1 module prefix");
+    eflink::worldauthority::EfmlHostExtensionV1 extension{};
+    extension.struct_size=sizeof(extension);extension.version=1;extension.feature_flags=eflink::worldauthority::shutdownBarrierFeature;
+    eflink::worldauthority::EfmlHostV1 extendedHost{};extendedHost.base.struct_size=sizeof(extendedHost);extendedHost.efml=&extension;
+    check(eflink::worldauthority::hasShutdownBarrier(&extendedHost.base),"EFML host reports its native restoration barrier");
+    extension.feature_flags=0;
+    check(!eflink::worldauthority::hasShutdownBarrier(&extendedHost.base),"an older host cannot enable native gameplay by size alone");
     auto getWorld=reinterpret_cast<EFLink_GetApiV2Fn>(GetProcAddress(library,EFLINK_ENTRY_V2));
     auto* worldApi=getWorld?getWorld():nullptr;
     check(worldApi&&worldApi->version==2&&worldApi->transport==api,"V2 world API preserves the original transport ABI");
