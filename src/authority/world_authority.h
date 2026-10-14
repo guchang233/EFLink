@@ -220,6 +220,8 @@ struct Witness {
     // they are not per-caster skill IDs or client-supplied hit identifiers.
     std::uint64_t serial=0,actorCookie=0,targetCookie=0,event=0;Json state;std::uint64_t nativeStamp=0;
 };
+enum class NativeActorDomain { Unknown, HostPersonal, RoomProxy };
+struct NativeActorContext {std::uint16_t peer=0;NativeActorDomain domain=NativeActorDomain::Unknown;};
 class NativeAdapter {
 public:
     virtual ~NativeAdapter()=default;
@@ -229,6 +231,8 @@ public:
     virtual bool isolationVerified() const {return false;}
     virtual bool recoveryVerified() const {return false;}
     virtual bool dualClientVerified() const {return false;}
+    // Proved by a live native actor binding, not by the guest or room roster.
+    virtual NativeActorContext actorContext(const Object&) const {return {};}
     virtual bool supports(const std::string&,const std::string&) const {return false;}
     virtual bool validate(const Intent&,const Object&,const Object&) const {return false;}
     virtual bool begin(const Ticket&) {return false;}
@@ -248,6 +252,7 @@ public:
     virtual void releasePersonal(std::uint64_t) noexcept {}
 };
 class Host {
+    const std::uint16_t authorityPeer;
     struct Member {std::uint64_t incarnation=0,highRequest=0;std::vector<Ref> actors;bool active=false;};
     struct Pending {Ticket ticket;NativeAdapter* adapter=nullptr;std::uint64_t deadline=0;std::optional<Witness> event;};
     Scope scope_;std::string gameVersion_;std::thread::id owner;
@@ -296,6 +301,11 @@ class Host {
     }
     void cancelAll() noexcept {for(auto& [id,p]:pending)p.adapter->cancel(p.ticket);pending.clear();}
     static bool owns(const Member& member,Ref actor) {return std::find(member.actors.begin(),member.actors.end(),actor)!=member.actors.end();}
+    bool nativeActorOwnedBy(const NativeAdapter& adapter,std::uint16_t peer,const Object& actor) const {
+        try {const auto context=adapter.actorContext(actor);
+            return context.peer==peer&&context.domain==(peer==authorityPeer?NativeActorDomain::HostPersonal:NativeActorDomain::RoomProxy);}
+        catch(...) {return false;}
+    }
     bool ownedGroup(std::uint16_t peer,std::vector<Ref>& actors) const {
         if(!peer||actors.empty()||actors.size()>4)return false;
         std::sort(actors.begin(),actors.end(),[](Ref a,Ref b){return std::tie(a.id,a.life)<std::tie(b.id,b.life);});
@@ -325,14 +335,16 @@ class Host {
             const auto& t=it->second.ticket;const auto* a=find(t.intent.actor);const auto* o=find(t.intent.target);
             auto m=members.find(t.intent.peer);
             if(t.scope!=scope_||!a||!o||a->cookie!=t.actorCookie||o->cookie!=t.targetCookie||
-               m==members.end()||!m->second.active||m->second.incarnation!=t.intent.member||!owns(m->second,t.intent.actor)) {
+               m==members.end()||!m->second.active||m->second.incarnation!=t.intent.member||!owns(m->second,t.intent.actor)||
+               !nativeActorOwnedBy(*it->second.adapter,t.intent.peer,*a)) {
                 it->second.adapter->cancel(t);it=pending.erase(it);
             }else ++it;
         }
     }
 public:
     static constexpr std::size_t maxObjects=1024,maxWire=240*1024;
-    Host()=default;Host(const Host&)=delete;Host& operator=(const Host&)=delete;
+    explicit Host(std::uint16_t peer=1):authorityPeer(peer) {if(!peer)throw std::runtime_error("missing authority peer");}
+    Host(const Host&)=delete;Host& operator=(const Host&)=delete;
     // Adapter lifetime must exceed all pending tickets. Reset before destruction.
     void reset(Scope scope={},std::string gameVersion={}) {
         thread();cancelAll();scope_=std::move(scope);gameVersion_=std::move(gameVersion);objects.clear();members.clear();
@@ -443,7 +455,8 @@ public:
                 !adapter.recoveryVerified()||!adapter.dualClientVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()||adapter.path().size()>128) {++rejected;return {};}
             auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
             Strike strike{sender,intent.member,intent.actor.id,intent.actor.life,intent.action,intent.target.id,intent.target.life,intent.strike};
-            if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
+            if(intent.request<=m.highRequest||strikes.contains(strike)||!nativeActorOwnedBy(adapter,sender,*actor)||
+               !adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
             advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp(),adapter.path()};
             m.highRequest=intent.request;rememberStrike(strike,intent.request);
             // Making room can retire this very old action. Consuming its new

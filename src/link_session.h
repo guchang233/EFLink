@@ -312,6 +312,12 @@ public:
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!adapterReady()||
            !authoritySeen||nowMs()-authoritySeen>1500||!nativeMemberPresent(net.snapshot(),peer)||
            !nativeAuthority.resume(*nativeAdapter))return false;
+        for(const auto actor:actors) {
+            const auto* object=nativeAuthority.find(actor);if(!object||object->kind!="player")return false;
+            try {const auto context=nativeAdapter->actorContext(*object);
+                if(context.peer!=peer||context.domain!=(peer==localPeer?worldauthority::NativeActorDomain::HostPersonal:worldauthority::NativeActorDomain::RoomProxy))return false;
+            }catch(...) {return false;}
+        }
         if(auto old=nativeMembers.find(peer);old!=nativeMembers.end()) {
             if(old->second!=member||!nativeAuthority.replaceActors(peer,member,actors))return false;
         }else if(!nativeAuthority.bindGroup(peer,member,actors))return false;

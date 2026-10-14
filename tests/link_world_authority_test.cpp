@@ -14,7 +14,8 @@ Observation mineral(int hp=10000,std::uint64_t cookie=20,bool collected=false) {
     return {"ore-12","mineral",{{"template","quartz"},{"position",{1,2,3}},{"hp_ratio",hp},{"max_hp_ratio",10000},{"collected",collected}},cookie};
 }
 struct Fixture:NativeAdapter {
-    bool certified=true,dualCertified=true,began=true;unsigned starts=0,cancels=0;std::optional<Witness> result;
+    bool certified=true,dualCertified=true,began=true,ownershipValid=true,personalDomain=false;
+    unsigned starts=0,cancels=0;std::optional<Witness> result;
     bool retained=false,allowCapture=true,beginWorld=true,initialized=true,applied=false,restoreBegin=true,restoreResult=false;
     unsigned restores=0,releases=0,applies=0;Scope activeScope;std::set<std::uint64_t> observedBaselines;std::uint64_t submittedRevision=0;
     std::string gameVersion() const override {return "fixture-only";}
@@ -23,6 +24,10 @@ struct Fixture:NativeAdapter {
     bool isolationVerified() const override {return certified;}
     bool recoveryVerified() const override {return certified;}
     bool dualClientVerified() const override {return dualCertified;}
+    NativeActorContext actorContext(const Object& actor) const override {
+        if(!ownershipValid)return {};
+        return {std::uint16_t(actor.key=="other"?3:2),personalDomain?NativeActorDomain::HostPersonal:NativeActorDomain::RoomProxy};
+    }
     bool supports(const std::string& kind,const std::string& op) const override {return kind=="mineral"&&op=="mine";}
     bool validate(const Intent&,const Object&,const Object&) const override {return true;}
     bool begin(const Ticket&) override {++starts;return began;}
@@ -202,6 +207,11 @@ int main() {
     check(!host.resume(adapter)&&!host.submit(intent.json(),2,adapter,100),"native execution remains closed before two-client certification");
     adapter.dualCertified=true;
     adapter.certified=true;check(host.resume(adapter),"fixture-only execution requires isolation and recovery proof");
+    adapter.personalDomain=true;
+    check(!host.submit(intent.json(),2,adapter,100),"a room grant cannot let a guest operate a host personal actor");
+    adapter.personalDomain=false;adapter.ownershipValid=false;
+    check(!host.submit(intent.json(),2,adapter,100),"room membership cannot replace missing native actor ownership");
+    adapter.ownershipValid=true;
     auto bad=intent.json();bad["damage"]=999999;
     check(!host.submit(bad,2,adapter,100)&&adapter.starts==0,"claimed damage cannot enter native execution");
     check(!host.submit(intent.json(),3,adapter,100),"transport sender cannot impersonate operator");
@@ -245,6 +255,19 @@ int main() {
         check(forged.status()["pending"]==0&&forged.status()["expired"]==2&&forged.find(ore)->state["hp_ratio"]==7500,
             "cached callbacks expire without changing host-observed state when no matching census arrives");
         forged.reset();
+    }
+    {
+        Host revoked;Fixture native;revoked.reset(scene(),"fixture-only");
+        revoked.observe("player",{{"operator","player",{{"hp",100},{"max_hp",100}},10}});
+        revoked.observe("mineral",{mineral()});
+        const auto owner=revoked.find("player","operator")->ref,ore=revoked.find("mineral","ore-12")->ref;
+        revoked.bind(2,1,owner);revoked.resume(native);
+        Intent command{scene(),2,1,1,1,1,1,owner,ore,"mine"};
+        check(revoked.submit(command.json(),2,native,10).has_value(),"native-owned room actor may start an authority operation");
+        native.ownershipValid=false;revoked.poll(11);
+        check(revoked.status()["pending"]==0&&native.cancels==1&&revoked.status()["results_confirmed"]==0,
+            "losing the live native actor binding revokes a pending operation before confirmation");
+        revoked.reset();
     }
     auto baseline=host.baseline();Replica guest;
     check(!guest.baseline(baseline,scene(),false)&&guest.baseline(baseline,scene(),true),"late join accepts only host unified baseline");
