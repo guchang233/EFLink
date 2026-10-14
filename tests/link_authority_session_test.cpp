@@ -6,7 +6,7 @@ using namespace eflink::worldauthority;
 static void check(bool value,const char* name) {if(!value)throw std::runtime_error(name);std::cout<<"PASS "<<name<<std::endl;}
 template<class F> static bool wait(F f) {for(int i=0;i<200;++i) {if(f())return true;std::this_thread::sleep_for(std::chrono::milliseconds(15));}return f();}
 struct Fixture final:NativeAdapter {
-    Session* session=nullptr;bool certified=true,saved=false,restoreReady=false,restoreStarted=false,acceptCast=false;
+    Session* session=nullptr;bool certified=true,dualCertified=true,saved=false,restoreReady=false,restoreStarted=false,acceptCast=false;
     Json lastInput;
     std::uint64_t revision=0,event=0;unsigned begins=0,cancels=0,applications=0;std::optional<Witness> result;
     bool awaitingPostDispatchFrame=false;
@@ -15,6 +15,7 @@ struct Fixture final:NativeAdapter {
     bool executionVerified() const override{return certified;}
     bool isolationVerified() const override{return certified;}
     bool recoveryVerified() const override{return certified;}
+    bool dualClientVerified() const override{return dualCertified;}
     bool supports(const std::string& kind,const std::string& op) const override{return kind=="mineral"&&(op=="mine"||(acceptCast&&op=="cast"));}
     bool validate(const Intent&,const Object& actor,const Object& target) const override{return actor.kind=="player"&&target.kind=="mineral";}
     bool begin(const Ticket& ticket) override {
@@ -99,7 +100,9 @@ int run() {
     check(!g.submitNativeIntent(guest,actor,target,"mine",1,1),"guest cannot submit before a host party grant");
     ha.certified=false;
     check(!h.grantNativeParty(host,2,9,{actor}),"unverified native adapter cannot open execution through transport");
-    ha.certified=true;
+    ha.certified=true;ha.dualCertified=false;
+    check(!h.grantNativeParty(host,2,9,{actor}),"host cannot grant room operations before dual-client certification");
+    ha.dualCertified=true;
     check(h.grantNativeParty(host,2,9,{actor}),"host grants only registered native party references");
     check(wait([&]{tick();return g.submitNativeIntent(guest,actor,target,"mine",1,1);}),"guest sends an intent only after native baseline application is observed");
     const bool resultReady=wait([&]{tick();return ha.begins==1&&h.status()["world_authority"]["host"]["results_confirmed"]==1&&g.sharedObjects()==h.sharedObjects();});

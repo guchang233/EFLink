@@ -74,7 +74,8 @@ class Session {
     }
     bool adapterReady() const {
         return shutdownBarrierAvailable&&nativeAdapter&&!adapterVersion.empty()&&nativeAdapter->gameVersion()==adapterVersion&&
-            !nativeAdapter->path().empty()&&nativeAdapter->executionVerified()&&nativeAdapter->isolationVerified()&&nativeAdapter->recoveryVerified();
+            !nativeAdapter->path().empty()&&nativeAdapter->executionVerified()&&nativeAdapter->isolationVerified()&&
+            nativeAdapter->recoveryVerified()&&nativeAdapter->dualClientVerified();
     }
     bool nativeMemberPresent(const Snapshot& snapshot,std::uint16_t peer) const {
         const auto* member=find(snapshot,peer);

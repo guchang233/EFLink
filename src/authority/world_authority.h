@@ -434,13 +434,13 @@ public:
     // build and proven isolation/recovery. Observation support grants nothing.
     bool resume(const NativeAdapter& adapter) {
         thread();suspended=!(scope_.valid()&&!gameVersion_.empty()&&adapter.gameVersion()==gameVersion_&&!adapter.path().empty()&&
-            adapter.path().size()<=128&&adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified());return !suspended;
+            adapter.path().size()<=128&&adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified()&&adapter.dualClientVerified());return !suspended;
     }
     std::optional<std::uint64_t> submit(const Json& body,std::uint16_t sender,NativeAdapter& adapter,std::uint64_t now) {
         thread();try {
             Intent intent=Intent::parse(body);
             if(sender!=intent.peer||!usable(intent)||pending.size()>=128||commandRetired(intent)||!adapter.executionVerified()||!adapter.isolationVerified()||
-                !adapter.recoveryVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()||adapter.path().size()>128) {++rejected;return {};}
+                !adapter.recoveryVerified()||!adapter.dualClientVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()||adapter.path().size()>128) {++rejected;return {};}
             auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
             Strike strike{sender,intent.member,intent.actor.id,intent.actor.life,intent.action,intent.target.id,intent.target.life,intent.strike};
             if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
@@ -462,7 +462,8 @@ public:
         thread();invalidatePending();
         for(auto it=pending.begin();it!=pending.end();) {
             auto& p=it->second;const auto& t=p.ticket;
-            if(!p.adapter->executionVerified()||!p.adapter->isolationVerified()||!p.adapter->recoveryVerified()||p.adapter->gameVersion()!=gameVersion_||p.adapter->path()!=t.path) {
+            if(!p.adapter->executionVerified()||!p.adapter->isolationVerified()||!p.adapter->recoveryVerified()||!p.adapter->dualClientVerified()||
+               p.adapter->gameVersion()!=gameVersion_||p.adapter->path()!=t.path) {
                 p.adapter->cancel(t);it=pending.erase(it);++rejected;continue;
             }
             if(now>=p.deadline) {p.adapter->cancel(t);it=pending.erase(it);++expired;continue;}
@@ -573,7 +574,7 @@ private:
     }
     bool verified(const std::string& gameVersion) const {
         return adapter&&!gameVersion.empty()&&adapter->gameVersion()==gameVersion&&!adapter->path().empty()&&
-            adapter->executionVerified()&&adapter->isolationVerified()&&adapter->recoveryVerified()&&adapter->personalRetained(snapshot);
+            adapter->executionVerified()&&adapter->isolationVerified()&&adapter->recoveryVerified()&&adapter->dualClientVerified()&&adapter->personalRetained(snapshot);
     }
 public:
     WorldHandoff()=default;WorldHandoff(const WorldHandoff&)=delete;WorldHandoff& operator=(const WorldHandoff&)=delete;
@@ -581,7 +582,7 @@ public:
     bool begin(const Scope& scope,NativeAdapter& native,const std::string& gameVersion) {
         thread();
         if(phase_!=Phase::Personal||!scope.valid()||gameVersion.empty()||native.gameVersion()!=gameVersion||native.path().empty()||
-            !native.executionVerified()||!native.isolationVerified()||!native.recoveryVerified())return false;
+            !native.executionVerified()||!native.isolationVerified()||!native.recoveryVerified()||!native.dualClientVerified())return false;
         std::optional<std::uint64_t> saved;try {saved=native.capturePersonal();}catch(...) {return false;}
         if(!saved||!*saved||!native.personalRetained(*saved))return false;
         scope_=scope;adapter=&native;snapshot=*saved;gameVersion_=gameVersion;phase_=Phase::Loading;restoreStarted=baselineSubmitted=false;

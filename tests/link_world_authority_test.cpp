@@ -14,7 +14,7 @@ Observation mineral(int hp=10000,std::uint64_t cookie=20,bool collected=false) {
     return {"ore-12","mineral",{{"template","quartz"},{"position",{1,2,3}},{"hp_ratio",hp},{"max_hp_ratio",10000},{"collected",collected}},cookie};
 }
 struct Fixture:NativeAdapter {
-    bool certified=true,began=true;unsigned starts=0,cancels=0;std::optional<Witness> result;
+    bool certified=true,dualCertified=true,began=true;unsigned starts=0,cancels=0;std::optional<Witness> result;
     bool retained=false,allowCapture=true,beginWorld=true,initialized=true,applied=false,restoreBegin=true,restoreResult=false;
     unsigned restores=0,releases=0,applies=0;Scope activeScope;std::set<std::uint64_t> observedBaselines;std::uint64_t submittedRevision=0;
     std::string gameVersion() const override {return "fixture-only";}
@@ -22,6 +22,7 @@ struct Fixture:NativeAdapter {
     bool executionVerified() const override {return certified;}
     bool isolationVerified() const override {return certified;}
     bool recoveryVerified() const override {return certified;}
+    bool dualClientVerified() const override {return dualCertified;}
     bool supports(const std::string& kind,const std::string& op) const override {return kind=="mineral"&&op=="mine";}
     bool validate(const Intent&,const Object&,const Object&) const override {return true;}
     bool begin(const Ticket&) override {++starts;return began;}
@@ -197,6 +198,9 @@ int main() {
     Intent intent{scene(),2,1,1,88,1,1,actor,target,"mine"};
     adapter.certified=false;
     check(!host.resume(adapter)&&!host.submit(intent.json(),2,adapter,100),"census cannot authorize an unverified native path");
+    adapter.certified=true;adapter.dualCertified=false;
+    check(!host.resume(adapter)&&!host.submit(intent.json(),2,adapter,100),"native execution remains closed before two-client certification");
+    adapter.dualCertified=true;
     adapter.certified=true;check(host.resume(adapter),"fixture-only execution requires isolation and recovery proof");
     auto bad=intent.json();bad["damage"]=999999;
     check(!host.submit(bad,2,adapter,100)&&adapter.starts==0,"claimed damage cannot enter native execution");
