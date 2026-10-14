@@ -246,3 +246,13 @@
 Replica 在完整基线/增量结束后校验整个关系图，允许同一事务中的引用与目标同时创建/退役，禁止对半个子图先应用。Session 新增编译适配器的整帧入口，契约 revision 16；公共 ABI 不变。独立检查覆盖跨类别前向关系、晚加入、生命周期替换、关系版本、异常回滚、整子树清理与不完整增量，真实 localhost 测试确认施法者/目标/投射物关联走同一基线/增量。测试关系是 fixture，不是实际游戏技能/投射物验收。
 
 `.62` 完整构建、当前 15 组检查、源指纹与 V1/V2 ABI 通过，恢复包 SHA256 `2C3A72992E33EAE557C11B4D1773AE2CB0698E4EF236C8293AB710BCD0368A3D`。游戏执行、客机隔离、原生应用与恢复仍缺少生产实现；矿石双客户端端到端尚未完成，不能打开 full_sync_verified 或结束持续目标。
+
+## 原生代码只读核对与角色类型限制（.63）
+
+已有只读代码检查器补同一 1.5.3 门禁，唯一新 ID probe.audit63 临时注册到房主，只读取指定 Gameplay 方法的元数据/可执行页，未调用被检查的方法、未装钩子、未发输入、未取登录凭据。读取结束已用 EFML disable 并核对 enabled=false，主模块仍 `.37`。检查记录保存在本地忽略的 ore-reference，不发布原生代码字节或私有运行数据。
+
+核对实际 `_CheckEntityCanDo` 常规实现对 Entity+0x5c 检查值 8；再核对 Entity.get_objectType getter 与原生 ObjectType 枚举，8=Character、256=Npc。因此 CreateNpcProxy 不能直接冒充可采集角色。DoOperation 还经过原生资源资格、重入/打断、实体资格、InitOperation 和主控角色技能入口，不能缩减为改矿石耐久。发现 `_CreateProxyNpcInfo` 委托原生 EntityDataStorage.CreateNpcFromNpcProxy，存在原生本地 NPC 编号分配；这些只证明类型/调用结构，不证明完整角色控制、账号隔离或结果认证。
+
+SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角色候选入口继续仅作只读核对。现有 ScopeName 为 Main/Blackbox/RpgDungeon/Training/WeekRaid，没有据此得到房间隔离证据；不会恢复已删除的背包查找替换或临时物品构造来绕过边界。未创建 NPC/角色，未发起采集，未宣称端到端成功。
+
+`.63` 完整构建、当前 15 组检查、源指纹及 ABI 通过，恢复包 SHA256 `4416722639465F19A2EE146EA0B7B49C45788C6C896298DF2634F18F8A9E059F`。生产执行、隔离/应用及恢复仍缺少实现和实际验收，持续目标未完成。

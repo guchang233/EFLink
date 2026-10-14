@@ -4,6 +4,7 @@
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "runtime_scope.h"
 #include "authority/link_metadata.h"
+#include "authority/native_build_policy.h"
 #include "nlohmann/json.hpp"
 #include <string>
 #include <mutex>
@@ -31,6 +32,8 @@ json inspect(const json& request) {
     RuntimeThreadScope attached(true);if(!attached.ready())throw std::runtime_error("runtime worker unavailable");
     auto* api=runtime();auto dll=GetModuleHandleW(L"GameAssembly.dll");
     if(!api||!dll)throw std::runtime_error("runtime unavailable");
+    if(!eflink::worldauthority::readOnlyBuildSupported(eflink::worldauthority::nativeGameVersion(api)))
+        throw std::runtime_error("unverified game build; native metadata/code inspection disabled");
     const auto name=request.at("class").get<std::string>(),space=request.value("namespace",std::string("Beyond.Gameplay.Core"));
     if(request.contains("search")) {
         const auto query=request.at("search").get<std::string>();
