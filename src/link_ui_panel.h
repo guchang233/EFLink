@@ -347,7 +347,7 @@ struct UiPanel {
                 ui::pushSmall();
                 ui::hint("暂不跟随会留在当前地图，并暂停联机战斗。");
                 ui::popSmall();
-                if(!hostSceneSupported()) ui::notice(ui::Tone::Warning,"房主当前场景尚未开放联机入场，请等待其回到大世界。");
+                if(!hostSceneSupported()) ui::notice(ui::Tone::Warning,"原生换图、世界隔离与恢复尚未验收，当前无法跟随入场。");
                 ui::vspace(ui::px(14));
                 ImGui::BeginDisabled(!hostSceneSupported());
                 if(ui::primaryButton("跟随切换",{ui::px(140),ui::px(32)})) {

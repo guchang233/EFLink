@@ -112,8 +112,8 @@ pwsh -NoProfile -File .\tools\build-cooperation-stage1.ps1 -ModuleId eflink.coop
 | 目录 | 用途 |
 |---|---|
 | `src/link_protocol.h`、`src/link_net.h` | 独立于游戏和 GUI 的通信层 |
-| `src/link_world.h` | 游戏线程上的采样、模型加载和姿态显示 |
-| `src/link_session.h`、`src/link_entry.h` | 房主快照、入场握手、权限和世界版本 |
+| `src/link_world.h`、`src/link_world_census.h` | 游戏线程上的原生只读采样、统一对象绑定和屏幕标记 |
+| `src/link_session.h`、`src/authority/world_authority.h` | 房间清单、统一意图/结果、对象版本与原生隔离/恢复门禁 |
 | `src/link_gui.cpp`、`src/link_native_gui.h` | 游戏内 ImGui / Unity CanvasRenderer 菜单和 HUD |
 | `src/link_ui_theme.h` | 共用 ImGui 主题：调色板、度量、DPI 缩放与 CJK 字体加载 |
 | `src/link_ui_widgets.h` | 复用控件：卡片、徽章、胶囊、提示条、按钮、开关、字段 |

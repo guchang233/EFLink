@@ -27,7 +27,7 @@ try {
     $taskGui = @('link_gui.obj','imgui.obj','imgui_draw.obj','imgui_tables.obj','imgui_widgets.obj','imgui_impl_win32.obj','imgui_impl_dx11.obj')
     Invoke-TaskCompiler ($taskFlags + @('/LD',"$taskProject\src\link_module.cpp") + $taskGui + @('/Fe:eflink.core.dll','/link','ws2_32.lib','iphlpapi.lib','user32.lib','gdi32.lib','imm32.lib','dwmapi.lib','comctl32.lib','d3d11.lib','dxgi.lib','d3dcompiler.lib','dcomp.lib','/DYNAMICBASE','/NXCOMPAT'))
     Invoke-TaskCompiler ($taskFlags + @('/LD',"$taskProject\examples\echo\echo.cpp",'/Fe:eflink.example.echo.dll','/link','/DYNAMICBASE','/NXCOMPAT'))
-    $taskTests = @('link_appearance_test','link_session_test','link_protocol_test','link_net_test','link_input_ownership_test','link_map_consent_test','link_native_op_policy_test','link_official_view_test','link_official_monster_test','link_api_test')
+    $taskTests = @('link_appearance_test','link_session_test','link_protocol_test','link_net_test','link_input_ownership_test','link_map_consent_test','link_api_test')
     foreach ($taskTest in $taskTests) {
         Invoke-TaskCompiler ($taskFlags + @("$taskProject\tests\$taskTest.cpp","/Fe:$taskTest.exe",'/link','ws2_32.lib','iphlpapi.lib'))
         $taskArguments = if ($taskTest -eq 'link_api_test') { @((Join-Path $taskOutput 'eflink.core.dll'),'eflink.core') } else { @() }

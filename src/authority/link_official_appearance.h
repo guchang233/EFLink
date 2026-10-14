@@ -2,7 +2,7 @@
 // Passive, local-only cache of official character/weapon relationships. Wire
 // fields are from LR-S 936df33f and the project's existing corrected schema.
 // Never injects a bag message, writes a CharBag, loads an asset or sends an RPC.
-#include "link_official_view.h"
+#include "native_wire_fields.h"
 #include "../link_profile.h"
 #include <map>
 #include <limits>
