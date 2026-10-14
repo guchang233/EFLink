@@ -211,10 +211,31 @@ int main() {
     auto disguised=intent;disguised.request=2;
     check(!host.submit(disguised.json(),2,adapter,101),"new request ID cannot disguise the same action strike");
     host.poll(200);check(host.status()["results_confirmed"]==0,"dispatch return without native witness is not a result");
-    adapter.result=Witness{*ticket,10,20,1,mineral(7500).state,host.captureNativeStamp()};host.poll(201);
+    const auto firstEvent=host.captureNativeStamp();
+    host.observe("mineral",{mineral(7500)});
+    adapter.result=Witness{*ticket,10,20,1,mineral(7500).state,firstEvent};host.poll(201);
     check(host.find(target)->version==2&&host.find(target)->state["hp_ratio"]==7500&&host.status()["results_confirmed"]==1,
-        "correlated host native witness commits the observed result exactly once");
+        "correlated witness only acknowledges state already committed by the host native census");
     check(host.status()["full_sync_verified"]==false,"fixture tests never certify real full synchronization");
+    {
+        Host forged;Fixture native;forged.reset(scene(),"fixture-only");
+        forged.observe("player",{{"operator","player",{{"hp",100},{"max_hp",100}},10}});
+        forged.observe("mineral",{mineral()});
+        const auto owner=forged.find("player","operator")->ref,ore=forged.find("mineral","ore-12")->ref;
+        forged.bind(2,1,owner);forged.resume(native);
+        Intent command{scene(),2,1,1,1,1,1,owner,ore,"mine"};
+        const auto first=forged.submit(command.json(),2,native,10);
+        native.result=Witness{*first,10,20,1,mineral().state,forged.captureNativeStamp()};forged.poll(11);
+        check(forged.status()["results_confirmed"]==0&&forged.find(ore)->state["hp_ratio"]==10000,
+            "an event receipt without a subsequent host native census cannot confirm a result");
+        command.request=2;command.action=2;command.strike=2;
+        const auto second=forged.submit(command.json(),2,native,12);
+        const auto callbackStamp=forged.captureNativeStamp();forged.observe("mineral",{mineral(7500)});
+        native.result=Witness{*second,10,20,2,mineral(5000).state,callbackStamp};forged.poll(13);
+        check(forged.status()["results_confirmed"]==0&&forged.find(ore)->state["hp_ratio"]==7500,
+            "an adapter cannot replace a committed host observation with its claimed durability");
+        forged.reset();
+    }
     auto baseline=host.baseline();Replica guest;
     check(!guest.baseline(baseline,scene(),false)&&guest.baseline(baseline,scene(),true),"late join accepts only host unified baseline");
     auto old=guest.version();host.observe("mechanism",{{"lever","mechanism",{{"active",true},{"phase","open"}},30}});
@@ -358,11 +379,12 @@ int main() {
     Replica concurrentGuest;concurrentGuest.baseline(concurrent.baseline(),scene(),true);auto concurrentRevision=concurrentGuest.version();
     const auto precedingBaseline=concurrent.baseline();
     const auto early=concurrent.captureNativeStamp(),laterCapture=concurrent.captureNativeStamp();
+    concurrent.observe("mineral",{mineral(7000)});
     ordered.callbacks.emplace(*concurrentSecond,Witness{*concurrentSecond,10,20,12,mineral(7000).state,laterCapture});concurrent.poll(5);
     ordered.callbacks.emplace(*concurrentFirst,Witness{*concurrentFirst,10,20,11,mineral(8000).state,early});concurrent.poll(6);
     auto concurrencyDelta=concurrent.changesSince(concurrentRevision);
-    check(concurrent.status()["results_confirmed"]==2&&concurrent.find(oreRef)->state["hp_ratio"]==7000&&concurrent.find(oreRef)->version==3,
-        "late correlated callback acknowledges its strike without rolling back a newer native result");
+    check(concurrent.status()["results_confirmed"]==1&&concurrent.find(oreRef)->state["hp_ratio"]==7000&&concurrent.find(oreRef)->version==3,
+        "late callback claiming an older result cannot roll back the newest host native observation");
     Replica finalBaseline;finalBaseline.baseline(concurrent.baseline(),scene(),true);
     check(concurrencyDelta&&concurrentGuest.delta(*concurrencyDelta,true)&&concurrentGuest.snapshot()==finalBaseline.snapshot(),
         "state-preserving receipts share the ordered journal and converge on the newest native state");
@@ -373,7 +395,7 @@ int main() {
     auto unissued=first;unissued.request=3;unissued.strike=3;
     const auto unissuedTicket=concurrent.submit(unissued.json(),2,ordered,7);
     ordered.callbacks.emplace(*unissuedTicket,Witness{*unissuedTicket,10,20,13,mineral(6000).state,UINT64_MAX});concurrent.poll(8);
-    check(concurrent.status()["results_confirmed"]==2&&concurrent.find(oreRef)->state["hp_ratio"]==7000,
+    check(concurrent.status()["results_confirmed"]==1&&concurrent.find(oreRef)->state["hp_ratio"]==7000,
         "unissued future callback stamp cannot certify or replace native state");
     const auto privateWire=concurrent.baseline().dump();
     check(privateWire.find("nativeStamp")==std::string::npos&&privateWire.find("native_stamp")==std::string::npos&&
@@ -421,7 +443,9 @@ int main() {
         Intent input{scene(),2,1,index+(index>=8193?1:0),index,1,1,longActor,longOre,"mine"};
         const auto longTicket=longHost.submit(input.json(),2,longAdapter,index*2);
         if(!longTicket) {continuous=false;break;}
-        longAdapter.result=Witness{*longTicket,10,20,index,mineral().state,longHost.captureNativeStamp()};
+        const auto callbackStamp=longHost.captureNativeStamp();
+        longHost.observe("mineral",{mineral()});
+        longAdapter.result=Witness{*longTicket,10,20,index,mineral().state,callbackStamp};
         longHost.poll(index*2+1);
     }
     check(continuous&&longHost.status()["results_confirmed"]==10020,"a long session does not stop when command/event dedup reaches its memory window");
@@ -432,7 +456,8 @@ int main() {
     const auto oldEventTicket=longHost.submit(newest.json(),2,longAdapter,21000);
     check(oldEventTicket.has_value(),"new input continues after old commands retire");
     if(oldEventTicket) {
-        longAdapter.result=Witness{*oldEventTicket,10,20,1,mineral().state,longHost.captureNativeStamp()};
+        const auto callbackStamp=longHost.captureNativeStamp();longHost.observe("mineral",{mineral()});
+        longAdapter.result=Witness{*oldEventTicket,10,20,1,mineral().state,callbackStamp};
         longHost.poll(21001);
         check(longHost.status()["results_confirmed"]==10020&&longHost.status()["pending"]==0,"event window rejects an evicted old native event even with a fresh capture stamp");
     }

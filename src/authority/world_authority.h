@@ -472,22 +472,16 @@ public:
             if(witness->serial!=t.serial||witness->actorCookie!=t.actorCookie||witness->targetCookie!=t.targetCookie||!witness->event||
                 !validState(witness->state)||!existing||repeatedEvent(t.path,witness->event)||
                 !witness->nativeStamp||witness->nativeStamp<=t.beginStamp||witness->nativeStamp>nextNativeStamp||
-                (witness->nativeStamp==existing->nativeStamp&&witness->state!=existing->state)||
+                // An adapter receipt can only identify an already committed
+                // host-native census. It must never write result state itself.
+                existing->nativeStamp<=t.beginStamp||witness->nativeStamp>existing->nativeStamp||
+                witness->state!=existing->state||
                 revision==UINT64_MAX) {
                 ++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;
             }
             auto& object=objects.at(index(existing->kind,existing->key));
-            auto candidate=object;
-            const bool changed=witness->nativeStamp>object.nativeStamp&&witness->state!=object.state;
-            if(changed) {
-                if(candidate.version==UINT64_MAX) {++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;}
-                candidate.state=witness->state;++candidate.version;
-            }
-            candidate.nativeStamp=std::max(candidate.nativeStamp,witness->nativeStamp);
-            auto full=baseline();for(auto& o:full["objects"])if(o.at("ref")==candidate.ref.json())o=candidate.json();
-            if(full.dump().size()>maxWire) {++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;}
-            object=std::move(candidate);rememberEvent(t.path,witness->event);
-            record(changed?"upsert":"receipt",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
+            rememberEvent(t.path,witness->event);
+            record("receipt",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
             ++confirmed;it=pending.erase(it);
         }
     }
