@@ -249,7 +249,7 @@ public:
 };
 class Host {
     struct Member {std::uint64_t incarnation=0,highRequest=0;std::vector<Ref> actors;bool active=false;};
-    struct Pending {Ticket ticket;NativeAdapter* adapter=nullptr;std::uint64_t deadline=0;};
+    struct Pending {Ticket ticket;NativeAdapter* adapter=nullptr;std::uint64_t deadline=0;std::optional<Witness> event;};
     Scope scope_;std::string gameVersion_;std::thread::id owner;
     std::map<std::string,Object> objects;
     std::map<std::uint16_t,Member> members;
@@ -467,18 +467,21 @@ public:
                 p.adapter->cancel(t);it=pending.erase(it);++rejected;continue;
             }
             if(now>=p.deadline) {p.adapter->cancel(t);it=pending.erase(it);++expired;continue;}
-            std::optional<Witness> witness;try {witness=p.adapter->poll(t);}catch(...) {}
-            if(!witness) {++it;continue;}
+            if(!p.event) {try {p.event=p.adapter->poll(t);}catch(...) {}}
+            if(!p.event) {++it;continue;}
+            const auto& witness=p.event;
             auto* existing=find(t.intent.target);
             if(witness->serial!=t.serial||witness->actorCookie!=t.actorCookie||witness->targetCookie!=t.targetCookie||!witness->event||
                 !validState(witness->state)||!existing||repeatedEvent(t.path,witness->event)||
                 !witness->nativeStamp||witness->nativeStamp<=t.beginStamp||witness->nativeStamp>nextNativeStamp||
-                // An adapter receipt can only identify an already committed
-                // host-native census. It must never write result state itself.
-                existing->nativeStamp<=t.beginStamp||witness->nativeStamp>existing->nativeStamp||
-                witness->state!=existing->state||
                 revision==UINT64_MAX) {
                 ++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;
+            }
+            // Native callbacks can precede the next complete census. Retain
+            // the one-shot event until the host has actually observed this
+            // state, or expire the ticket without manufacturing any result.
+            if(existing->nativeStamp<=t.beginStamp||witness->nativeStamp>existing->nativeStamp||witness->state!=existing->state) {
+                ++it;continue;
             }
             auto& object=objects.at(index(existing->kind,existing->key));
             rememberEvent(t.path,witness->event);
@@ -492,7 +495,8 @@ public:
         if(changes.dump().size()>maxWire-512)return {};
         return Json{{"scope",scope_.json()},{"base",since},{"revision",revision},{"events",std::move(changes)}};
     }
-    Json status() const {return {{"objects",objects.size()},{"revision",revision},{"pending",pending.size()},{"suspended",suspended},
+    Json status() const {std::size_t awaitingCensus=0;for(const auto& [serial,p]:pending)if(p.event)++awaitingCensus;
+        return {{"objects",objects.size()},{"revision",revision},{"pending",pending.size()},{"awaiting_native_census",awaitingCensus},{"suspended",suspended},
         {"intents_accepted",accepted},{"intents_rejected",rejected},{"results_confirmed",confirmed},{"expired",expired},
         {"dedup_commands",strikes.size()},{"dedup_event_paths",nativeEvents.size()},
         {"full_sync_verified",false},{"native_execution_supported",false},{"account_risk",true}};}

@@ -216,8 +216,10 @@ int main() {
     check(!host.submit(disguised.json(),2,adapter,101),"new request ID cannot disguise the same action strike");
     host.poll(200);check(host.status()["results_confirmed"]==0,"dispatch return without native witness is not a result");
     const auto firstEvent=host.captureNativeStamp();
-    host.observe("mineral",{mineral(7500)});
     adapter.result=Witness{*ticket,10,20,1,mineral(7500).state,firstEvent};host.poll(201);
+    check(host.status()["awaiting_native_census"]==1&&host.find(target)->state["hp_ratio"]==10000,
+        "an early native callback waits without manufacturing durability before the next census");
+    host.observe("mineral",{mineral(7500)});host.poll(202);
     check(host.find(target)->version==2&&host.find(target)->state["hp_ratio"]==7500&&host.status()["results_confirmed"]==1,
         "correlated witness only acknowledges state already committed by the host native census");
     check(host.status()["full_sync_verified"]==false,"fixture tests never certify real full synchronization");
@@ -230,14 +232,18 @@ int main() {
         Intent command{scene(),2,1,1,1,1,1,owner,ore,"mine"};
         const auto first=forged.submit(command.json(),2,native,10);
         native.result=Witness{*first,10,20,1,mineral().state,forged.captureNativeStamp()};forged.poll(11);
-        check(forged.status()["results_confirmed"]==0&&forged.find(ore)->state["hp_ratio"]==10000,
-            "an event receipt without a subsequent host native census cannot confirm a result");
+        check(forged.status()["results_confirmed"]==0&&forged.status()["awaiting_native_census"]==1&&
+              forged.find(ore)->state["hp_ratio"]==10000,
+            "an event receipt without a subsequent host native census stays pending and cannot confirm a result");
         command.request=2;command.action=2;command.strike=2;
         const auto second=forged.submit(command.json(),2,native,12);
         const auto callbackStamp=forged.captureNativeStamp();forged.observe("mineral",{mineral(7500)});
         native.result=Witness{*second,10,20,2,mineral(5000).state,callbackStamp};forged.poll(13);
         check(forged.status()["results_confirmed"]==0&&forged.find(ore)->state["hp_ratio"]==7500,
             "an adapter cannot replace a committed host observation with its claimed durability");
+        forged.poll(2000);
+        check(forged.status()["pending"]==0&&forged.status()["expired"]==2&&forged.find(ore)->state["hp_ratio"]==7500,
+            "cached callbacks expire without changing host-observed state when no matching census arrives");
         forged.reset();
     }
     auto baseline=host.baseline();Replica guest;

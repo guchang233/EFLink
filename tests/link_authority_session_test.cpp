@@ -9,7 +9,6 @@ struct Fixture final:NativeAdapter {
     Session* session=nullptr;bool certified=true,dualCertified=true,saved=false,restoreReady=false,restoreStarted=false,acceptCast=false;
     Json lastInput;
     std::uint64_t revision=0,event=0;unsigned begins=0,cancels=0,applications=0;std::optional<Witness> result;
-    bool awaitingPostDispatchFrame=false;
     std::string gameVersion() const override{return "fixture-game";}
     std::string path() const override{return "transport-fixture-only";}
     bool executionVerified() const override{return certified;}
@@ -23,19 +22,9 @@ struct Fixture final:NativeAdapter {
         lastInput=ticket.intent.input;
         result=Witness{ticket.serial,ticket.actorCookie,ticket.targetCookie,++event,
             {{"template","ore"},{"hp_ratio",9000},{"max_hp_ratio",10000},{"collected",false}},session->captureNativeResultStamp()};
-        awaitingPostDispatchFrame=true;
         return true;
     }
-    std::optional<Witness> poll(const Ticket&) override {
-        if(!result)return {};
-        if(awaitingPostDispatchFrame) {awaitingPostDispatchFrame=false;return {};}
-        bool observed=false;
-        const auto baseline=session->authorityBaseline();
-        for(const auto& object:baseline.at("objects"))
-            if(object.at("kind")=="mineral"&&object.at("state")==result->state)observed=true;
-        if(!observed)return {};
-        auto value=result;result.reset();return value;
-    }
+    std::optional<Witness> poll(const Ticket&) override {auto value=result;result.reset();return value;}
     void cancel(const Ticket&) noexcept override{++cancels;result.reset();}
     std::optional<std::uint64_t> capturePersonal() override{saved=true;return 11;}
     bool personalRetained(std::uint64_t handle) const override{return saved&&handle==11;}
