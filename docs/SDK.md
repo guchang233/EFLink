@@ -8,11 +8,13 @@ V1 调用方继续可用。
 
 先调用 `get_world_json(nullptr, 0)` 得到含结尾 NUL 的所需字节数，分配自己的
 缓冲区后再次调用；若返回所需长度增大，扩容重试。容量不足时不写入。
-JSON 包含 `session`（epoch、revision、就绪状态）、`world`（地图、稳定实体编号）
-与 `native`（应用与传送状态），不暴露 Unity 地址。
+JSON 包含 `session`（epoch、revision、就绪状态）、`world`（地图清单）、
+`native`（原生能力诊断）和 `objects`（统一权威账本的公共对象），不暴露 Unity 地址。
+对象的 `ref` 同时包含身份和生命周期；`version`、`state`、`relations` 由同一账本生成。
+只读账本数据一致不能证明房客原生世界已接管或玩法已经支持。
 
-`request_teleport(peer)` 为异步提交，返回成功不等于抵达；查看
-`native.teleport` 与 `native.teleports_completed`。游戏接口仅在游戏线程执行。
+`request_teleport(peer)` 保留 V2 函数表位置，目前拒绝请求：原生换图、隔离及恢复未验收。
+调用方不得依据 ABI 存在就把传送列为已支持。
 `eflink.world.v1` 为保留通道；额外领域适配使用自己的命名通道。
 
 世界 JSON 中 `session.ready` 只表示已收到有效且新鲜的快照；真正完成世界入场

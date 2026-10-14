@@ -304,3 +304,11 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 玩家账本与只读表现采样共用 ServerSquad 的实际 slots/GetMemberBySlot，避免把临时采矿/剧情 currentSquad 当作整个正式队伍。检查真实队伍是否释放、槽位容量、角色别名和实际成员，未构造角色、补空槽或查询外来账号；世界 JSON 增加 real_slots/real_entities/current_slots/current_is_real 的来源诊断。采到一个成员就只发布一个成员，不能伪造剩余三人。
 
 完整构建、15 组检查、源指纹和 ABI 通过，恢复包 SHA256 `431AB5414A764AD2FA43CC7D02BF87AC55DBDFC55FF3030145538F262B9FE32A`。两真实客户端 `.70` 只读验证一致的 45 个矿石与 1 个玩家，实机正式队伍确实 real_slots=1/real_entities=1 且 current_is_real=true；因此这次测试不能验证四人队伍或“剩余三个角色”的表现。自动离房与引用清理通过，没有共享玩法执行、原生世界隔离/应用或个人世界恢复测试。只读接口核对还确认 NetResponse 的 headMsg/msgBody、原生交互属性通知结构与 WorldManagerCollection；未读取实际登录消息或调用管理器初始化/释放。旧只读 inspector 已停用。整个目标继续未完成，下一步必须推进生产原生执行和隔离路径。
+
+## 原生整帧身份与状态提交（.71）
+
+矿石、正式队伍及怪物原生读取改为同一帧准备，并用 `observeNativeFrame` 原子校验。原生绑定表、矿石 GC 根及公开状态均先暂存；任何类别读取失败、无效对象图或账本拒绝都保留上一帧的身份和状态。账本接受后才一起替换绑定与资源根；旧根释放与房间清理仍在游戏线程执行。事务拒绝重复提交、过期/外来事务，以及发布回调中的原表或候选表重入修改。没有新增本地玩法模拟。
+
+用户补齐队伍后，`.70` 已核对两端真实正式队伍均为 4 槽/4 角色，房客接收与房主相同的 45 矿石和 4 玩家公共对象。此为只读数据链验证，不是四角色表现或矿石端到端验收。只读原生方法核对确认 `ServerSyncInteractiveProperty` 经数据存储取得 `InteractiveInfo`，调用 `UpdateServerProperty`；消息编号不能直接冒充 NatureResourceManager 资源编号。未调用这些更新/创建路径，检查器已停用。
+
+完整构建、15 组独立检查、源指纹和 V1/V2 ABI 通过；不可覆盖的恢复包 SHA256 为 `6CAD17CCF157CECDFDB401181534A685EFC6B49A092E6B9BD7D27AEFF30AD482`。原生执行、客机隔离/应用、个人世界恢复和端到端验收仍未完成，`full_sync_verified=false`。

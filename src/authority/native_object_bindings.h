@@ -16,8 +16,14 @@ struct NativeBinding {std::string kind,key;NativeAllocation allocation;std::uint
 class NativeObjectBindings {
     std::map<std::pair<std::string,std::string>,NativeBinding> entries;
     std::uint64_t nextCookie=0;
+    std::uint64_t revision=0,sourceRevision=0;
+    const NativeObjectBindings* source=nullptr;
+    bool committing=false;
     std::thread::id owner;
+    explicit NativeObjectBindings(const NativeObjectBindings& value,int)
+        :entries(value.entries),nextCookie(value.nextCookie),sourceRevision(value.revision),source(&value),owner(value.owner) {}
     void thread() {
+        if(committing)throw std::runtime_error("native binding mutation during authority commit");
         if(owner==std::thread::id{})owner=std::this_thread::get_id();
         if(owner!=std::this_thread::get_id())throw std::runtime_error("native binding mutation outside game thread");
     }
@@ -25,6 +31,20 @@ public:
     NativeObjectBindings()=default;
     NativeObjectBindings(const NativeObjectBindings&)=delete;
     NativeObjectBindings& operator=(const NativeObjectBindings&)=delete;
+    // Prepare all native kinds privately. Cookies and retirements become
+    // visible only after the authority accepts the complete observed frame.
+    NativeObjectBindings preview() {thread();return NativeObjectBindings(*this,0);}
+    template<class Accept> bool commitWith(NativeObjectBindings& candidate,Accept accept) {
+        thread();candidate.thread();
+        if(candidate.source!=this||candidate.sourceRevision!=revision)
+            throw std::runtime_error("stale or foreign native binding transaction");
+        committing=candidate.committing=true;bool accepted=false;
+        try {accepted=accept();}catch(...) {committing=candidate.committing=false;throw;}
+        committing=candidate.committing=false;if(!accepted)return false;
+        // No allocation or game call after authority acceptance.
+        entries.swap(candidate.entries);nextCookie=candidate.nextCookie;++revision;
+        candidate.source=nullptr;return true;
+    }
     // An adapter supplies a COMPLETE census for one kind. Failure/truncation
     // must not retire live objects. Other kinds retain their own bindings.
     void reconcile(const std::string& kind,const std::vector<NativeBindingInput>& census) {
@@ -52,11 +72,11 @@ public:
             if(it->first.first==kind&&!seen.contains(it->first.second))it=candidate.erase(it);else ++it;
         }
         if(candidate.size()>Host::maxObjects)throw std::runtime_error("native binding capacity exceeded");
-        entries.swap(candidate);nextCookie=counter;
+        entries.swap(candidate);nextCookie=counter;++revision;
     }
     // Scene/room teardown retires all bindings. Allocation counters survive
     // resets so a pooled address cannot resurrect a previous object's cookie.
-    void clear() {thread();entries.clear();}
+    void clear() {thread();entries.clear();++revision;}
     void retireKind(const std::string& kind) {reconcile(kind,{});}
     const NativeBinding* find(const std::string& kind,const std::string& key) const {
         auto it=entries.find({kind,key});return it==entries.end()?nullptr:&it->second;

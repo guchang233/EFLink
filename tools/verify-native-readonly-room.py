@@ -58,10 +58,13 @@ def run(args):
             guest_revision = states[1]["session"]["world_authority"]["replica_revision"]
             census = values[0]["game"]["world_replication"]["native_census"]
             player = census.get("player", {})
+            squads_ready = not args.party_size or all(
+                value["game"]["world_replication"].get("native_squad_source", {}).get("real_entities") == args.party_size
+                for value in values)
             if player.get("error"):
                 raise RuntimeError("Native player census: " + player["error"])
             if (all(value["world_session"]["ready"] and value["world_session"]["protocol"]["compatible"] for value in values)
-                    and player.get("observed") and player.get("objects", 0) > 0
+                    and squads_ready and player.get("observed") and player.get("objects", 0) > 0
                     and states[0]["objects"] and host_revision == guest_revision
                     and states[0]["objects"] == states[1]["objects"]):
                 aligned = (values, states)
@@ -75,9 +78,14 @@ def run(args):
             raise RuntimeError("No native minerals were enumerated")
         if any(value["world_session"]["entry"]["active"] for value in values):
             raise RuntimeError("Read-only transport must not admit gameplay")
+        squads = [value["game"]["world_replication"].get("native_squad_source", {}) for value in values]
+        if args.party_size and (counts["player"] != args.party_size or any(
+                squad.get("real_slots") != args.party_size or squad.get("real_entities") != args.party_size for squad in squads)):
+            raise RuntimeError("Both native real squads and the host ledger must contain the required party size")
         report.update(object_kinds=dict(counts), objects_match=True,
                       native_census=values[0]["game"]["world_replication"]["native_census"],
                       native_squad_source=values[0]["game"]["world_replication"].get("native_squad_source", {}),
+                      native_squad_sources=squads,
                       scene_generation=states[0]["session"]["epoch"],
                       native_objects=states[0]["objects"])
         first = values[0]["world_session"]["world_authority"]["transport"]
@@ -128,6 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--guest-index", type=Path, default=base / "_1/AppData/Local/EFML/modules/index.json")
     parser.add_argument("--port", type=int, default=48667)
     parser.add_argument("--seconds", type=float, default=8)
+    parser.add_argument("--party-size", type=int, choices=range(1, 5), default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535 or not 1 <= args.seconds <= 40:

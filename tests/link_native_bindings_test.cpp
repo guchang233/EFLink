@@ -39,4 +39,24 @@ int main() {
         check(bindings.resolve(kind,"object",actor)!=nullptr,"shared identity rules support every declared world kind");
     }
     check(rejects([&]{bindings.reconcile("reward",{{"item",actor}});}),"account rewards are not shared-world binding kinds");
+    const auto retained=bindings.find("mineral","ore")->cookie;
+    auto trial=bindings.preview();
+    trial.reconcile("mineral",{});trial.reconcile("player",{{"new-player",ore}});
+    check(!bindings.commitWith(trial,[]{return false;})&&bindings.find("mineral","ore")->cookie==retained&&
+        !bindings.find("player","new-player"),"authority rejection cannot retire or expose any staged native identity");
+    check(rejects([&]{bindings.commitWith(trial,[]{throw std::runtime_error("invalid frame");return true;});})&&
+        bindings.find("mineral","ore"),"authority validation exception preserves the native allocation table");
+    check(bindings.commitWith(trial,[]{return true;})&&!bindings.find("mineral","ore")&&
+        bindings.find("player","new-player"),"accepted cross-kind frame commits retirements and new bindings together");
+    check(rejects([&]{bindings.commitWith(trial,[]{return true;});}),"native transaction cannot be committed twice");
+    auto stale=bindings.preview();bindings.retireKind("player");bool called=false;
+    check(rejects([&]{bindings.commitWith(stale,[&]{called=true;return true;});})&&!called,
+        "stale transaction cannot publish authority before discovering changed bindings");
+    NativeObjectBindings foreign;auto another=foreign.preview();
+    check(rejects([&]{bindings.commitWith(another,[]{return true;});}),"foreign native transaction is rejected");
+    auto reentrant=bindings.preview();
+    check(rejects([&]{bindings.commitWith(reentrant,[&]{bindings.clear();return true;});})&&bindings.size()!=0,
+        "authority callback cannot mutate bindings while publishing a frame");
+    check(rejects([&]{bindings.commitWith(reentrant,[&]{reentrant.clear();return true;});})&&bindings.size()!=0,
+        "authority callback cannot change the prepared frame's identities during publication");
 }

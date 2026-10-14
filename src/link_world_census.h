@@ -1,12 +1,11 @@
     // Included inside World. Real host Entity/AbilitySystem facts use the same
     // binding allocator and ledger as minerals. Census never executes inputs or
     // supplies an operation witness, ownership grant or gameplay certificate.
-    std::uint32_t actorCensusRoom=0;std::uint64_t actorCensusEpoch=0,lastActorCensus=0;
     struct CensusStatus {std::uint64_t scans=0,observed=0;std::size_t objects=0;std::string error;};
     std::map<std::string,CensusStatus> actorCensusStatus;
     void clearNativeCensus() {
         nativeObjectBindings.retireKind("player");nativeObjectBindings.retireKind("enemy");
-        actorCensusRoom=0;actorCensusEpoch=lastActorCensus=0;actorCensusStatus.clear();
+        actorCensusStatus.clear();nativeSquadSource=Json::object();
     }
     worldauthority::Observation readNativeBattle(void* entity,const std::string& kind,const std::string& key) {
         if(!usable(entity)||!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity))
@@ -42,7 +41,7 @@
             api.value<float>(gm("AbilitySystem","get_maxPoise","","System.Single"),ability),
             api.value<bool>(entityAlive,entity)});
     }
-    std::vector<worldauthority::Observation> sampleNativeBattle(const std::string& kind) {
+    std::vector<worldauthority::Observation> sampleNativeBattle(const std::string& kind,worldauthority::NativeObjectBindings& staged) {
         std::vector<std::pair<std::string,void*>> entities;
         if(kind=="player") {
             for(const auto& [slot,entity]:nativeRealSquadMembers())
@@ -67,29 +66,9 @@
             const auto identity=identityOf(entity);
             bindings.push_back({key,{reinterpret_cast<std::uintptr_t>(entity),identity.instance,0,identity.generation,identity.server,0}});
         }
-        nativeObjectBindings.reconcile(kind,bindings);
-        for(auto& fact:facts)fact.cookie=nativeObjectBindings.find(kind,fact.key)->cookie;
+        staged.reconcile(kind,bindings);
+        for(auto& fact:facts)fact.cookie=staged.find(kind,fact.key)->cookie;
         return facts;
-    }
-    void updateNativeCensus(Net& net,Session& link) {
-        const auto snapshot=net.snapshot();
-        if(snapshot.role!=Role::Host||!link.ready()||!link.followHost||!link.combat||!link.localSceneOperational()||!nativeSceneInitialized||
-           link.snapshot().value("map",std::string{})!=mapId||link.snapshot().value("level",std::string{})!=levelId) {
-            if(actorCensusRoom)clearNativeCensus();return;
-        }
-        if(actorCensusRoom!=snapshot.roomId||actorCensusEpoch!=link.generation()) {
-            clearNativeCensus();actorCensusRoom=snapshot.roomId;actorCensusEpoch=link.generation();
-        }
-        if(nowMs()-lastActorCensus<100)return;lastActorCensus=nowMs();
-        for(const std::string kind:{"player","enemy"}) {
-            auto& status=actorCensusStatus[kind];
-            try {
-                auto facts=sampleNativeBattle(kind);
-                if(!link.observeNativeObjects(kind,facts))throw std::runtime_error("unified authority rejected native census; previous baseline retained");
-                ++status.scans;status.objects=facts.size();status.observed=nowMs();status.error.clear();
-            }catch(const std::exception& e) {status.error=e.what();}
-        }
-        link.publishAuthority(net);
     }
     Json nativeCensusStatus() const {
         Json value=Json::object();

@@ -602,7 +602,10 @@ public:
         mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
         nlohmann::json resources=nlohmann::json::array();
         nlohmann::json properties;
-        try {for(const auto& value:sampleResources()) {auto state=value.state;state["key"]=value.key;state["kind"]=value.kind;resources.push_back(std::move(state));}properties=resourceProperties();}
+        try {
+            auto staged=nativeObjectBindings.preview();NativeResourceSample sample(*this);sampleResources(staged,sample);
+            resources.swap(sample.census);nativeResources.swap(sample.resources);properties=resourceProperties();
+        }
         catch(...) {clearResources();throw;}
         auto types=resourceNativeTypes;auto unknown=resourceUnknown;clearResources();
         return {{"map",mapId},{"level",levelId},{"resources",resources},{"properties",properties},{"native_types",types},{"unadapted",unknown},{"gameplay_modified",false}};
@@ -800,7 +803,6 @@ public:
         }
         updatePresentation(net,link);
         updateResources(net,link);
-        updateNativeCensus(net,link);
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
         perf.remotesMs=0; // no uncertified model/effect replay

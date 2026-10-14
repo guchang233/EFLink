@@ -7,13 +7,23 @@
     struct NativeResource {void* object=nullptr;std::uint32_t root=0,component=0;std::uint64_t incarnation=0,natureId=0;
         NativeIdentity identity;std::string type,space,key;};
     std::map<std::string,NativeResource> nativeResources;
+    struct NativeResourceSample {
+        World& world;std::map<std::string,NativeResource> resources;
+        std::vector<worldauthority::Observation> facts;
+        nlohmann::json census=nlohmann::json::array();
+        explicit NativeResourceSample(World& value):world(value) {}
+        ~NativeResourceSample() {for(auto& [key,value]:resources)world.release(value.root);}
+        NativeResourceSample(const NativeResourceSample&)=delete;
+        NativeResourceSample& operator=(const NativeResourceSample&)=delete;
+    };
     void clearResources() {
         nativeObjectBindings.retireKind("mineral");
         for(auto& [key,resource]:nativeResources)release(resource.root);
         nativeResources.clear();nativeResourceCensus=nlohmann::json::array();
         resourceRoom=0;resourceEpoch=lastResourceScan=lastResourceSuccess=0;
+        clearNativeCensus();
     }
-    std::vector<worldauthority::Observation> sampleResources() {
+    void sampleResources(worldauthority::NativeObjectBindings& staged,NativeResourceSample& output) {
         std::vector<worldauthority::Observation> result;
         std::vector<worldauthority::NativeBindingInput> bindings;
         std::map<std::string,NativeResource> sampled;
@@ -78,13 +88,14 @@
                 if(result.size()>512)throw std::runtime_error("native mineral baseline exceeds capacity");
             }
             if(!complete)throw std::runtime_error("native resource census truncated; previous baseline retained");
-            nativeObjectBindings.reconcile("mineral",bindings);
+            staged.reconcile("mineral",bindings);
             for(auto& observation:result) {
-                const auto cookie=nativeObjectBindings.find("mineral",observation.key)->cookie;
+                const auto cookie=staged.find("mineral",observation.key)->cookie;
                 observation.cookie=cookie;sampled.at(observation.key).incarnation=cookie;
+                auto state=observation.state;state["key"]=observation.key;state["kind"]=observation.kind;
+                output.census.push_back(std::move(state));
             }
-            for(auto& [key,value]:nativeResources)release(value.root);
-            nativeResources=std::move(sampled);return result;
+            output.resources.swap(sampled);output.facts.swap(result);
         }catch(...) {cleanup();throw;}
     }
     void updateResources(Net& net,Session& link) {
@@ -97,16 +108,27 @@
             clearResources();resourceRoom=snapshot.roomId;resourceEpoch=link.generation();
         }
         if(nowMs()-lastResourceScan<100)return;lastResourceScan=nowMs();
+        NativeResourceSample sample(*this);
         try {
-            const auto observations=sampleResources();nativeResourceCensus=nlohmann::json::array();
-            for(const auto& observation:observations) {
-                auto state=observation.state;state["key"]=observation.key;state["kind"]=observation.kind;nativeResourceCensus.push_back(std::move(state));
-            }
+            auto staged=nativeObjectBindings.preview();
+            sampleResources(staged,sample);
+            std::map<std::string,std::vector<worldauthority::Observation>> frame;
             if(snapshot.role==Role::Host) {
-                if(!link.observeNativeObjects("mineral",observations))throw std::runtime_error("unified authority rejected native mineral census; previous baseline retained");
-                link.publishAuthority(net);
+                for(const std::string kind:{"player","enemy"}) {
+                    try {frame[kind]=sampleNativeBattle(kind,staged);}
+                    catch(const std::exception& e) {actorCensusStatus[kind].error=e.what();throw;}
+                }
+                frame["mineral"]=sample.facts;
+            }
+            if(!nativeObjectBindings.commitWith(staged,[&] {return snapshot.role!=Role::Host||link.observeNativeFrame(frame);}))
+                throw std::runtime_error("unified authority rejected native frame; bindings and previous baseline retained");
+            nativeResources.swap(sample.resources);nativeResourceCensus.swap(sample.census);
+            for(const auto& [kind,facts]:frame) {
+                if(kind=="mineral")continue;
+                auto& status=actorCensusStatus[kind];++status.scans;status.objects=facts.size();status.observed=nowMs();status.error.clear();
             }
             ++resourceScans;lastResourceSuccess=nowMs();resourceError.clear();
+            if(snapshot.role==Role::Host)link.publishAuthority(net);
         }catch(const std::exception& e) {resourceError=e.what();}
     }
     nlohmann::json resourceProperties() {
