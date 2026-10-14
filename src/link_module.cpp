@@ -32,6 +32,8 @@ eflink::Session session;
 eflink::Gui gui;
 std::recursive_mutex worldMutex;
 std::atomic<bool> hooked=false,canvasHooked=false,cleanupRequested=false,cleanupDone=false;
+std::atomic<bool> worldEverTicked=false,cleanupTaskScheduled=false;
+const eflink::worldauthority::EfmlHostExtensionV1* efmlLifecycleHost=nullptr;
 bool cleanupNetworkStopped=false; // protected by lifecycle
 std::jthread hookWorker;
 json configuration=json::object();
@@ -79,14 +81,23 @@ void cleanupOnGameThread(const BE_HostApiV1* api) {
     if(!session.prepareNativeShutdown())return;
     gui.shutdownGame(api);world.shutdown();cleanupDone.store(true);
 }
+void BE_CALL cleanupTask(void*) {
+    std::lock_guard lock(worldMutex);
+    try {if(auto* api=runtime())cleanupOnGameThread(api);}
+    catch(const std::exception& e) {hookError=e.what();}
+    catch(...) {hookError="native cleanup callback failed";}
+    cleanupTaskScheduled.store(false);
+}
 void __fastcall onTick(void* instance,float delta,void* info) {
     if(nextTick) nextTick(instance,delta,info);
     // Identical native bodies can be folded together; only CameraManager's tick counts.
     if(!instance||(info&&info!=tickMethod.method_info)||!isCameraManager(instance)) return;
     std::lock_guard lock(worldMutex);
     auto* api=runtime();if(!api) return;
+    worldEverTicked.store(true);
     if(cleanupRequested.load()) {
         try {cleanupOnGameThread(api);} catch(const std::exception& e) {hookError=e.what();}
+        catch(...) {hookError="native cleanup callback failed";}
         return;
     }
     world.tick(api,net,session);
@@ -100,6 +111,7 @@ void __fastcall onCanvas(void* info) {
     // Consistent lock order: GUI actions can re-enter lifecycle and worldMutex.
     std::unique_lock lock(lifecycle,std::try_to_lock);if(!lock.owns_lock()) return;
     std::lock_guard lockWorld(worldMutex);auto* api=runtime();if(!api) return;
+    worldEverTicked.store(true);
     rendering=true;
     try {
         if(cleanupRequested.load()) {
@@ -365,9 +377,11 @@ BE_Result BE_CALL initialize(const BE_ThirdPartyHostV1* input,const char* config
         net.version=kVersion;net.onData=deliver;net.onPeer=peerChanged;
         eflink::migrateMenuKey(parsed);
         applyConfiguration(parsed);
-        session.setShutdownBarrierAvailable(eflink::worldauthority::hasShutdownBarrier(input));
+        efmlLifecycleHost=eflink::worldauthority::shutdownBarrierExtension(input);
+        session.setShutdownBarrierAvailable(efmlLifecycleHost!=nullptr);
         if(!net.start()) {host={};return BE_Result_Failed;}
         cleanupRequested=false;cleanupDone=false;cleanupNetworkStopped=false;
+        worldEverTicked=false;cleanupTaskScheduled=false;
         hookError.clear();guiError.clear();
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         {std::lock_guard nativeLoggerLock(worldMutex);world.setNativeOperationLogger([](const std::string& message){if(host.log)host.log(host.context,message.c_str());});}
@@ -416,7 +430,12 @@ BE_Result BE_CALL prepareShutdown() {
         cleanupRequested.store(true);
         net.stop();cleanupNetworkStopped=true;
     }
-    return cleanupDone.load()||(!hooked.load()&&!canvasHooked.load())?BE_Result_Ok:BE_Result_NotReady;
+    if(!worldEverTicked.load()) {cleanupDone.store(true);return BE_Result_Ok;}
+    if(!cleanupDone.load()&&efmlLifecycleHost&&!cleanupTaskScheduled.exchange(true)) {
+        if(efmlLifecycleHost->post_to_game_thread(host.context,cleanupTask,nullptr)!=BE_Result_Ok)
+            cleanupTaskScheduled.store(false);
+    }
+    return cleanupDone.load()?BE_Result_Ok:BE_Result_NotReady;
 }
 void BE_CALL shutdown() {
     {std::lock_guard lock(lifecycle);if(!initialized) return;initialized=false;}

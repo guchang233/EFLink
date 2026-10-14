@@ -23,6 +23,7 @@ BE_Result BE_CALL reply(void*,const char*,BE_Result,const char* body) {
 }
 BE_Result BE_CALL emit(void*,const char*) {return BE_Result_Ok;}
 const BE_HostApiV1* BE_CALL noRuntime(void*) {return nullptr;}
+BE_Result BE_CALL acceptGameTask(void*,void(BE_CALL*)(void*),void*) {return BE_Result_Ok;}
 const BE_ThirdPartyModuleV1* module=nullptr;
 json send(const json& body) {
     int before;{std::lock_guard lock(replyMutex);before=replies;}
@@ -52,11 +53,14 @@ int main(int argc,char** argv) {
         reinterpret_cast<const eflink::worldauthority::EfmlModuleWithShutdownBarrierV1*>(module)->prepare_shutdown,
         "EFML shutdown barrier extends the unchanged V1 module prefix");
     eflink::worldauthority::EfmlHostExtensionV1 extension{};
-    extension.struct_size=sizeof(extension);extension.version=1;extension.feature_flags=eflink::worldauthority::shutdownBarrierFeature;
+    extension.struct_size=sizeof(extension);extension.version=1;
+    extension.post_to_game_thread=acceptGameTask;extension.feature_flags=eflink::worldauthority::shutdownBarrierFeature;
     eflink::worldauthority::EfmlHostV1 extendedHost{};extendedHost.base.struct_size=sizeof(extendedHost);extendedHost.efml=&extension;
     check(eflink::worldauthority::hasShutdownBarrier(&extendedHost.base),"EFML host reports its native restoration barrier");
     extension.feature_flags=0;
     check(!eflink::worldauthority::hasShutdownBarrier(&extendedHost.base),"an older host cannot enable native gameplay by size alone");
+    extension.feature_flags=eflink::worldauthority::shutdownBarrierFeature;extension.post_to_game_thread=nullptr;
+    check(!eflink::worldauthority::hasShutdownBarrier(&extendedHost.base),"shutdown support also requires a working game-thread dispatch entry");
     auto getWorld=reinterpret_cast<EFLink_GetApiV2Fn>(GetProcAddress(library,EFLINK_ENTRY_V2));
     auto* worldApi=getWorld?getWorld():nullptr;
     check(worldApi&&worldApi->version==2&&worldApi->transport==api,"V2 world API preserves the original transport ABI");
