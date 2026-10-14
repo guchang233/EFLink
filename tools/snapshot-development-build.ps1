@@ -23,6 +23,8 @@ foreach($taskRoot in @('src','include','tests','docs','vendor')) {Copy-Item -Lit
 $taskTools=Join-Path $taskSnapshot 'tools'
 New-Item -ItemType Directory -Path $taskTools | Out-Null
 Get-ChildItem -LiteralPath $PSScriptRoot -File | Copy-Item -Destination $taskTools
+$taskNotices=Join-Path $PSScriptRoot 'third_party'
+if(Test-Path -LiteralPath $taskNotices) {Copy-Item -LiteralPath $taskNotices -Destination $taskTools -Recurse}
 foreach($taskFile in @('module.json','LICENSE','README.md')) {Copy-Item -LiteralPath (Join-Path $taskProject $taskFile) -Destination $taskSnapshot}
 Copy-Item -LiteralPath $taskDll -Destination $taskSnapshot
 $taskSymbols=Join-Path $taskBuild "$ModuleId.pdb"
