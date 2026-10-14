@@ -9,10 +9,7 @@
 #include "authority/native_object_bindings.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
-#include "authority/link_native_feed.h"
 #include "authority/link_metadata.h"
-#include "authority/link_native_op_policy.h"
-#include "authority/link_official_view.h"
 #include "authority/link_official_appearance.h"
 #include "nlohmann/json.hpp"
 #include <chrono>
@@ -21,14 +18,6 @@
 #include <optional>
 
 namespace eflink {
-// The rejected private-world quarantine/replica adapter must never certify or
-// execute shared-world admission. Replaced by the native server adapter in progress.
-inline constexpr bool legacyReplicaAdapterAvailable=false;
-// Native world feed: the guest's client receives the host world's monsters as
-// standard server messages (same server IDs, native create/spawn/remove), and
-// its own account monsters leave view natively instead of being hidden.
-inline constexpr bool nativeFeedAdapter=false;
-inline constexpr bool roomAdapterAvailable=legacyReplicaAdapterAvailable||nativeFeedAdapter;
 class World {
     using V3=eflink::unity::V3;using Q=eflink::unity::Quaternion;
     eflink::unity::Api api;
@@ -56,11 +45,10 @@ class World {
     std::uint64_t lastAppearanceSample=0;
     std::string appearanceModel,appearanceError;
     BE_ResolvedMethodV1 mainCharacter{},entityAlive{},entityCinematic{},entityModel{},modelGo{},modelPath{},
-        getTransform{},getPosition{},getRotation{},setPosition{},setRotation{},getLocalRotation{},setLocalRotation{},
-        getLocalPosition{},setLocalPosition{},isAlive{},objectName{},setActive{},destroy{},
-        childrenOf{},mapIdText{},levelIdText{},instantiate{},handleGet{},pathHash{},behaviourEnabled{},colliderEnabled{};
+        getTransform{},getPosition{},getRotation{},getLocalRotation{},
+        getLocalPosition{},isAlive{},objectName{},
+        childrenOf{},mapIdText{},levelIdText{};
     const void* worldInfoField=nullptr;
-    void* loader=nullptr;std::uint32_t loaderRoot=0;
 
     // Local player.
     void* character=nullptr;void* model=nullptr;std::uint32_t modelRoot=0;
@@ -73,209 +61,18 @@ class World {
     bool backgroundLease=false,backgroundOriginal=false,simulationPaused=false,nativeSceneInitialized=false;
     float nativeTimeScale=1,nativeDeltaTime=0;
 
-    struct Actor {
-        std::uint64_t id=0,epoch=0,retry=0,presentationLife=0;std::uint16_t peer=0;
-        std::string model,templateId,error;
-        void* entity=nullptr;void* info=nullptr;
-        void* movement=nullptr;
-        NativeIdentity identity;
-        std::uint32_t entityRoot=0,infoRoot=0;
-        bool registered=false,inited=false,started=false,aiPaused=false,bound=false,hpInitialized=false,casting=false,abilityTicking=false;
-        double hp=0,maxHp=0;std::size_t skillCount=0;
-        std::map<std::string,Realm::SkillRule> catalog;
-        std::uint64_t teleports=0;
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-        nlohmann::json movementDiagnostics=nlohmann::json::object();
-        std::uint64_t lastDiagnostics=0;
-#endif
-        nlohmann::json waiting=nlohmann::json::array();
-        nlohmann::json growth;
-        nlohmann::json appearance=nlohmann::json::object();
-        std::string weaponError;
-        bool weaponLoaded=false;
-        std::uint64_t weaponReloads=0,weaponRetry=0;
-        int weaponState=-1;
-    };
-    std::map<std::uint16_t,Actor> actors;
-    std::map<std::uint16_t,nlohmann::json> actorTravelGrants;
     Session* session=nullptr;
     worldauthority::NativeObjectBindings nativeObjectBindings;
-    bool nativeCombatReady=false,nativeIsolationReady=false;
-    bool nativeWeaponLookupReady=false;
-    std::uint64_t roomCharacterLookups=0;
-    struct ObservedPlayerCast {void* skill=nullptr;std::uint32_t root=0,nativeId=0;std::uint64_t actor=0,epoch=0,seen=0;NativeIdentity source;void* entity=nullptr;nlohmann::json event;int pendingFinish=-1;};
-    std::map<void*,ObservedPlayerCast> observedPlayerCasts;
-    NativeCastBindings nativePlayerCastBindings;
-    struct PlayerHitSource {std::uint64_t actor=0,epoch=0,cast=0;int action=0,unit=0;std::string skill;};
-    std::uint64_t nativePlayerHitMatched=0,nativePlayerHitMissing=0,nativeHitStrike=0,hitClaimsPending=0;
-    nlohmann::json lastPlayerHitSource,lastHitClaim;
-    std::string nativePlayerHitError;
-    std::uint64_t playerCastSequence=0,playerCastEventsSent=0,playerCastEventsSeen=0;
-    nlohmann::json lastPlayerCast;
-    struct Enemy {
-        void* entity=nullptr;std::uint32_t root=0;
-        NativeIdentity identity;
-        std::uint64_t targetQueries=0,targetActor=0,enableQueries=0,targetAssignments=0,foreignTargetsRejected=0;int targetRange=0;std::string targetError;
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-        nlohmann::json aiDiagnostics=nlohmann::json::object();
-#endif
-        bool borrowed=false,aiPaused=false,controllerPaused=false,hidden=false,originalActive=true,stateChanged=false;
-        double originalHp=0;V3 originalPosition{};
-        std::uint64_t mirroredCastAt=0,lastCastCheck=0;
-        bool mirroredCasting=false;
-        bool visibilityApplied=false,battleTargetDetached=false;
-    };
-    std::map<std::string,Enemy> enemies;
-    // Private account enemies and room replicas have separate lifetimes. Never
-    // overwrite an account enemy merely because its level logic ID matches the host.
-    std::map<void*,Enemy> privateEnemies;
-    bool guestRealm=false,roomHost=false,privateTargetIsolationReady=false;
     HostMapConsent hostMapConsent;
     std::string hostMapChoiceMap,hostMapChoiceLevel;
-    std::uint64_t hostMapChoiceRoom=0;
-    std::map<std::string,nlohmann::json> hostEnemySeeds;
-    struct Spawn {void* data=nullptr;std::uint32_t root=0;std::uint64_t retry=0;std::string error;
-        std::uint64_t id=0;std::uint32_t generation=0;bool ownershipEstablished=false,committed=false;
-        int pipeline=-1;bool resourcesComplete=false,inAoi=false,preload=false,initialStateApplied=false,started=false;
-        bool native=false,nativeDataReady=false;std::uint64_t serverId=0,nativeCheckAt=0;};
-    std::map<std::string,Spawn> spawnedEnemies;
-    std::uint32_t nextSpawnGeneration=0;
-    std::uint64_t lastEnemies=0,lastProjection=0,enemyEpoch=0;
-    bool applyingDamage=false;std::string replicationError;
-    std::size_t matchedEnemies=0,missingEnemies=0,deferredNativeEnemies=0;
+    std::string replicationError;
+    std::uint64_t lastReplication=0,lastProjection=0;
+    double localHp=0,localMaxHp=0;
     nlohmann::json markers=nlohmann::json::array();
-    // Native scene changes and restoration belong to WorldHandoff and its
-    // compiled game adapter. The old teleport/dungeon approximation is gone.
-    std::string travelState="unsupported";
-    nlohmann::json officialTeleportStatus={{"supported",false}};
-    std::uint64_t officialTeleports=0;
-    nlohmann::json travelLifecycle={{"supported",false}};
-    std::uint64_t completedTeleports=0,damageRequests=0;
-    std::uint64_t nativeCasts=0,nativeCastRejected=0;
-    nlohmann::json lastNativeCast=nlohmann::json::object();
-    nlohmann::json nativeHits=nlohmann::json::array();
-    std::uint64_t nativeDeaths=0;
-    std::uint64_t guestHitsSent=0,roomHitsApplied=0,playerHitsSent=0,playerHitsTaken=0,enemyCastsSent=0,enemyCastsMirrored=0,enemyCastsRejected=0;
-    bool guestGatesReady=false,guestRestrictionsActive=false;std::string guestGateError;
-    std::map<std::string,std::uint64_t> blockedGuestActions;
-    std::uint64_t damageHookCalls=0,guestHitCandidates=0,guestZeroDamage=0,guestHitSendFailed=0,guestDeathsBlocked=0;
-    std::map<std::string,std::uint64_t> guestHitSources; // template of whatever damaged a host monster here
-    std::uint64_t lastAppliedRevision=0,lastAppliedEpoch=0,lastHostDiagnostics=0;
-    std::string lastDiagnosedEnemy;
-    std::uint16_t localPeer=0;
-    // Enemy ownership, as in official co-op: an enemy's AI runs on the machine of
-    // the player it fights, against that player's real operator (the game's enemy
-    // AI is built around a main character). Everyone else drives it as a puppet.
-    // The host assigns owners and keeps authority over health and death.
-    std::map<std::string,std::uint16_t> owners;                                   // host registry / guest copy
-    std::map<std::string,std::pair<bool,std::uint64_t>> engagedReports;           // host: owner says "fighting me"
-    std::map<std::string,std::pair<std::uint16_t,std::uint64_t>> hitClaims;       // host: last guest to hit it
-    struct Motion {std::deque<std::tuple<std::uint64_t,V3,Q>> samples;std::uint64_t stamp=0,commandAt=0;bool applied=false,walking=false;V3 last{};};
-    // Guest puppets driven by native SC_MOVE_OBJECT_MOVE instead of MoveTo/TeleportTo.
-    bool nativeMovePuppets=true,nativeMoveNotify=false,hostOwnsAll=true;
-    // A native server move places the entity at once, so it is sent every frame
-    // (0 ms): 20 Hz placement reads as stepping.
-    std::uint64_t nativeMoveIntervalMs=0;
-    bool nativeMoveSpeed=true,nativeMoveState=true; // diagnostic toggles
-    // ServerMoveEntity steers a monster in combat toward the point rather than
-    // placing it; the host's interpolated position is pinned exactly as well.
-    bool nativeMovePin=true;std::vector<std::pair<void*,V3>> nativePins;std::uint64_t pinErrors=0;
-    // Per-frame motion trace of one guest puppet (diagnostic).
-    std::uint64_t traceId=0;int traceFrames=0;nlohmann::json motionTrace=nlohmann::json::array();std::uint64_t traceLastAt=0;int feedScene=0;std::uint64_t lastNativeMove=0,nativeMoveErrors=0;std::string nativeMoveError;
-    std::map<std::string,Motion> motions;
-    std::uint64_t lastOwnership=0,lastEnemyReport=0,ownershipChanges=0,enemyStatesSent=0,enemyStatesApplied=0,enemyMoves=0,enemyWalks=0,enemySnaps=0;
-    bool replayingCast=false;
-    // Native feed state (guest): host monsters entered under their server IDs,
-    // this account's monsters that left view on join (restored on leave), and
-    // official enter/leave messages withheld while in the host's world.
-    authority::NativeFeed feed;
-    std::map<std::uint64_t,authority::FeedMonster> privateRecords;std::string privateRecordsLevel;
-    authority::DeferredOfficialMessages withheldOfficial;
-    bool restorationPending=false,recoveryAbort=false;
-    std::uint64_t restorationAttempts=0,restoreAwaitOfficial=0;
-    bool feedFilterActive=false;std::uint64_t withheldCount=0,feedErrors=0,opsSuppressed=0;std::string feedError;
-    bool feedOperating=false; // inside our own injected enter/leave view call
-    authority::NativeOpPolicy nativeOpPolicy;std::map<std::uint64_t,std::uint64_t> leakedOwners;
-    // Latest official SCENE_MONSTER bytes per monster this account's server sent.
-    std::map<std::uint64_t,std::string> officialMonsters;
-    std::uint64_t officialRestored=0;
-    // Guest in the host world. Level monsters share server IDs across accounts,
-    // so the instance UID tells this account's monster from the host's:
-    // leavingPrivate = own monsters sent out of view once (still releasing
-    // asynchronously); fedInstance = the instance accepted as the host's monster.
-    std::map<std::uint64_t,std::uint32_t> leavingPrivate,fedInstance;std::uint64_t privateLeaveSkipped=0,feedWaitsForRelease=0;
-    std::vector<std::string> enteringOfficial;std::uint64_t officialForwarded=0; // host's official SCENE_MONSTERs for this guest
-    bool detachFedScripts=false; // diagnostic toggle, see officialMonsterForGuest
-    std::map<std::string,std::uint64_t> damageCensus; // hook:target class:result
-    struct FeedScope {bool& flag;bool previous;explicit FeedScope(bool& f):flag(f),previous(f){flag=true;}~FeedScope(){flag=previous;}};
-    void leaveNative(const std::vector<std::uint64_t>& ids) {
-        if(ids.empty())return;
-        // The native view handler schedules withdrawal on later ticks. Register
-        // the IDs before dispatch and keep them after the private world resumes.
-        nativeOpPolicy.rememberRetired(ids);
-        traceNative("monster.leave.begin");
-        FeedScope scope(feedOperating);feed.bind(runtime);feed.leave(ids);
-        traceNative("monster.leave.end");
-    }
-    bool roomEnemy(const std::string& key) const {
-        return spawnedEnemies.contains(key)||(nativeFeedAdapter&&roomHost&&enemies.contains(key));
-    }
-    static std::uint64_t serverIdFromKey(const std::string& key) {
-        const auto at=key.rfind(":level:");if(at==std::string::npos)return 0;
-        try {return std::stoull(key.substr(at+7));}catch(...) {return 0;}
-    }
-    authority::FeedMonster recordOf(void* entity) {
-        authority::FeedMonster m;
-        m.id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
-        auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity);
-        if(data) {
-            m.templateId=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
-            const auto p=api.value<V3>(gm("BaseEntityData","get_position","","UnityEngine.Vector3"),data);
-            const auto r=api.value<V3>(gm("BaseEntityData","get_rotation","","UnityEngine.Vector3"),data);
-            m.position[0]=p.x;m.position[1]=p.y;m.position[2]=p.z;m.rotation[0]=r.x;m.rotation[1]=r.y;m.rotation[2]=r.z;
-            m.scene=api.value<int>(gm("BaseEntityData","get_levelIdNum","","System.Int32"),data);
-            auto* server=api.call(gm("BaseEntityData","get_serverData","","Beyond.Gameplay.EntityServerData"),data);
-            if(server&&classOf(server)=="Beyond.Gameplay.EnemyServerData")m.level=api.value<int>(gm("EnemyServerData","get_level","","System.Int32","Beyond.Gameplay"),server);
-        }
-        if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity))
-            m.hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
-        // Keep this account's battle identity so the restored monster reports
-        // to the player's own official world exactly as before.
-        m.battleInstance=api.value<std::uint64_t>(gm("Entity","get_serverBattleInstId","","System.UInt64"),entity);
-        m.generation=(std::max)(1u,api.value<std::uint32_t>(gm("Entity","get_serverGeneration","","System.UInt32"),entity));
-        return m;
-    }
-    std::uint64_t lastGuestDiagnostics=0;double localHp=0,localMaxHp=0;
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
-    std::map<std::string,std::pair<std::uint16_t,std::uint64_t>> ownerPins; // development: forced owner for 30 s
-    // Development commands arrive on the RPC thread but touch the game, so they
-    // only ever run on the game thread (replication), never in the RPC handler.
-    std::deque<nlohmann::json> diagnosticQueue;nlohmann::json diagnosticResults=nlohmann::json::array();
+    std::deque<nlohmann::json> diagnosticQueue;
+    nlohmann::json diagnosticResults=nlohmann::json::array();
 #endif
-    std::map<std::string,std::uint64_t> localHitAt;
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-    std::optional<nlohmann::json> diagnosticCast;
-    nlohmann::json localMovementDiagnostics=nlohmann::json::object();
-#endif
-    std::uint64_t lastReplication=0,lastCapture=0,lastOverworld=0;std::string enemyMap;bool overworldCached=false;
-    std::string hostModeId,hostDungeonId;bool hostInSubGame=false,hostInDungeon=false;
-    bool overworldScene() {
-        if(nowMs()-lastOverworld<1000)return overworldCached;
-        lastOverworld=nowMs();
-        auto* mode=api.call(gm("GameInstance","get_mode","","Beyond.Gameplay.Core.BaseGameMode","Beyond.Gameplay"));
-        auto* dungeon=api.call(gm("GameInstance","get_dungeonManager","","Beyond.Gameplay.Core.DungeonManager","Beyond.Gameplay"));
-        auto* subgame=staticObject("subGameManager");
-        hostModeId=mode?text(api.call(gm("BaseGameMode","get_modeId","","System.String"),mode)):std::string{};
-        hostInSubGame=subgame&&api.value<bool>(gm("SubGameManager","get_inSubGame","","System.Boolean"),subgame);
-        // Open-world challenges run as a sub game/mode on the same map and are
-        // part of the shared world; dungeons and other scopes are not (yet).
-        hostInDungeon=dungeon&&api.value<bool>(gm("DungeonManager","get_inDungeon","","System.Boolean"),dungeon);
-        hostDungeonId=hostInDungeon?text(api.call(gm("DungeonManager","get_curDungeonId","","System.String"),dungeon)):std::string{};
-        // Guests follow into a dungeon through the official dungeon entry.
-        overworldCached=mode&&((api.value<bool>(gm("GameInstance","get_isMainScope","","System.Boolean","Beyond.Gameplay"))&&mapId.rfind("map",0)==0)||
-            (hostInDungeon&&!hostDungeonId.empty()));
-        return overworldCached;
-    }
     // Main-thread cost of EF Link per game frame; hitches here are felt as stutter.
     struct Perf {double frameMs=0,frameMaxMs=0,scanMs=0,replicationMs=0,remotesMs=0;std::uint64_t windowStart=0;double windowMax=0;
         bool containerScan=true;std::string containerError;} perf;
@@ -305,22 +102,11 @@ class World {
         getTransform=m("GameObject","get_transform","","UnityEngine.Transform");
         getPosition=m("Transform","get_position","","UnityEngine.Vector3");
         getRotation=m("Transform","get_rotation","","UnityEngine.Quaternion");
-        setPosition=m("Transform","set_position","UnityEngine.Vector3","System.Void");
-        setRotation=m("Transform","set_rotation","UnityEngine.Quaternion","System.Void");
         getLocalRotation=m("Transform","get_localRotation","","UnityEngine.Quaternion");
-        setLocalRotation=m("Transform","set_localRotation","UnityEngine.Quaternion","System.Void");
         getLocalPosition=m("Transform","get_localPosition","","UnityEngine.Vector3");
-        setLocalPosition=m("Transform","set_localPosition","UnityEngine.Vector3","System.Void");
         isAlive=m("Object","op_Implicit","UnityEngine.Object","System.Boolean");
         objectName=m("Object","get_name","","System.String");
-        setActive=m("GameObject","SetActive","System.Boolean","System.Void");
-        destroy=m("Object","Destroy","UnityEngine.Object","System.Void");
         childrenOf=m("GameObject","GetComponentsInChildren","System.Type|System.Boolean","UnityEngine.Component[]");
-        behaviourEnabled=m("Behaviour","set_enabled","System.Boolean","System.Void");
-        colliderEnabled=m("Collider","set_enabled","System.Boolean","System.Void","UnityEngine.PhysicsModule.dll");
-        instantiate=m("SimpleAssetLoader","InstantiatePrefab","Beyond.Resource.StringPathHash|System.Boolean","Beyond.Resource.FAssetProxyLoaderHandle","Common.Beyond.dll","Beyond.Resource");
-        handleGet=m("FAssetProxyLoaderHandle","Get","","UnityEngine.Object","Common.Beyond.dll","Beyond.Resource");
-        pathHash=m("StringPathHash","op_Implicit","System.String","Beyond.Resource.StringPathHash","Common.Beyond.dll","Beyond.Resource");
         auto world=api.klass("GameWorld","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
         worldInfoField=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(world.class_info,"worldInfo");
         if(!worldInfoField) throw std::runtime_error("GameWorld.worldInfo unavailable");
@@ -378,59 +164,6 @@ class World {
     bool currentEntity(void* entity,const NativeIdentity& identity) {
         return usable(entity)&&identity.matches(identityOf(entity));
     }
-    bool currentEnemy(const Enemy& enemy) {return currentEntity(enemy.entity,enemy.identity);}
-    bool currentActor(const Actor& actor) {return currentEntity(actor.entity,actor.identity);}
-    Enemy trackEnemy(void* entity) {
-        Enemy enemy;enemy.entity=entity;enemy.identity=identityOf(entity);enemy.root=rootOf(entity);return enemy;
-    }
-    bool currentSpawn(const Spawn& spawn) {
-        return spawn.data&&spawn.ownershipEstablished&&
-            (!spawn.committed||api.value<bool>(gm("BaseEntityData","get_isCommitted","","System.Boolean"),spawn.data))&&
-            api.value<std::uint64_t>(gm("BaseEntityData","get_id","","System.UInt64"),spawn.data)==spawn.id&&
-            api.value<std::uint32_t>(gm("BaseEntityData","get_serverGeneration","","System.UInt32"),spawn.data)==spawn.generation;
-    }
-    void releaseSpawn(Spawn& spawn) {
-        // A released BaseEntityData may already describe a different pooled node.
-        try {if(currentSpawn(spawn))api.call(gm("BaseEntityData","Release"),spawn.data);}catch(...) {}
-        release(spawn.root);spawn.data=nullptr;spawn.ownershipEstablished=false;
-        spawn.committed=false;
-    }
-    // A host monster delivered through the native feed lives under its real
-    // server ID; it is looked up, never allocated by EF Link.
-    void* nativeEntity(std::uint64_t id) {
-        auto* container=staticObject("objectContainer");if(!container||!id)return nullptr;
-        auto* entity=api.call(gm("ObjectContainer","GetEntityById","System.UInt64","Beyond.Gameplay.Core.Entity"),container,{&id});
-        if(!usable(entity)||api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity)!=id)return nullptr;
-        return entity;
-    }
-    // Committed native data can legitimately have no entity while outside the
-    // client's AOI. Do not reset its spawn pipeline by repeatedly entering view.
-    // Confirm the host template and isolated battle identity, not just the ID:
-    // level monster IDs can also exist in this account's private world.
-    bool nativeDataAccepted(std::uint64_t id,const std::string& expectedTemplate) {
-        auto klass=api.klass("EntityManager","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
-        auto* field_=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,"s_manager");
-        void* manager=nullptr;if(field_)symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field_,&manager);
-        if(!manager||!id||expectedTemplate.empty())return false;
-        void* data=nullptr;
-        if(!api.value<bool>(gm("EntityManager","TryGetEntityData","System.UInt64|Beyond.Gameplay.Core.BaseEntityData&","System.Boolean"),manager,{&id,&data})||!data)return false;
-        eflink::unity::Api::TemporaryRoot dataRoot(runtime,data);
-        return api.value<std::uint64_t>(gm("BaseEntityData","get_id","","System.UInt64"),data)==id&&
-            api.value<bool>(gm("BaseEntityData","get_isCommitted","","System.Boolean"),data)&&
-            api.value<std::uint64_t>(gm("BaseEntityData","get_serverBattleInstId","","System.UInt64"),data)==0&&
-            text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data))==expectedTemplate;
-    }
-    void* spawnEntity(const Spawn& spawn) {
-        if(spawn.native)return nativeEntity(spawn.serverId);
-        if(!currentSpawn(spawn))return nullptr;
-        auto* entity=api.call(gm("BaseEntityData","GetEntity","","Beyond.Gameplay.Core.Entity"),spawn.data);
-        if(!usable(entity))return nullptr;
-        const auto identity=identityOf(entity);
-        if(identity.server!=spawn.id||identity.generation!=spawn.generation||
-            api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity)!=spawn.data)
-            throw std::runtime_error("房间实体节点与原生分配身份不匹配");
-        return entity;
-    }
     std::string entityKey(void* entity) {
         auto* data=api.call(gm("Entity","get_inLevelData","","Beyond.Gameplay.LevelEntityData"),entity);
         if(data) {
@@ -439,33 +172,7 @@ class World {
             std::uint64_t id=0;if(f) symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value")(data,f,&id);
             if(id) return levelId+":level:"+std::to_string(id);
         }
-        // Native feed: every monster without a level logic ID was spawned at
-        // runtime by the host's server (scripts, challenge waves, spawners).
-        // Guests create it under the host's server ID, so that ID is its
-        // identity. Script slots are not unique: a challenge spawns its whole
-        // wave into slot 0 of one script.
-        if(nativeFeedAdapter) {
-            const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
-            return id?levelId+":server:"+std::to_string(id):std::string{};
-        }
-        // Legacy replica path: matched guest-account entities by script slot.
-        const auto script=api.value<std::uint64_t>(gm("Entity","get_parentScriptId","","System.UInt64"),entity);
-        const auto slot=api.value<std::uint32_t>(gm("Entity","get_parentScriptSlotId","","System.UInt32"),entity);
-        if(script) return levelId+":script:"+std::to_string(script)+":"+std::to_string(slot);
-        return {};
-    }
-    void dropEnemies() {
-        // Old native borrowing/feed entry points were deleted. Release only
-        // retained references here; personal recovery belongs to WorldHandoff.
-        for(auto& [pointer,e]:privateEnemies)release(e.root);
-        privateEnemies.clear();
-        privateTargetIsolationReady=false;
-        for(auto& [key,e]:enemies)release(e.root);
-        enemies.clear();matchedEnemies=missingEnemies=deferredNativeEnemies=0;lastEnemies=0;
-        for(auto& [key,s]:spawnedEnemies)releaseSpawn(s);
-        spawnedEnemies.clear();
-        hostEnemySeeds.clear();
-        owners.clear();engagedReports.clear();hitClaims.clear();motions.clear();
+        return {}; // Runtime/script identities require a verified common binding adapter.
     }
     // The native container's enemy list. FindObjectsOfType walks every Unity
     // object in the scene and caused a periodic frame hitch while in a room.
@@ -498,91 +205,6 @@ class World {
         for(std::uintptr_t i=0;i<n;++i)if(items[i])if(auto* entity=api.call(gm("ObjectMono","get_entity","","Beyond.Gameplay.Core.Entity"),items[i]))out.push_back(entity);
         return out;
     }
-    nlohmann::json enemyState(void* entity,const std::string& key) {
-            if(!usable(entity))return nlohmann::json::object();
-            if(!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity))return nlohmann::json::object();
-            auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity);if(!ability)return nlohmann::json::object();
-            auto pos=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),entity);
-            auto* component=api.call(entityModel,entity);auto* go=component?api.call(modelGo,component):nullptr;
-            Q rotation{0,0,0,1};if(go&&alive(go)) rotation=api.value<Q>(getRotation,api.call(getTransform,go));
-            double hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability),max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
-            if(!std::isfinite(hp)||!std::isfinite(max)||max<=0)return nlohmann::json::object();
-            auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),entity);
-            auto templateId=data?text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data)):std::string{};
-            int enemyLevel=1;auto* server=data?api.call(gm("BaseEntityData","get_serverData","","Beyond.Gameplay.EntityServerData"),data):nullptr;
-            if(server&&classOf(server)=="Beyond.Gameplay.EnemyServerData")
-                enemyLevel=api.value<int>(gm("EnemyServerData","get_level","","System.Int32","Beyond.Gameplay"),server);
-            const auto allocation=identityOf(entity);
-            return {{"key",key},{"kind","enemy"},{"position",{pos.x,pos.y,pos.z}},{"rotation",{rotation.x,rotation.y,rotation.z,rotation.w}},
-                {"native_spawn",(std::uint64_t(allocation.instance)<<32)|allocation.generation},{"poise",readPoise(ability)},
-                {"template",templateId},{"enemy_level",enemyLevel},{"server_id",api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity)},
-                {"battle_inst",api.value<std::uint64_t>(gm("Entity","get_serverBattleInstId","","System.UInt64"),entity)},{"hp",(std::max)(0.,hp)},{"max_hp",max},{"alive",api.value<bool>(entityAlive,entity)}};
-    }
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-    // Development: read-only state of a room enemy's native AI.
-    void diagnoseAI(const std::string& key,void* entity) {
-        try {
-            auto& enemy=enemies.at(key);auto* ai=api.call(gm("Entity","get_enemyAICom","","Beyond.Gameplay.AI.EnemyAIComponent"),entity);
-            constexpr const char* space="Beyond.Gameplay.AI";
-            auto* brain=ai?api.call(gm("EnemyAIComponent","get_aiBrain","","Beyond.Gameplay.AI.EnemyAIBrain",space),ai):nullptr;
-            auto* controller=brain?api.call(gm("EnemyAIBrain","get_targetController","","Beyond.Gameplay.AI.EnemyAITargetController",space),brain):nullptr;
-            auto* current=controller?api.call(gm("EnemyAITargetController","GetTargetNoCache","","Beyond.Gameplay.Core.Entity",space),controller):nullptr;
-            std::uint64_t target=0;for(const auto& [peer,actor]:actors)if(actor.entity==current&&currentActor(actor)){target=actor.id;break;}
-            auto* mode=brain?api.call(gm("EnemyAIBrain","get_curMode","","Beyond.Gameplay.AI.EnemyAIMode",space),brain):nullptr;
-            enemy.aiDiagnostics={{"ai_component",ai!=nullptr},{"brain",brain!=nullptr},{"controller",controller!=nullptr},{"target_actor",target},{"mode",mode?classOf(mode):std::string{}}};
-            const auto position=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),entity);
-            enemy.aiDiagnostics["position"]={position.x,position.y,position.z};
-            if(current) {
-                const auto p=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),current);
-                enemy.aiDiagnostics["target_position"]={p.x,p.y,p.z};
-            }
-            if(mode) {
-                auto* boxed=collection(mode,"get_modeType");auto* raw=boxed?runtime->object_unbox(runtime->context,boxed):nullptr;
-                if(raw) {
-                    const int type=*static_cast<int*>(raw);enemy.aiDiagnostics["mode_type"]=type;
-                    for(const char* name:{"None","Idle","Patrol","Vigilance","Battle","LeaveBattle","Born","Atmospheric","AttackBuilding","ScriptedMove","AvoidCombat"})
-                        if(type==enumValue<int>("EnemyAIModeType",name,space)){enemy.aiDiagnostics["mode_name"]=name;break;}
-                }
-                auto* graph=collection(mode,"get_graph");
-                if(graph) {
-                    enemy.aiDiagnostics["graph_pause"]=api.value<bool>(gm("AIGraph","get_pause","","System.Boolean",space),graph);
-                    enemy.aiDiagnostics["graph_tick_enabled"]=readField<bool>(graph,"AIGraph","m_enableTick",space);
-                    enemy.aiDiagnostics["in_graph"]=readField<bool>(graph,"AIGraph","m_inGraph",space);
-                    auto* behaviours=api.call(gm("AIGraph","get_curBehaviors","","System.Collections.Generic.List<Beyond.Gameplay.AI.AIBehavior>",space),graph);
-                    auto* count=behaviours?collection(behaviours,"get_Count"):nullptr;
-                    auto* countRaw=count?runtime->object_unbox(runtime->context,count):nullptr;
-                    enemy.aiDiagnostics["behaviours"]=nlohmann::json::array();
-                    if(countRaw)for(int i=0,n=(std::clamp)(*static_cast<int*>(countRaw),0,32);i<n;++i)
-                        if(auto* behaviour=collection(behaviours,"get_Item",{&i});behaviour)enemy.aiDiagnostics["behaviours"].push_back(classOf(behaviour));
-                }
-            }
-            if(ai) {
-                enemy.aiDiagnostics["ticking"]=api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),ai);
-                enemy.aiDiagnostics["active_lod"]=readField<bool>(ai,"EnemyAIComponent","m_activeAILod",space);
-                enemy.aiDiagnostics["lod"]=readField<int>(ai,"EnemyAIComponent","m_aiLod",space);
-                enemy.aiDiagnostics["init_state"]=readField<int>(ai,"EnemyAIComponent","m_initState",space);
-                enemy.aiDiagnostics["tick_time"]=readField<float>(ai,"EnemyAIComponent","m_tickTime",space);
-            }
-            if(brain) {
-                enemy.aiDiagnostics["brain_inited"]=readField<bool>(brain,"EnemyAIBrain","m_inited",space);
-                const auto born=api.value<V3>(gm("EnemyAIBrain","GetBornPos","","UnityEngine.Vector3",space),brain);
-                enemy.aiDiagnostics["born_position"]={born.x,born.y,born.z};
-            }
-            if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity);ability)
-                enemy.aiDiagnostics["casting"]=anySkillCasting(ability);
-            if(controller)enemy.aiDiagnostics["find_enabled"]=api.value<bool>(gm("EnemyAITargetController","EnableFindTarget","","System.Boolean",space),controller);
-        }catch(const std::exception& e){enemies.at(key).aiDiagnostics={{"error",e.what()}};}
-    }
-#endif
-
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-    void sampleHostDiagnostic() {
-        if(nowMs()-lastHostDiagnostics<250||enemies.empty())return;
-        lastHostDiagnostics=nowMs();
-        auto it=enemies.upper_bound(lastDiagnosedEnemy);if(it==enemies.end())it=enemies.begin();
-        lastDiagnosedEnemy=it->first;if(currentEnemy(it->second))diagnoseAI(it->first,it->second.entity);
-    }
-#endif
     template<class T> T readField(void* object,const char* type,const char* name,const char* space="Beyond.Gameplay.Core",const char* library="Gameplay.Beyond.dll") {
         auto klass=api.klass(type,library,space);
         auto* descriptor=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,name);
@@ -595,37 +217,6 @@ class World {
         if(!info) throw std::runtime_error(std::string("collection method unavailable: ")+name);
         BE_ResolvedMethodV1 method{};method.method_info=info;return api.call(method,object,args);
     }
-    bool resourcesReady(void* node,std::string& reason) {
-        // Completed orders may already have been retired from ResourceFactory.
-        // The node's own readiness set is the source of truth, not order existence.
-        if(api.value<bool>(gm("EntityManager/EntityNode","get_allResourcesReady","","System.Boolean"),node)) return true;
-        auto* list=api.call(gm("EntityManager/EntityNode","get_resRequirements","","System.Collections.Generic.List<Beyond.Gameplay.Core.EntityManager.ResourceRequirement>"),node);
-        if(!list) {reason="资源需求列表为空";return false;}
-        eflink::unity::Api::TemporaryRoot listRoot(runtime,list);
-        auto* boxedCount=collection(list,"get_Count");if(!boxedCount) return false;
-        int count=0;std::memcpy(&count,runtime->object_unbox(runtime->context,boxedCount),sizeof count);
-        if(count<=0||count>256) {reason="资源需求数量无效";return false;}
-        auto klass=api.klass("EntityManager/ResourceFactory","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
-        auto* descriptor=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,"s_factory");
-        if(!descriptor) return false;
-        void* factory=nullptr;symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(descriptor,&factory);if(!factory) return false;
-        for(int i=0;i<count;++i) {
-            auto* item=collection(list,"get_Item",{&i});if(!item) return false;
-            eflink::unity::Api::TemporaryRoot itemRoot(runtime,item);
-            int type=readField<int>(item,"EntityManager/ResourceRequirement","type");auto* path=readField<void*>(item,"EntityManager/ResourceRequirement","path");void* order=nullptr;
-            if(!api.value<bool>(gm("EntityManager/ResourceFactory","TryGetOrder","Beyond.Gameplay.Core.EntityManager.ResourceType|System.String|Beyond.Gameplay.Core.EntityManager.ResourceFactory.ResourceOrder&","System.Boolean"),factory,{&type,path,&order})||!order) {reason="资源订单不存在: "+std::to_string(type)+" "+text(path);return false;}
-            // ResourceOrder's getter is abstract. Invoke the actual order subclass,
-            // rather than resolving an abstract body through the native hook resolver.
-            auto* boxedReady=collection(order,"get_isReady");auto* rawReady=boxedReady?runtime->object_unbox(runtime->context,boxedReady):nullptr;
-            bool ready=false;if(rawReady) std::memcpy(&ready,rawReady,sizeof ready);if(!ready) {reason="资源订单未完成: "+std::to_string(type)+" "+text(path);return false;}
-            auto* requirement=runtime->object_unbox(runtime->context,item);if(!requirement) return false;
-            api.call(gm("EntityManager/EntityNode","MarkResourceReady","Beyond.Gameplay.Core.EntityManager.ResourceRequirement&"),node,{requirement});
-        }
-        return true;
-    }
-
-    // Ask the client to create a host monster under its real server ID. Returns
-    // the native entity once the game's own pipeline has spawned it.
     static std::string operatorTemplate(const std::string& path) {
         return characterTemplate(path);
     }
@@ -694,115 +285,16 @@ class World {
         }catch(const std::exception& e) {localAppearanceInfo=nullptr;appearanceError=e.what();}
         return localAppearanceInfo;
     }
-    void destroyActor(Actor& actor) {
-        if(session)session->unbindPlayer(actor.peer);
-        if(actor.entity) {
-            try {if(currentActor(actor))api.call(gm("Entity","Release"),actor.entity);}catch(...) {}
-        }
-        release(actor.entityRoot);release(actor.infoRoot);
-        actor.entity=actor.info=nullptr;actor.registered=actor.started=actor.bound=false;
-        actor.movement=nullptr;
-        actor.identity={};
-        actor.inited=false;actor.waiting=nlohmann::json::array();
-        actor.catalog.clear();actor.skillCount=0;
-    }
-    void dropActors() {for(auto& [peer,actor]:actors)destroyActor(actor);actors.clear();actorTravelGrants.clear();}
-    std::map<std::string,Realm::SkillRule> skillCatalog(void* ability) {
-        std::map<std::string,Realm::SkillRule> catalog;
-        auto* list=api.call(gm("AbilitySystem","get_skills","","System.Collections.Generic.List<Beyond.Gameplay.Core.Skill>"),ability);
-        if(!list)return catalog;
-        eflink::unity::Api::TemporaryRoot listRoot(runtime,list);
-        auto* countBox=collection(list,"get_Count");if(!countBox)return catalog;
-        int count=0;std::memcpy(&count,runtime->object_unbox(runtime->context,countBox),sizeof count);
-        if(count<0||count>64)return catalog;
-        for(int i=0;i<count;++i) {
-            auto* skill=collection(list,"get_Item",{&i});if(!skill)continue;
-            auto* data=api.call(gm("Skill","get_data","","Beyond.Gameplay.Core.SkillData"),skill);
-            if(!data)continue;
-            auto* castData=readField<void*>(data,"SkillData","castData");if(!castData)continue;
-            const auto id=text(api.call(gm("Skill","get_skillId","","System.String"),skill));
-            const int check=readField<int>(castData,"CastData","checkCastDistanceType");
-            float distance=check==enumValue<int>("CheckCastDistanceType","NotCheck","Beyond.Gameplay")?120.f:
-                api.value<float>(gm("Skill","get_castDistance","","System.Single"),skill);
-            float cooldown=api.value<float>(gm("Skill","get_cooldown","","System.Single"),skill);
-            if(id.empty()||!std::isfinite(distance)||!std::isfinite(cooldown)||cooldown<0||cooldown>3600)continue;
-            // Native targeting remains the final range/cost validator. A skill with
-            // unlimited cast distance still has the transport's 120 m safety bound.
-            double range=distance<=0?120.:(std::min)(120.,double(distance));
-            catalog.emplace(id,Realm::SkillRule{std::uint32_t(std::ceil(cooldown*1000)),range});
-        }
-        return catalog;
-    }
-    bool anySkillCasting(void* ability) {
-        if(api.value<bool>(gm("AbilitySystem","get_inSkill","","System.Boolean"),ability))return true;
-        auto* list=api.call(gm("AbilitySystem","get_skills","","System.Collections.Generic.List<Beyond.Gameplay.Core.Skill>"),ability);
-        if(!list)return false;
-        eflink::unity::Api::TemporaryRoot listRoot(runtime,list);auto* countBox=collection(list,"get_Count");int count=0;
-        if(countBox)std::memcpy(&count,runtime->object_unbox(runtime->context,countBox),sizeof count);
-        if(count<0||count>64)throw std::runtime_error("原生施法状态列表长度无效");
-        for(int i=0;i<count;++i)if(auto* skill=collection(list,"get_Item",{&i})) {
-            // Passive/buff-only skills have no timeline processor. The game's
-            // get_isCasting accessor assumes both objects exist and throws for
-            // those entries; inspect the metadata-resolved references first.
-            auto* action=readField<void*>(skill,"Skill","m_ability");
-            if(!action||!readField<void*>(action,"Ability","m_timelineActionProcessor"))continue;
-            if(api.value<bool>(gm("Skill","get_isCasting","","System.Boolean"),skill))return true;
-        }
-        return false;
-    }
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-    nlohmann::json movementState(void* entity) {
-        auto* movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),entity);
-        if(!movement)return {{"available",false}};
-        auto* controller=api.call(gm("Entity","get_charCtrl","","Beyond.Gameplay.Core.CharacterController"),entity);
-        auto* ai=api.call(gm("Entity","get_charAICom","","Beyond.Gameplay.AI.CharacterAIComponent"),entity);
-        auto velocity=api.value<V3>(gm("MovementComponent","get_velocity","","UnityEngine.Vector3"),movement);
-        auto* capsule=readField<void*>(movement,"MovementComponent","m_capsule");
-        auto state=nlohmann::json{{"available",true},{"entity_disabled",api.value<bool>(gm("Entity","get_isDisabled","","System.Boolean"),entity)},
-            {"enabled",api.value<bool>(gm("MovementComponent","get_enabled","","System.Boolean"),movement)},
-            {"enabled_by_camera",api.value<bool>(gm("MovementComponent","get_enabledByCamera","","System.Boolean"),movement)},
-            {"enabled_by_factory_camera",api.value<bool>(gm("MovementComponent","get_enabledByFactoryCamera","","System.Boolean"),movement)},
-            {"pipeline_available",readField<void*>(movement,"MovementComponent","m_pipeline")!=nullptr},{"capsule_alive",capsule&&alive(capsule)},
-            {"movement_ticking",api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),movement)},
-            {"controller_ticking",controller&&api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),controller)},
-            {"ai_ticking",ai&&api.value<bool>(gm("TickComponent","IsTicking","","System.Boolean"),ai)},
-            {"fixed_tick_index",readField<int>(movement,"MovementComponent","m_tickIndex")},
-            {"last_fixed_tick_time",readField<double>(movement,"MovementComponent","m_lastFixedTickTime")},
-            {"block_grounded",api.value<bool>(gm("MovementComponent","get_blockGroundedMove","","System.Boolean"),movement)},
-            {"active_move",api.value<bool>(gm("MovementComponent","get_isActiveMove","","System.Boolean"),movement)},
-            {"ground_speed",api.value<float>(gm("MovementComponent","get_realGroundSpeed","","System.Single"),movement)},
-            {"velocity",{velocity.x,velocity.y,velocity.z}}};
-        auto* group=api.call(gm("Entity","get_tickOwnerInfoGroup","","Beyond.TickOwnerInfoGroup"),entity);
-        auto* owner=api.call(gm("TickComponent","GetTickOwnerInfo","","Beyond.TickOwnerInfo"),movement);
-        auto* function=api.call(gm("TickComponent","get_fixedTickFunction","","Beyond.TickFunction"),movement);
-        const char* common="Common.Beyond.dll";const char* space="Beyond";
-        state["group_available"]=group!=nullptr;state["owner_available"]=owner!=nullptr;state["fixed_function_available"]=function!=nullptr;
-        if(group)state["tick_group"]={{"registered",readField<bool>(group,"TickOwnerInfoGroup","m_isRegistered",space,common)},
-            {"owned_by_entity",api.call(m("TickOwnerInfoGroup","GetOwner","","System.Object",common,space),group)==entity},
-            {"time_scale",api.value<float>(m("TickOwnerInfoGroup","GetTimeScale","","System.Single",common,space),group)},
-            {"skip_frame",api.value<bool>(m("TickOwnerInfoGroup","GetSkipTickThisFrame","","System.Boolean",common,space),group)}};
-        if(owner)state["tick_owner"]={{"registered",api.value<bool>(m("TickOwnerInfo","IsRegistered","","System.Boolean",common,space),owner)},
-            {"constructed",api.value<bool>(m("TickOwnerInfo","IsConstructed","","System.Boolean",common,space),owner)},
-            {"time_scale",api.value<float>(m("TickOwnerInfo","GetTimeScale","","System.Single",common,space),owner)}};
-        if(function)state["fixed_function"]={{"inited",api.value<bool>(m("TickFunction","IsInited","","System.Boolean",common,space),function)},
-            {"released",api.value<bool>(m("TickFunction","IsReleased","","System.Boolean",common,space),function)},
-            {"should_tick",api.value<bool>(m("TickFunction","ShouldTick","","System.Boolean",common,space),function)},
-            {"last_timestamp",readField<double>(function,"TickFunction","lastTimeStamp",space,common)},
-            {"last_frame",readField<int>(function,"TickFunction","lastFrameCount",space,common)}};
-        return state;
-    }
-#endif
 public:
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     void setNativeOperationLogger(std::function<void(const std::string&)> logger) {nativeOperationLogger=std::move(logger);}
 #endif
 private:
     void replication(Net& net,Session& link) {
-        session=&link;link.update(net);link.setAuthority({});localPeer=net.snapshot().localId;
+        session=&link;link.update(net);link.setAuthority({});
         // Transport and read-only discovery remain available. No replica world,
         // native enemy creation, account-world withdrawal, shared teleport,
         // actor skill execution or local result projection is admitted here.
-        roomHost=guestRealm=guestRestrictionsActive=false;
         replicationError="统一原生权威适配器未验收；共享世界操作已停用";
         if(net.currentRole()==Role::Host&&character&&nativeSceneInitialized&&!mapId.empty()&&!levelId.empty()) {
             auto* info=staticObject("worldInfo");
@@ -877,13 +369,6 @@ private:
         }
         if(go!=model) bindLocalModel(go);
         character=entity;
-#ifdef EFLINK_NATIVE_DIAGNOSTICS
-        static std::uint64_t lastMovementDiagnostics=0;
-        if(now-lastMovementDiagnostics>=1000) {
-            lastMovementDiagnostics=now;
-            try {localMovementDiagnostics=movementState(entity);}catch(const std::exception& e){localMovementDiagnostics={{"error",e.what()}};}
-        }
-#endif
         if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity)) {
             localHp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             localMaxHp=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
@@ -1125,11 +610,9 @@ public:
     void chooseHostMap(Net& net,std::uint64_t token,bool follow) {
         if(net.currentRole()!=Role::Client||!session||!session->followHost)throw std::runtime_error("当前不是跟随房主的房客");
         if(follow) {
-            const auto blockers=session->entryStatus().at("blockers");
-            if(std::find(blockers.begin(),blockers.end(),nlohmann::json("host_scene_rules"))!=blockers.end())
-                throw std::runtime_error("房主当前场景尚未开放联机入场");
+            throw std::runtime_error("原生换图隔离与恢复适配器尚未实现；跟随未支持");
         }
-        hostMapConsent.choose(token,follow);if(follow){travelState="queued";replicationError.clear();}
+        hostMapConsent.choose(token,false);
     }
     void resetAppearance() {
         officialAppearance.clear();localAppearanceInfo=nullptr;lastAppearanceSample=0;appearanceModel.clear();appearanceError.clear();
@@ -1144,11 +627,6 @@ public:
         if(!backgroundLease)return;
         if(api.value<bool>(m("Application","get_runInBackground","","System.Boolean")))api.call(m("Application","set_runInBackground","System.Boolean","System.Void"),nullptr,{&backgroundOriginal});
         backgroundLease=false;
-    }
-    void clearPlayerCastObservations() {
-        for(auto& [skill,cast]:observedPlayerCasts)release(cast.root);
-        observedPlayerCasts.clear();
-        nativePlayerCastBindings.clear();
     }
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     void queueDiagnostic(nlohmann::json command) {
@@ -1181,14 +659,13 @@ public:
     // Read-only identity of every enemy the client currently has (game thread).
     nlohmann::json enemyCensus() {
         nlohmann::json out=nlohmann::json::array();
-        std::set<std::uint64_t> fedNow;for(const auto& [key,s]:spawnedEnemies)if(s.native)fedNow.insert(s.serverId);
         V3 self{};if(character)self=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
         for(auto* entity:sceneEnemies()) {
             if(out.size()>=96)break;
             if(!usable(entity)||!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),entity))continue;
             nlohmann::json e;
             const auto id=api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity);
-            e["server_id"]=id;e["fed"]=fedNow.contains(id);
+            e["server_id"]=id;e["fed"]=false;
             e["battle_inst"]=api.value<std::uint64_t>(gm("Entity","get_serverBattleInstId","","System.UInt64"),entity);
             e["started"]=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity);
             e["key"]=entityKey(entity);
@@ -1304,7 +781,7 @@ public:
             link.setAdapterVersion(text(api.call(m("Application","get_version","","System.String"))));
             const auto now=nowMs();
             // Bones are only read while in a room; offline the module costs nothing per frame.
-            if((net.currentRole()!=Role::Offline||restorationPending)&&now-lastSample>=33) {lastSample=now;sample(net);}
+            if((net.currentRole()!=Role::Offline)&&now-lastSample>=33) {lastSample=now;sample(net);}
             auto* level=staticObject("levelLoader");auto* info=staticObject("worldInfo");
             auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
             const bool initialized=level&&info&&instance&&
@@ -1329,7 +806,6 @@ public:
         }
         updatePresentation(net,link);
         updateResources(net,link);
-        for(const auto& event:link.takePlayerCasts()) {lastPlayerCast=event;++playerCastEventsSeen;}
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
         perf.remotesMs=0; // no uncertified model/effect replay
@@ -1345,89 +821,44 @@ public:
     }
     void shutdown() {
         clearResources();
-        clearPlayerCastObservations();
         menu(runtime,false);
         try {restoreBackground();}catch(...) {}
         clear();
-        dropActors();
-        dropEnemies();
         markers=nlohmann::json::array();
         try {dropLocalModel();} catch(...) {}
-        if(loader) {
-            try {api.call(m("SimpleAssetLoader","Dispose","","System.Void","Common.Beyond.dll","Beyond.Resource"),loader);} catch(...) {}
-            release(loaderRoot);loader=nullptr;
-        }
         resetAppearance();
     }
     nlohmann::json status() const {
-        nlohmann::json remote=nlohmann::json::array();
-        nlohmann::json spawnStatus=nlohmann::json::array();for(const auto& [key,s]:spawnedEnemies) spawnStatus.push_back({{"key",key},{"submitted",s.data!=nullptr},
-            {"pipeline",s.pipeline},{"resources_complete",s.resourcesComplete},{"in_aoi",s.inAoi},{"preload",s.preload},{"started",s.started},
-            {"native_data_ready",s.nativeDataReady},{"awaiting_native_entity",s.native&&s.nativeDataReady&&!s.started},
-            {"initial_state_applied",s.initialStateApplied},{"error",s.error}});
-        nlohmann::json actorStatus=nlohmann::json::array();for(const auto& [peer,a]:actors)actorStatus.push_back({{"peer",peer},{"entity",a.id},{"template",a.templateId},
-            {"registered",a.registered},{"inited",a.inited},{"started",a.started},{"waiting",a.waiting},{"bound",a.bound},
-            {"hp",a.hp},{"max_hp",a.maxHp},{"skills",a.skillCount},{"casting",a.casting},{"ability_ticking",a.abilityTicking},
-            {"growth",a.growth},
-            {"appearance",a.appearance},{"weapon_loaded",a.weaponLoaded},{"weapon_reloads",a.weaponReloads},{"weapon_error",a.weaponError},
-            {"weapon_state",a.weaponState},
-            {"authorized_teleports",a.teleports},{"error",a.error}});
-        nlohmann::json targetStatus=nlohmann::json::array();for(const auto& [key,e]:enemies)targetStatus.push_back({{"key",key},{"queries",e.targetQueries},{"enable_queries",e.enableQueries},{"assignments",e.targetAssignments},{"foreign_targets_rejected",e.foreignTargetsRejected},{"target_actor",e.targetActor},{"range",e.targetRange},{"error",e.targetError}});
-        auto result=nlohmann::json{{"local_model",localModel},{"map_id",mapId},{"level_id",levelId},{"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},
-            {"authority_architecture",{{"phase","legacy_removed_adapters_unverified"},{"shared_world_supported",false},{"full_sync_verified",false},
-                {"guest_result_submission",false},{"guest_ai_authority",false},{"native_gameplay_replay",false},
-                {"account_risk",true},{"official_safety_guaranteed",false},{"native_paths_verified",false}}},
-            {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",remote},{"markers",markers},
+        auto result=nlohmann::json{{"local_model",localModel},{"map_id",mapId},{"level_id",levelId},
+            {"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},
+            {"authority_architecture",{{"phase","native_adapters_in_progress"},{"shared_world_supported",false},
+                {"full_sync_verified",false},{"guest_result_submission",false},{"guest_ai_authority",false},
+                {"native_gameplay_replay",false},{"account_risk",true},{"official_safety_guaranteed",false},{"native_paths_verified",false}}},
+            {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
-                {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage",nativeWeaponLookupReady?"native_weapon_preview":"metadata_only"},
-                {"lookup_ready",nativeWeaponLookupReady},{"effects_replayed",false}}},
-            {"presentation",{{"local_members",sampledParty},{"local_effects",sampledEffects},{"effects_created",effectsCreated},{"effects_released",effectsReleased},{"effects_expired",effectsExpired},
-                {"active_effects",0},{"native_effects",visualReadback},{"native_combat",nativeCombatReadback},{"local_materials",sampledMaterials},{"native_materials",materialReadback},
-                {"materials_started",materialsStarted},{"materials_stopped",materialsStopped},{"material_error",materialError},{"poise_writes",nativePoiseWrites},
-                {"party_error",partySamplingError},{"effect_error",effectSamplingError},{"error",presentationError},{"native_skill_replay",false},{"full_sync_verified",false}}},
-            {"player_casts",{{"events_sent",playerCastEventsSent},{"events_seen",playerCastEventsSeen},{"tracked",observedPlayerCasts.size()},
-                {"last",lastPlayerCast},{"replay_enabled",false}}},
+                {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage","metadata_only"},{"lookup_ready",false},{"effects_replayed",false}}},
+            {"presentation",{{"local_members",sampledParty},{"local_effects",sampledEffects},{"active_effects",0},
+                {"native_combat",nativeCombatReadback},{"local_materials",sampledMaterials},{"native_materials",materialReadback},
+                {"party_error",partySamplingError},{"effect_error",effectSamplingError},{"material_error",materialError},
+                {"error",presentationError},{"native_skill_replay",false},{"full_sync_verified",false}}},
             {"resources",{{"local",nativeResourceCensus},{"scans",resourceScans},{"unadapted_native_objects",resourceUnknown},
-                {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},{"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
-            {"hit_provenance",{{"matched",nativePlayerHitMatched},{"missing",nativePlayerHitMissing},{"bindings",nativePlayerCastBindings.size()},
-                {"last",lastPlayerHitSource},{"error",nativePlayerHitError},{"observation_only",true}}},
-            {"world_replication",{{"native_entities",enemies.size()},{"private_enemies_quarantined",privateEnemies.size()},
-                {"room_character_lookup_hits",roomCharacterLookups},
-                {"guest_policy",{{"ready",guestGatesReady},{"restricted",guestRestrictionsActive},{"target_isolation_ready",privateTargetIsolationReady},
-                    {"targets_detached",std::count_if(privateEnemies.begin(),privateEnemies.end(),[](const auto& item){return item.second.battleTargetDetached;})},
-                    {"error",guestGateError},{"blocked",blockedGuestActions}}},
-                {"room_owned_enemies",spawnedEnemies.size()},{"host_enemy_seeds",hostEnemySeeds.size()},{"matched",matchedEnemies},{"missing",missingEnemies},{"deferred_native",deferredNativeEnemies},
-                {"native_feed",{{"enabled",nativeFeedAdapter},{"filter_active",feedFilterActive},{"entered",feed.entered},{"left",feed.left},
-                    {"private_recorded",privateRecords.size()},{"withheld",withheldCount},{"withheld_pending",withheldOfficial.size()},
-                    {"withheld_bytes",withheldOfficial.byteSize()},{"restoration_pending",restorationPending},{"restoration_attempts",restorationAttempts},
-                    {"awaiting_official_resend",restoreAwaitOfficial},{"recovery_abort",recoveryAbort},
-                    {"fed",std::count_if(spawnedEnemies.begin(),spawnedEnemies.end(),[](const auto& item){return item.second.native;})},
-                    {"ops_suppressed",opsSuppressed},{"known_fed_owners",nativeOpPolicy.fedCount()},{"retired_owners",nativeOpPolicy.retiredCount()},
-                    {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"detach_scripts",detachFedScripts},{"private_leave_skipped",privateLeaveSkipped},{"feed_waits_for_release",feedWaitsForRelease},{"scene_mode",hostModeId},{"host_owns_all",hostOwnsAll},{"in_subgame",hostInSubGame},{"native_move",nativeMovePuppets},{"native_move_speed",nativeMoveSpeed},{"native_move_pin",nativeMovePin},{"pin_errors",pinErrors},{"native_move_state",nativeMoveState},{"trace_id",traceId},{"trace_left",traceFrames},{"motion_trace",motionTrace},{"native_move_interval_ms",nativeMoveIntervalMs},{"native_moves_sent",feed.moved},{"native_move_route",feed.moveRoute},{"native_move_errors",nativeMoveErrors},{"native_move_error",nativeMoveError},{"damage_census",damageCensus},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
-                {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
-                {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"native_load_parameter_retained",false},{"official_teleport",officialTeleportStatus},{"official_teleports",officialTeleports},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
-                {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
-                    {"settlement_policy","host_native_only"},{"legacy_numeric_damage",false},{"native_damage_verified",false},
-                    {"hit_claims_pending",hitClaimsPending},{"last_hit_claim",lastHitClaim},
-                    {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
-                    {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
-                    {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
-                    {"owned_here",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second==localPeer;})},
-                    {"owned_by_others",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second!=localPeer;})},
-                    {"ownership_changes",ownershipChanges},{"enemy_walks",enemyWalks},{"enemy_snaps",enemySnaps},{"enemy_states_sent",enemyStatesSent},{"enemy_states_applied",enemyStatesApplied},{"enemy_moves",enemyMoves}}},
-                {"native_casts",nativeCasts},{"native_cast_rejected",nativeCastRejected},{"last_native_cast",lastNativeCast},{"native_hits",nativeHits},{"native_deaths",nativeDeaths},
+                {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},
+                {"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
+            {"world_replication",{{"native_bindings",nativeObjectBindings.size()},
+                {"native_entities",0},{"private_enemies_quarantined",0},{"room_owned_enemies",0},{"matched",0},{"missing",0},
+                {"guest_policy",{{"ready",false},{"restricted",false},{"target_isolation_ready",false},{"supported",false}}},
+                {"native_feed",{{"enabled",false},{"filter_active",false},{"legacy_removed",true},{"supported",false}}},
+                {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},
+                    {"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
+                {"error",replicationError},{"spawns",nlohmann::json::array()},{"players",nlohmann::json::array()},
+                {"enemy_targets",nlohmann::json::array()},{"teleport","unsupported"},{"scene_travel_supported",false},{"native_load_parameter_retained",false},
+                {"combat",{{"settlement_policy","host_native_only"},{"legacy_numeric_damage",false},{"native_damage_verified",false},{"supported",false}}},
                 {"perf",{{"frame_ms",perf.frameMs},{"frame_max_ms",perf.frameMaxMs},{"replication_ms",perf.replicationMs},
-                    {"remotes_ms",perf.remotesMs},{"enemy_scan_ms",perf.scanMs},{"container_enemy_scan",perf.containerScan},{"container_error",perf.containerError}}},
-                {"home",nullptr},
-                {"simulation_paused",simulationPaused},{"time_scale",nativeTimeScale},{"delta_time",nativeDeltaTime},{"background_lease",backgroundLease}}}};
+                    {"remotes_ms",perf.remotesMs},{"container_enemy_scan",perf.containerScan},{"container_error",perf.containerError}}},
+                {"home",nullptr},{"background_lease",backgroundLease}}}};
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         result["world_replication"]["native_operations"]=nativeOperations;
-        for(auto& entry:result["world_replication"]["enemy_targets"])if(auto enemy=enemies.find(entry.at("key").get<std::string>());enemy!=enemies.end())entry["ai_diagnostics"]=enemy->second.aiDiagnostics;
-        result["world_replication"]["local_movement_diagnostics"]=localMovementDiagnostics;
         result["world_replication"]["diagnostics"]=diagnosticResults;
-        for(auto& entry:result["world_replication"]["players"])if(auto actor=actors.find(entry.at("peer").get<std::uint16_t>());actor!=actors.end()) {
-            entry["movement_diagnostics"]=actor->second.movementDiagnostics;
-        }
 #endif
         return result;
     }

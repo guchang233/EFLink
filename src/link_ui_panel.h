@@ -283,7 +283,7 @@ struct UiPanel {
             const auto phase=uid::stringAt(entry(),"phase","offline");
             std::snprintf(buffer,sizeof buffer,"世界 %s",uid::boolAt(entry(),"active",false)?"已入场":phase.c_str());
             ui::dim("%s",buffer);
-        } else ui::dim("%s","局域网连接 · 同一地图显示玩家");
+        } else ui::dim("%s","房间连接与只读状态 · 共享玩法未支持");
         const std::string version=std::string("EF Link ")+EFLINK_VERSION;
         ui::alignRight(ImGui::CalcTextSize(version.c_str()).x);
         ui::muted("%s",version.c_str());
@@ -535,7 +535,7 @@ struct UiPanel {
             if(local) {ui::hspace(ui::px(6));ui::badge("你",ui::Tone::Info);}
             if(!local&&online()) {
                 ui::alignRight(teleportWidth+kickWidth);
-                ImGui::BeginDisabled(!fresh);
+                ImGui::BeginDisabled(!fresh||!uid::boolAt(replication(),"scene_travel_supported",false));
                 if(ui::secondaryButton("传送到这位玩家",{0,ui::px(30)})) call({{"action","teleport_to_player"},{"id",uid::intAt(peer,"id",0)}});
                 ImGui::EndDisabled();
                 if(host) {
@@ -544,7 +544,7 @@ struct UiPanel {
                 }
             }
             ui::pushSmall();
-            const char* status=local?"本机":(!fresh?"等待角色状态":(uid::boolAt(peer,"same_map",false)?"同地图 · 同步中":"在其他地图"));
+            const char* status=local?"本机":(!fresh?"等待角色状态":(uid::boolAt(peer,"same_map",false)?"同地图 · 位置状态":"在其他地图"));
             const auto mapName=uid::stringAt(peer,"map");
             ui::muted("地图 %s  ·  %s",mapName.empty()?"读取中":mapName.c_str(),status);
             const auto endpoint=uid::stringAt(peer,"address");
@@ -608,10 +608,10 @@ struct UiPanel {
         ImGui::SetNextItemWidth(ui::px(180));
         if(ImGui::Combo("##menuKey",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
         ui::vspace(ui::px(16));
-        ui::toggleSwitch("remote",&remote,"在游戏中显示其他玩家");
+        ui::toggleSwitch("remote",&remote,"远端角色显示偏好（待适配）");
         ui::toggleSwitch("markers",&markers,"屏幕显示玩家位置与距离");
-        ui::toggleSwitch("follow",&follow,"房主换图时询问是否跟随");
-        ui::toggleSwitch("combat",&combat,"同步战斗（实验）");
+        ui::toggleSwitch("follow",&follow,"跟随房主偏好（换图未支持）");
+        ui::toggleSwitch("combat",&combat,"共享战斗偏好（原生执行未支持）");
         ui::vspace(ui::px(10));
         if(ui::primaryButton("保存设置",{ui::px(140),ui::px(32)})) save();
         ui::hspace(ui::px(12));
@@ -619,25 +619,9 @@ struct UiPanel {
         ui::cardEnd();
 
         ui::vspace(ui::px(14));
-        ui::sectionHeader("救援","恢复用");
+        ui::sectionHeader("恢复","未支持");
         ui::cardBegin();
-        if(ui::secondaryButton("应急回到四号谷地",{0,ui::px(32)})) call({{"action","emergency_home"}});
-        ui::vspace(ui::px(8));
-        ui::pushSmall();
-        ui::hint("会先离开房间，再用官方传送回到四号谷地的枢纽。卡在读条或场景异常时使用。");
-        ui::popSmall();
-        const auto& teleport=uid::objectAt(replication(),"official_teleport");
-        const auto teleportError=uid::stringAt(teleport,"error");
-        if(!teleportError.empty()) {
-            ui::vspace(ui::px(8));
-            ui::notice(ui::Tone::Danger,(std::string("官方传送失败：")+teleportError).c_str());
-        } else if(uid::hasAt(teleport,"hub")) {
-            ui::vspace(ui::px(6));
-            ui::muted("最近一次官方传送：%s / %s",uid::stringAt(teleport,"map").c_str(),uid::stringAt(teleport,"hub").c_str());
-        } else if(uid::stringAt(teleport,"state")=="queued") {
-            ui::vspace(ui::px(6));
-            ui::muted("%s","应急传送已排队：离开房间并恢复私人世界后执行。");
-        }
+        ui::notice(ui::Tone::Warning,"原生个人世界隔离与恢复尚未验收，房主世界入场和自动应急传送未开放。");
         ui::cardEnd();
 
         ui::vspace(ui::px(14));

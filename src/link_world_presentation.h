@@ -130,17 +130,7 @@
         for(auto it=effectLives.begin();it!=effectLives.end();)if(!present.contains(it->first))it=effectLives.erase(it);else ++it;
     }
     void sampleNativeCombat() {
-        if(nowMs()-nativeCombatSampleAt<100)return;nativeCombatSampleAt=nowMs();nativeCombatReadback=Json::array();
-        for(const auto& [key,e]:enemies)if(currentEnemy(e)&&nativeCombatReadback.size()<64) {
-            auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e.entity);if(!ability)continue;
-            const auto expected=session->entityReference(key);if(expected.is_null())continue;
-            Json row={{"key",key},{"life",expected.at("life")},{"poise",readPoise(ability)},
-                {"hp",api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)}};
-            for(const auto& state:session->snapshot().at("entities"))if(state.at("key")==key) {
-                row["expected_poise"]=state.value("poise",Json{});row["expected_hp"]=state.at("hp");break;
-            }
-            nativeCombatReadback.push_back(std::move(row));
-        }
+        nativeCombatReadback=Json::array(); // Common enemy/native result adapter is not verified yet.
     }
     void updatePresentation(Net& net,Session& link) {
         if(!link.localSceneOperational()||!link.ready()||!character||link.snapshot().value("map",std::string{})!=mapId||link.snapshot().value("level",std::string{})!=levelId) {if(!partySamples.empty()||!materialLives.empty())clearPresentation();return;}
