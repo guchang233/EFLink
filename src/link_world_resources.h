@@ -89,7 +89,7 @@
     }
     void updateResources(Net& net,Session& link) {
         const auto snapshot=net.snapshot();
-        if(snapshot.role==Role::Offline||!link.followHost||!link.combat||!link.localSceneOperational()||!nativeSceneInitialized||travel||
+        if(snapshot.role==Role::Offline||!link.followHost||!link.combat||!link.localSceneOperational()||!nativeSceneInitialized||
            link.snapshot().value("map",std::string{})!=mapId||link.snapshot().value("level",std::string{})!=levelId) {
             if(resourceRoom)clearResources();return;
         }

@@ -144,27 +144,12 @@ class World {
     bool applyingDamage=false;std::string replicationError;
     std::size_t matchedEnemies=0,missingEnemies=0,deferredNativeEnemies=0;
     nlohmann::json markers=nlohmann::json::array();
-    // Room entry and exit use the game's own loading pipeline so the official
-    // loading panel covers the scene swap, as an official teleport does.
-    struct Travel {std::string map,level;V3 position;std::uint64_t until=0;bool started=false;int levelNumber=0;
-        bool homeward=false,observedLoading=false;std::uint64_t startedAt=0;
-        bool official=false; // an official hub teleport to the target map is in flight
-        std::string dungeon; // host's dungeon ID ("" = overworld)
-        int dungeonStage=0;  // 1 leaving this account's dungeon, 2 entering the host's
-        int inMapLoads=0;    // same-map loads tried (bounded: never loop)
-    };
-    // Official teleports (the map screen's own GameAction.TeleportToPosition to one
-    // of this account's factory hubs). The official server validates the hub.
-    struct HubTarget {std::string level,inst;std::uint64_t node=0;V3 position{},rotation{};};
-    nlohmann::json officialTeleportStatus=nlohmann::json::object();std::uint64_t officialTeleports=0;
-    bool emergencyHomePending=false;
-    std::optional<Travel> travel;std::string travelState="idle";
-    // A by-reference loading parameter must remain rooted beyond the native
-    // call while the asynchronous loading pipeline owns its contents.
-    std::uint32_t nativeTravelParameterRoot=0;
-    // Where this guest stood before entering the host's world; restored on leave.
-    std::optional<Travel> home;
-    nlohmann::json travelLifecycle=nlohmann::json::object();
+    // Native scene changes and restoration belong to WorldHandoff and its
+    // compiled game adapter. The old teleport/dungeon approximation is gone.
+    std::string travelState="unsupported";
+    nlohmann::json officialTeleportStatus={{"supported",false}};
+    std::uint64_t officialTeleports=0;
+    nlohmann::json travelLifecycle={{"supported",false}};
     std::uint64_t completedTeleports=0,damageRequests=0;
     std::uint64_t nativeCasts=0,nativeCastRejected=0;
     nlohmann::json lastNativeCast=nlohmann::json::object();
@@ -598,12 +583,6 @@ class World {
         lastDiagnosedEnemy=it->first;if(currentEnemy(it->second))diagnoseAI(it->first,it->second.entity);
     }
 #endif
-    template<class T> void field(void* object,const char* type,const char* name,T value,const char* space="Beyond.Gameplay.Core") {
-        auto klass=api.klass(type,"Gameplay.Beyond.dll",space);
-        auto* descriptor=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,name);
-        if(!descriptor) throw std::runtime_error(std::string("field unavailable: ")+type+"."+name);
-        symbol<void(*)(void*,const void*,void*)>("il2cpp_field_set_value")(object,descriptor,&value);
-    }
     template<class T> T readField(void* object,const char* type,const char* name,const char* space="Beyond.Gameplay.Core",const char* library="Gameplay.Beyond.dll") {
         auto klass=api.klass(type,library,space);
         auto* descriptor=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,name);
@@ -813,233 +792,10 @@ class World {
         return state;
     }
 #endif
-    void observeNativeCast() {
-        if(lastNativeCast.empty())return;
-        auto enemy=enemies.find(lastNativeCast.value("key",std::string{}));if(enemy==enemies.end()||!currentEnemy(enemy->second))return;
-        auto* target=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),enemy->second.entity);
-        if(target)lastNativeCast["target_hp_observed"]=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),target);
-    }
-    void teleportTo(V3 position) {
-        if(!usable(character)||api.value<bool>(entityCinematic,character)) throw std::runtime_error("当前角色未就绪或正在过场");
-        auto* movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),character);
-        if(!movement) throw std::runtime_error("当前角色没有移动组件");
-        bool warning=false;api.call(gm("MovementComponent","TeleportTo","UnityEngine.Vector3|System.Boolean"),movement,{&position,&warning});
-    }
-    void updateTravel() {
-        if(!travel) return;
-        auto* levelLoader=staticObject("levelLoader");
-        if(nowMs()>travel->until) {travelState="failed";replicationError="地图加载或传送超时；未报告成功";travel.reset();return;}
-        if(!levelLoader||!character) {travelState="waiting_scene";return;}
-        auto* info=staticObject("worldInfo");
-        if(!info) {travelState="waiting_scene";return;}
-        auto* mode=api.call(gm("GameInstance","get_mode","","Beyond.Gameplay.Core.BaseGameMode","Beyond.Gameplay"));
-        auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
-        auto* dungeon=api.call(gm("GameInstance","get_dungeonManager","","Beyond.Gameplay.Core.DungeonManager","Beyond.Gameplay"));
-        auto* subgame=staticObject("subGameManager");
-        const bool loading=api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader);
-        const bool started=api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info);
-        const bool delayed=instance&&readField<bool>(instance,"GameInstance","m_isModeDelayedToSwitch","Beyond.Gameplay");
-        const bool inDungeon=dungeon&&api.value<bool>(gm("DungeonManager","get_inDungeon","","System.Boolean"),dungeon);
-        const bool inSubgame=subgame&&api.value<bool>(gm("SubGameManager","get_inSubGame","","System.Boolean"),subgame);
-        const auto modeId=mode?text(api.call(gm("BaseGameMode","get_modeId","","System.String"),mode)):std::string{};
-        const bool mainScope=api.value<bool>(gm("GameInstance","get_isMainScope","","System.Boolean","Beyond.Gameplay"));
-        travelLifecycle={{"world_started",started},{"mode_switch_delayed",delayed},{"mode_id",modeId},
-            {"in_dungeon",inDungeon},{"in_subgame",inSubgame},{"main_scope",mainScope},{"loading",loading}};
-        if(loading) {
-            travel->observedLoading=true;travelState="loading";
-            travelLifecycle["loading_ms"]=nowMs()-travel->startedAt;
-            travelLifecycle["progress"]=api.value<float>(gm("GameLevelLoader","get_progress","","System.Single"),levelLoader);
-            try {if(auto* step=readField<void*>(levelLoader,"GameLevelLoader","m_curStep"))travelLifecycle["step"]=classOf(step);}catch(...) {}
-            // Record whether the game's pipeline actually shows its loading panel.
-            try {
-                auto* pipeline=readField<void*>(levelLoader,"GameLevelLoader","m_curLoadingPipeline");
-                const auto type=pipeline?classOf(pipeline):std::string{};
-                if(type.ends_with("LoadingPipeline")&&!type.ends_with("SeamlessLoadingPipeline")) {
-                    travelLifecycle["panel_hidden"]=readField<bool>(pipeline,"GameLevelLoader/LoadingPipeline","m_noLoading");
-                    travelLifecycle["short_teleport"]=readField<bool>(pipeline,"GameLevelLoader/LoadingPipeline","m_isShortTp");
-                }
-            }catch(const std::exception& e) {travelLifecycle["panel_error"]=e.what();}
-            return;
-        }
-        // Official hub teleport in flight: wait for the target map, then walk the
-        // rest within that map like any same-map move.
-        if(travel->official) {
-            if(mapId!=travel->map) {travelState="official_teleport";return;}
-            travel->official=false;travel->started=false;travel->observedLoading=false;
-        }
-        {
-            // Dungeons are entered and left by this account through the game's own
-            // dungeon flow (CS_ENTER_DUNGEON / LeaveDungeon), never a local load.
-            const auto current=inDungeon?text(api.call(gm("DungeonManager","get_curDungeonId","","System.String"),dungeon)):std::string{};
-            if(travel->dungeonStage==1) {if(inDungeon) {travelState="leaving_dungeon";return;}travel->dungeonStage=0;travel->started=false;}
-            if(travel->dungeonStage==2) {if(current!=travel->dungeon||!started) {travelState="entering_dungeon";return;}travel->dungeonStage=0;travel->started=false;travel->observedLoading=false;}
-            if(inDungeon&&current!=travel->dungeon) {
-                {OwnOfficial own(ownOfficialAction);api.call(gm("DungeonManager","LeaveDungeon"),dungeon);}
-                travel->dungeonStage=1;travelState="leaving_dungeon";return;
-            }
-            if(!travel->dungeon.empty()&&!inDungeon) {
-                if(!dungeon)throw std::runtime_error("副本管理器尚未就绪");
-                auto* id=api.string(travel->dungeon);
-                auto* instance_=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
-                auto* player=instance_?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance_):nullptr;
-                auto* bag=player?readField<void*>(player,"GamePlayer","charBag","Beyond.Gameplay"):nullptr;
-                int team=bag?api.value<int>(gm("CharBagSystem","get_curTeamIndex","","System.Int32","Beyond.Gameplay"),bag):0;
-                auto* preset=api.string("");
-                OwnOfficial own(ownOfficialAction);
-                const bool requested=api.value<bool>(gm("DungeonManager","TryReqEnterDungeon","System.String|System.String|System.Int32","System.Boolean"),dungeon,{id,preset,&team});
-                if(!requested)throw std::runtime_error("游戏未允许进入副本 "+travel->dungeon+"（未解锁或条件不满足，见游戏内提示）");
-                officialTeleportStatus={{"purpose","follow_dungeon"},{"dungeon",travel->dungeon},{"team",team},{"at",nowMs()}};
-                travel->dungeonStage=2;travelState="entering_dungeon";return;
-            }
-        }
-        const bool targetLoaded=mapId==travel->map&&levelId==travel->level;
-        const bool overworld=(mainScope&&mode&&modeId.empty()&&!inDungeon&&!inSubgame&&
-            mapId.rfind("map",0)==0&&travel->map.rfind("map",0)==0)||(inDungeon&&!travel->dungeon.empty());
-        // Cross-level travel must not strand a private dungeon/subgame in an
-        // overworld scene. Its full exit/room-rule adapter is still incomplete.
-        // Preserve the original native scene instead of bypassing that lifecycle.
-        if((!targetLoaded||travel->started)&&!overworld)
-            throw std::runtime_error("副本或子玩法的联机切图生命周期尚未就绪；当前场景已保留，请先通过游戏退出副本");
-        // The loader queues a pipeline; wait until it has actually begun before
-        // treating "not loading" as finished.
-        if(travel->started&&!travel->observedLoading&&nowMs()-travel->startedAt<3000) {travelState="loading_requested";return;}
-        const bool sameMap=mapId==travel->map;
-        if(sameMap&&!started&&travel->started) {
-            // LoadAtPos can leave a loaded world awaiting StartWorld. Use the
-            // idempotent native lifecycle, including delayed mode activation;
-            // never write isStarted or clear arbitrary UI-forbid handles.
-            bool inNewMap=true;
-            api.call(gm("WorldInfo","StartWorld","System.Boolean"),info,{&inNewMap});
-            travelState="starting_world";return;
-        }
-        if(!started||delayed) {travelState="waiting_world_start";return;}
-        if(sameMap&&(travel->started||!overworld)) {
-            teleportTo(travel->position);
-            auto actual=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
-            auto p=travel->position;float d=(actual.x-p.x)*(actual.x-p.x)+(actual.y-p.y)*(actual.y-p.y)+(actual.z-p.z)*(actual.z-p.z);
-            if(d<9) {travelState="complete";++completedTeleports;travel.reset();release(nativeTravelParameterRoot);traceNative("scene.load_parameter.released");}
-            else if(travel->started) {travel->started=false;travel->observedLoading=false;} // load once more, bounded below
-            return;
-        }
-        // Entering or leaving a room is a world change: run it through the game's
-        // own loading pipeline with the loading panel forced on, the same path as
-        // an official teleport, instead of silently moving the character.
-        if(mapId!=travel->map&&travel->dungeon.empty()) {
-            // Another map: the account itself must get there through an official
-            // teleport (hub on the target map nearest the destination).
-            officialHubTeleport(travel->map,travel->position,travel->homeward?"return_home":"follow_host");
-            travel->official=true;travel->started=true;travel->observedLoading=false;travel->startedAt=nowMs();travelState="official_teleport";
-            return;
-        }
-        auto* parameter=runtime->object_new(runtime->context,api.klass("TeleportParam","Gameplay.Beyond.dll","Beyond.Gameplay").class_info);
-        eflink::unity::Api::TemporaryRoot parameterRoot(runtime,parameter);
-        field(parameter,"TeleportParam","uiType",enumValue<int>("TeleportUIType","WithLoading","Beyond.Gameplay"),"Beyond.Gameplay");
-        auto* raw=runtime->object_unbox(runtime->context,parameter);if(!raw) throw std::runtime_error("地图传送参数 ABI 不可用");
-        release(nativeTravelParameterRoot);nativeTravelParameterRoot=rootOf(parameter);
-        if(!nativeTravelParameterRoot)throw std::runtime_error("地图传送参数生命周期保护失败");
-        // Tear room objects down in the old, still valid scene. Do not wait for
-        // the next frame to discover that the loader has already started.
-        traceNative("scene.prepare_room_objects.begin");
-        if(session)session->invalidateNativeScene();
-        clearPlayerCastObservations();clear();dropActors();dropEnemies();
-        lastAppliedEpoch=lastAppliedRevision=0;
-        traceNative("scene.prepare_room_objects.end");
-        travel->started=true;travel->observedLoading=false;travel->startedAt=nowMs();travelState="loading";
-        if(mapId==travel->map) {
-            if(++travel->inMapLoads>2)throw std::runtime_error("同图加载两次仍未到达目标位置，已停止传送");
-            try {
-                traceNative("scene.load_at_position.begin");
-                api.call(gm("GameLevelLoader","LoadAtPosInCurrentMap","UnityEngine.Vector3|Beyond.Gameplay.TeleportParam&|System.Action|System.Action"),levelLoader,{&travel->position,raw,nullptr,nullptr});
-                traceNative("scene.load_at_position.returned");
-            }catch(const std::exception& e) {
-                // Still arrive, without the panel, rather than strand the player.
-                replicationError=std::string("原生读条传送不可用，已直接传送: ")+e.what();
-                travel->observedLoading=true;
-            }
-            return;
-        }
-        // Resolve through native level-loader tables, using the host's validated numeric
-        // level from its current world snapshot (cross-map target must be that world).
-        int level=travel->levelNumber;if(level<=0) throw std::runtime_error("目标地图编号未就绪");
-        int source=enumValue<int>("GameLevelLoader/LoadingSource","ClientTeleport");
-        api.call(gm("GameLevelLoader","LoadAtPos","Beyond.Gameplay.Core.GameLevelLoader.LoadingSource|System.Int32|UnityEngine.Vector3|Beyond.Gameplay.TeleportParam&|System.Action|System.Action"),levelLoader,{&source,&level,&travel->position,raw,nullptr,nullptr});
-    }
-    // This account's teleportable factory hubs on a map (marks of GamePlayer.mapManager).
-    std::vector<HubTarget> hubTargets(const std::string& mapName) {
-        std::vector<HubTarget> out;
-        auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
-        auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
-        auto* map=player?readField<void*>(player,"GamePlayer","mapManager","Beyond.Gameplay"):nullptr;
-        if(!map)throw std::runtime_error("地图管理器尚未就绪");
-        auto* sequence=api.call(gm("MapManager","_EnumerateMarksInMap","System.String","System.Collections.Generic.IEnumerable<Beyond.Gameplay.MarkInstRuntimeData>","Beyond.Gameplay"),map,{api.string(mapName)});
-        if(!sequence)return out;
-        eflink::unity::Api::TemporaryRoot sequenceRoot(runtime,sequence);
-        auto objectClass=symbol<const void*(*)(void*)>("il2cpp_object_get_class");
-        auto methodsOf=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_methods");
-        auto methodName=symbol<const char*(*)(const void*)>("il2cpp_method_get_name");
-        auto paramCount=symbol<unsigned(*)(const void*)>("il2cpp_method_get_param_count");
-        auto find=[&](void* object,const char* suffix)->const void* {
-            void* it=nullptr;const void* found=nullptr;const auto n=std::strlen(suffix);
-            while(const auto* m=methodsOf(objectClass(object),&it)) {
-                const std::string name=methodName(m);
-                if(paramCount(m)==0&&name.size()>=n&&name.compare(name.size()-n,n,suffix)==0) {found=m;if(name.find("Generic")!=std::string::npos)break;}
-            }
-            return found;};
-        auto invoke=[&](const void* method,void* self)->void* {BE_ResolvedMethodV1 r{};r.method_info=method;return api.call(r,self);};
-        const auto* getEnumerator=find(sequence,"GetEnumerator");if(!getEnumerator)return out;
-        auto* enumerator=invoke(getEnumerator,sequence);if(!enumerator)return out;
-        eflink::unity::Api::TemporaryRoot enumeratorRoot(runtime,enumerator);
-        const auto* moveNext=find(enumerator,"MoveNext");const auto* current=find(enumerator,"get_Current");
-        if(!moveNext||!current)throw std::runtime_error("地图标记枚举不可用");
-        for(int guard=0;guard<4096;++guard) {
-            auto* more=invoke(moveNext,enumerator);if(!more||!*static_cast<bool*>(runtime->object_unbox(runtime->context,more)))break;
-            auto* mark=invoke(current,enumerator);
-            if(!mark||classOf(mark)!="Beyond.Gameplay.FacMarkInstRuntimeData")continue;
-            if(!readField<bool>(mark,"FacMarkInstRuntimeData","isTpRelated","Beyond.Gameplay"))continue;
-            HubTarget hub;hub.node=readField<std::uint32_t>(mark,"FacMarkInstRuntimeData","nodeId","Beyond.Gameplay");if(!hub.node)continue;
-            hub.level=text(readField<void*>(mark,"MarkInstRuntimeData","levelId","Beyond.Gameplay"));
-            hub.inst=text(readField<void*>(mark,"MarkInstRuntimeData","instId","Beyond.Gameplay"));
-            const auto* position=find(mark,"GetTeleportPosition");const auto* rotation=find(mark,"GetTeleportRotation");
-            if(position)if(auto* v=invoke(position,mark))hub.position=*static_cast<V3*>(runtime->object_unbox(runtime->context,v));
-            if(rotation)if(auto* v=invoke(rotation,mark))hub.rotation=*static_cast<V3*>(runtime->object_unbox(runtime->context,v));
-            out.push_back(std::move(hub));
-        }
-        return out;
-    }
-    // The map screen's official teleport to a hub of this account.
-    void officialHubTeleport(const std::string& mapName,V3 destination,const char* purpose) {
-        const auto hubs=hubTargets(mapName);
-        if(hubs.empty())throw std::runtime_error("本账号在 "+mapName+" 没有可传送的枢纽；请先在该地图解锁或建造枢纽");
-        const HubTarget* best=&hubs.front();double bestDistance=1e18;
-        for(const auto& hub:hubs){const double d=std::hypot(hub.position.x-destination.x,hub.position.z-destination.z);if(d<bestDistance){bestDistance=d;best=&hub;}}
-        int reason=1; // C2STeleportReason.ServerGotoHub (observed from the map screen)
-        try {reason=enumValue<int>("C2STeleportReason","ServerGotoHub","Beyond.GEnums");}catch(...) {}
-        // Same arguments as the map screen: target level ID (the game derives the
-        // scene number from it) and the default teleport UI (with its loading view).
-        int ui=enumValue<int>("TeleportUIType","Default","Beyond.Gameplay");int options=0;
-        V3 position=best->position,rotation=best->rotation;std::uint32_t node=std::uint32_t(best->node);
-        OwnOfficial own(ownOfficialAction);
-        api.call(gm("GameAction","TeleportToPosition","Beyond.GEnums.C2STeleportReason|System.String|UnityEngine.Vector3|UnityEngine.Vector3|Beyond.Gameplay.TeleportUIType|Beyond.Gameplay.TeleportOptions|System.Action|System.UInt32","System.Void","Beyond.Gameplay.Actions"),
-            nullptr,{&reason,api.string(best->level),&position,&rotation,&ui,&options,nullptr,&node});
-        ++officialTeleports;
-        officialTeleportStatus={{"purpose",purpose},{"map",mapName},{"hub",best->inst},{"node",best->node},{"level",best->level},
-            {"position",{position.x,position.y,position.z}},{"distance_to_target",bestDistance},{"candidates",hubs.size()},{"reason",reason},{"at",nowMs()}};
-    }
-    void updateEmergencyHome(Net& net) {
-        if(!emergencyHomePending)return;
-        if(net.currentRole()!=Role::Offline||guestRealm||travel)return; // wait until out of the room and restored
-        emergencyHomePending=false;
-        try {
-            const V3 here=character?api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character):V3{};
-            officialHubTeleport("map01",here,"emergency_home");
-        }catch(const std::exception& e) {officialTeleportStatus={{"purpose","emergency_home"},{"error",e.what()},{"at",nowMs()}};}
-    }
 public:
-    // Menu: leave any room, then teleport officially to a hub in Valley IV (map01).
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     void setNativeOperationLogger(std::function<void(const std::string&)> logger) {nativeOperationLogger=std::move(logger);}
 #endif
-    void requestEmergencyHome() {emergencyHomePending=true;officialTeleportStatus={{"purpose","emergency_home"},{"state","queued"},{"at",nowMs()}};}
 private:
     void replication(Net& net,Session& link) {
         session=&link;link.update(net);link.setAuthority({});localPeer=net.snapshot().localId;
@@ -1384,8 +1140,6 @@ public:
     void rejectAppearance() {
         officialAppearance.reject("official appearance serialization failed");localAppearanceInfo=nullptr;lastAppearanceSample=0;
     }
-    int ownOfficialAction=0;
-    struct OwnOfficial {int& depth;explicit OwnOfficial(int& d):depth(d){++depth;}~OwnOfficial(){--depth;}};
     void restoreBackground() {
         if(!backgroundLease)return;
         if(api.value<bool>(m("Application","get_runInBackground","","System.Boolean")))api.call(m("Application","set_runInBackground","System.Boolean","System.Void"),nullptr,{&backgroundOriginal});
@@ -1550,7 +1304,7 @@ public:
             link.setAdapterVersion(text(api.call(m("Application","get_version","","System.String"))));
             const auto now=nowMs();
             // Bones are only read while in a room; offline the module costs nothing per frame.
-            if((net.currentRole()!=Role::Offline||travel||restorationPending)&&now-lastSample>=33) {lastSample=now;sample(net);}
+            if((net.currentRole()!=Role::Offline||restorationPending)&&now-lastSample>=33) {lastSample=now;sample(net);}
             auto* level=staticObject("levelLoader");auto* info=staticObject("worldInfo");
             auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
             const bool initialized=level&&info&&instance&&
@@ -1559,10 +1313,9 @@ public:
                 !readField<bool>(instance,"GameInstance","m_isModeDelayedToSwitch","Beyond.Gameplay");
             if(nativeSceneInitialized&&!initialized)link.invalidateNativeScene();
             nativeSceneInitialized=initialized;
-            const bool sceneReady=initialized&&(!travel||!travel->started)&&character&&api.call(mainCharacter)==character&&
+            const bool sceneReady=initialized&&character&&api.call(mainCharacter)==character&&
                 text(api.call(mapIdText,info))==mapId&&text(api.call(levelIdText,info))==levelId;
             link.setLocalSceneReady(sceneReady);
-            if(initialized&&!travel&&nativeTravelParameterRoot) {release(nativeTravelParameterRoot);traceNative("scene.load_parameter.released");}
             localError.clear();
         } catch(const std::exception& e) {link.setLocalSceneReady(false);localError=e.what();character=nullptr;if(model) {try {dropLocalModel();} catch(...) {}}}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
@@ -1598,7 +1351,7 @@ public:
         clear();
         dropActors();
         dropEnemies();
-        travel.reset();markers=nlohmann::json::array();
+        markers=nlohmann::json::array();
         try {dropLocalModel();} catch(...) {}
         if(loader) {
             try {api.call(m("SimpleAssetLoader","Dispose","","System.Void","Common.Beyond.dll","Beyond.Resource"),loader);} catch(...) {}
@@ -1652,7 +1405,7 @@ public:
                     {"ops_suppressed",opsSuppressed},{"known_fed_owners",nativeOpPolicy.fedCount()},{"retired_owners",nativeOpPolicy.retiredCount()},
                     {"official_cached",officialMonsters.size()},{"official_forwarded",officialForwarded},{"detach_scripts",detachFedScripts},{"private_leave_skipped",privateLeaveSkipped},{"feed_waits_for_release",feedWaitsForRelease},{"scene_mode",hostModeId},{"host_owns_all",hostOwnsAll},{"in_subgame",hostInSubGame},{"native_move",nativeMovePuppets},{"native_move_speed",nativeMoveSpeed},{"native_move_pin",nativeMovePin},{"pin_errors",pinErrors},{"native_move_state",nativeMoveState},{"trace_id",traceId},{"trace_left",traceFrames},{"motion_trace",motionTrace},{"native_move_interval_ms",nativeMoveIntervalMs},{"native_moves_sent",feed.moved},{"native_move_route",feed.moveRoute},{"native_move_errors",nativeMoveErrors},{"native_move_error",nativeMoveError},{"damage_census",damageCensus},{"official_restored",officialRestored},{"unattributed_ops",[&]{nlohmann::json o=nlohmann::json::object();for(const auto& [id,n]:leakedOwners)o[std::to_string(id)]=n;return o;}()},{"errors",feedErrors},{"error",feedError}}},
                 {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},{"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
-                {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"native_load_parameter_retained",nativeTravelParameterRoot!=0},{"official_teleport",officialTeleportStatus},{"official_teleports",officialTeleports},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
+                {"error",replicationError},{"spawns",spawnStatus},{"players",actorStatus},{"enemy_targets",targetStatus},{"teleport",travelState},{"native_load_parameter_retained",false},{"official_teleport",officialTeleportStatus},{"official_teleports",officialTeleports},{"travel_lifecycle",travelLifecycle},{"teleports_completed",completedTeleports},{"damage_requests",damageRequests},
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"settlement_policy","host_native_only"},{"legacy_numeric_damage",false},{"native_damage_verified",false},
                     {"hit_claims_pending",hitClaimsPending},{"last_hit_claim",lastHitClaim},
@@ -1665,7 +1418,7 @@ public:
                 {"native_casts",nativeCasts},{"native_cast_rejected",nativeCastRejected},{"last_native_cast",lastNativeCast},{"native_hits",nativeHits},{"native_deaths",nativeDeaths},
                 {"perf",{{"frame_ms",perf.frameMs},{"frame_max_ms",perf.frameMaxMs},{"replication_ms",perf.replicationMs},
                     {"remotes_ms",perf.remotesMs},{"enemy_scan_ms",perf.scanMs},{"container_enemy_scan",perf.containerScan},{"container_error",perf.containerError}}},
-                {"home",home?nlohmann::json{{"map",home->map},{"level",home->level},{"position",{home->position.x,home->position.y,home->position.z}}}:nlohmann::json()},
+                {"home",nullptr},
                 {"simulation_paused",simulationPaused},{"time_scale",nativeTimeScale},{"delta_time",nativeDeltaTime},{"background_lease",backgroundLease}}}};
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         result["world_replication"]["native_operations"]=nativeOperations;

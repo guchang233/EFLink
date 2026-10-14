@@ -166,6 +166,12 @@
 
 协议契约升为 revision 13；`.52` 完整构建、20 组检查、源指纹及 V1/V2 ABI 均通过；恢复包 SHA256 `740013549C6FC006A64D007C399BFEACE0C713B823D72E5804EC79294304FD18`。生产 World 尚未注册经过验证的原生执行/隔离/恢复适配器，真实客户端仍运行 `.37`；不能把接口接通和 fixture 测试称为矿石端到端或完整同步验收，`full_sync_verified=false`。
 
+## 删除旧直接加载、官方传送及副本往返近似（.53）
+
+删除旧 LoadAtPos/LoadAtPosInCurrentMap、MovementComponent.TeleportTo、GameAction.TeleportToPosition、DungeonManager.EnterDungeon/LeaveDungeon 的跟随/恢复近似，以及 TeleportParam 字段写入、原生加载参数保留和旧 home/travel 状态。净减 247 行；旧状态键明确输出 unsupported/false，不再把个人地图加载当成房主世界隔离或恢复。正式换图与恢复只能由统一 WorldHandoff 和真实编译内适配器提供。
+
+`.53` 完整构建、20 组检查、源指纹和 V1/V2 ABI 通过；恢复包 SHA256 `D21BF0E4ED73CB94DB68A36AE98A15DEB0875C3B677F9E0DDF41D62FF999C5A3`。生产游戏适配与完整目标尚未完成，未启动新的矿石采样或要求用户操作；没有设置 full_sync_verified=true。
+
 - 各自原生登录与官方连接保留，不读取登录凭据。
 - 奖励、背包、任务、解锁及账号进度不由模组生成或补发。
 - 未验证游戏版本及原生入口默认停用，账号风险始终显示，不能声称官方认可或零封号风险。
