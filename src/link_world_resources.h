@@ -90,7 +90,8 @@
             if(!complete)throw std::runtime_error("native resource census truncated; previous baseline retained");
             staged.reconcile("mineral",bindings);
             for(auto& observation:result) {
-                const auto cookie=staged.find("mineral",observation.key)->cookie;
+                const auto cookie=staged.cookie("mineral",observation.key);
+                if(!cookie)throw std::runtime_error("staged mineral identity unavailable");
                 observation.cookie=cookie;sampled.at(observation.key).incarnation=cookie;
                 auto state=observation.state;state["key"]=observation.key;state["kind"]=observation.kind;
                 output.census.push_back(std::move(state));

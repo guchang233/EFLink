@@ -29,6 +29,9 @@ class NativeObjectBindings {
         if(owner==std::thread::id{})owner=std::this_thread::get_id();
         if(owner!=std::this_thread::get_id())throw std::runtime_error("native binding mutation outside game thread");
     }
+    const NativeBinding* find(const std::string& kind,const std::string& key) const {
+        auto it=entries.find({kind,key});return it==entries.end()?nullptr:&it->second;
+    }
 public:
     explicit NativeObjectBindings(NativeDomain value):domain(value) {}
     NativeObjectBindings(const NativeObjectBindings&)=delete;
@@ -84,8 +87,11 @@ public:
         for(auto it=entries.begin();it!=entries.end();)if(it->first.first==kind)it=entries.erase(it);else ++it;
         ++revision;
     }
-    const NativeBinding* find(const std::string& kind,const std::string& key) const {
-        auto it=entries.find({kind,key});return it==entries.end()?nullptr:&it->second;
+    // Census code may use the opaque cookie to build authority observations.
+    // It cannot retrieve a native address without an explicit domain check.
+    std::uint64_t cookie(const std::string& kind,const std::string& key) const {
+        if(owner==std::thread::id{}||owner!=std::this_thread::get_id())return 0;
+        auto* value=find(kind,key);return value?value->cookie:0;
     }
     // Revalidate the actual current native allocation immediately before an
     // operation; holding a GC root alone is not proof that it is still alive.

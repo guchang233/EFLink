@@ -67,7 +67,10 @@
             bindings.push_back({key,{reinterpret_cast<std::uintptr_t>(entity),identity.instance,0,identity.generation,identity.server,0}});
         }
         staged.reconcile(kind,bindings);
-        for(auto& fact:facts)fact.cookie=staged.find(kind,fact.key)->cookie;
+        for(auto& fact:facts) {
+            fact.cookie=staged.cookie(kind,fact.key);
+            if(!fact.cookie)throw std::runtime_error("staged actor identity unavailable");
+        }
         return facts;
     }
     Json nativeCensusStatus() const {
