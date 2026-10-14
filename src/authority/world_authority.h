@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <limits>
 #include <optional>
 #include <random>
 #include <set>
@@ -57,9 +58,18 @@ inline bool validState(const Json& state) {
             if(!v.is_number_integer()||v.get<std::int64_t>()<0||v.get<std::uint64_t>()>100000000)return false;
         } else return false;
     }
-    for(const auto& pair:std::vector<std::pair<std::string,std::string>>{{"hp","max_hp"},{"poise","max_poise"},{"hp_ratio","max_hp_ratio"}})
-        if(state.contains(pair.first)&&state.contains(pair.second)&&
-           (state.at(pair.second).get<double>()<=0||state.at(pair.first).get<double>()>state.at(pair.second).get<double>()))return false;
+    for(const auto& pair:std::vector<std::pair<std::string,std::string>>{{"hp","max_hp"},{"poise","max_poise"},{"hp_ratio","max_hp_ratio"}}) {
+        if(!state.contains(pair.first)||!state.contains(pair.second))continue;
+        const auto value=state.at(pair.first).get<double>(),capacity=state.at(pair.second).get<double>();
+        if(capacity<=0)return false;
+        // Native HP and its calculated capacity can differ at the last decimal
+        // places; native poise uses Single precision. Validate that precision
+        // without replacing either observed value. Integer durability is exact.
+        const double tolerance=pair.first=="hp_ratio"?0:pair.first=="poise"?
+            capacity*std::numeric_limits<float>::epsilon()*2:
+            (std::min)(1e-8,capacity*1e-8)+capacity*std::numeric_limits<double>::epsilon()*8;
+        if(value>capacity&&value-capacity>tolerance)return false;
+    }
     return true;
 }
 struct Scope {

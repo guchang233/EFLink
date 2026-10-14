@@ -118,6 +118,18 @@ int main() {
     battle.poise=battle.maxPoise=0;
     check(!nativeBattleObservation(battle).state.contains("poise"),"actors without native poise capacity do not acquire an invented bar");
     battle.hp=1001;check(throws([&]{nativeBattleObservation(battle);}),"inconsistent native battle values fail instead of being clamped");
+    auto rounded=battle;rounded.hp=4412.32737219;rounded.maxHp=4412.327372185988;
+    const auto roundedFact=nativeBattleObservation(rounded);
+    check(roundedFact.state["hp"].get<double>()==rounded.hp&&roundedFact.state["max_hp"].get<double>()==rounded.maxHp,
+        "observed native HP rounding preserves both original values through validation");
+    rounded.hp=rounded.maxHp+.001;
+    check(throws([&]{nativeBattleObservation(rounded);}),"floating precision tolerance cannot accept a material HP excess");
+    rounded.hp=2e-12;rounded.maxHp=1e-12;
+    check(throws([&]{nativeBattleObservation(rounded);}),"absolute precision tolerance cannot overwhelm a tiny capacity");
+    rounded.hp=700;rounded.maxHp=1000;rounded.poise=std::nextafter(100.f,101.f);rounded.maxPoise=100;
+    check(nativeBattleObservation(rounded).state["poise"].get<double>()==rounded.poise,
+        "native Single poise rounding is preserved without clipping the observation");
+    check(!validState({{"hp_ratio",10001},{"max_hp_ratio",10000}}),"integer mineral durability never acquires a floating precision tolerance");
     battle.hp=700;battle.kind="drop_display";
     check(throws([&]{nativeBattleObservation(battle);}),"battle observation cannot masquerade as another unadapted native kind");
     check(Intent::validInput("cast",{{"slot",3},{"phase","press"}})&&
