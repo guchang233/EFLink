@@ -1,6 +1,7 @@
 #include "authority/world_authority.h"
 #include "authority/native_build_policy.h"
 #include "authority/native_resource_state.h"
+#include "authority/native_battle_state.h"
 #include "authority/native_trace_window.h"
 #include <atomic>
 #include <cstdio>
@@ -49,6 +50,15 @@ struct InputFixture:Fixture {
     bool begin(const Ticket& ticket) override {received=ticket.intent.input;return Fixture::begin(ticket);}
 };
 int main() {
+    NativeBattleReading battle{"enemy","boss","enemy_template",9,{1,2,3},700,1000,25,100,true};
+    auto battleFact=nativeBattleObservation(battle);
+    check(battleFact.state["hp"]==700&&battleFact.state["poise"]==25&&battleFact.state["max_poise"]==100,
+        "native battle facts preserve actual HP and poise without guest numerical claims");
+    battle.poise=battle.maxPoise=0;
+    check(!nativeBattleObservation(battle).state.contains("poise"),"actors without native poise capacity do not acquire an invented bar");
+    battle.hp=1001;check(throws([&]{nativeBattleObservation(battle);}),"inconsistent native battle values fail instead of being clamped");
+    battle.hp=700;battle.kind="drop_display";
+    check(throws([&]{nativeBattleObservation(battle);}),"battle observation cannot masquerade as another unadapted native kind");
     check(Intent::validInput("cast",{{"slot",3},{"phase","press"}})&&
           Intent::validInput("attack",{{"button","primary"},{"phase","release"}})&&
           Intent::validInput("interact",{{"choice",0}}),"native controls select host-resolved slots, buttons and interaction choices");
@@ -174,8 +184,31 @@ int main() {
     auto newTarget=host.find("mineral","ore-12")->ref;
     check(newTarget!=target&&host.find(target)==nullptr,"pooled native target receives a new public identity and lifetime");
     check(guest.delta(*host.changesSince(priorVersion),true),"target retirement and replacement use the shared lifecycle journal");
-    priorVersion=guest.version();host.observe("mineral",{mineral(0,21,true)});host.observe("mineral",{mineral(10000,21)});
-    check(host.find("mineral","ore-12")->ref!=newTarget,"regeneration in the same native allocation revokes old lifecycle");
+    priorVersion=guest.version();host.observe("mineral",{mineral(0,21,true)});
+    auto regenerated=mineral(10000,21);regenerated.nativeLife=2;host.observe("mineral",{regenerated});
+    check(host.find("mineral","ore-12")->ref!=newTarget,"observed native lifecycle change in the same allocation revokes old lifecycle");
+    auto currentMineral=host.baseline();
+    check(throws([&]{host.observe("mineral",{mineral(9000,21)});})&&host.baseline()==currentMineral,
+        "an older native lifetime cannot replace the current allocation state");
+    {
+        Host transitions;Fixture native;transitions.reset(scene(),"fixture-only");
+        Observation player{"character","player",{{"hp",100},{"max_hp",100},{"dead",false}},10};
+        Observation mechanism{"door","mechanism",{{"active",true},{"phase","open"}},11};
+        transitions.observe("player",{player});transitions.observe("mechanism",{mechanism});
+        const auto originalPlayer=transitions.find("player","character")->ref,originalDoor=transitions.find("mechanism","door")->ref;
+        transitions.bind(2,1,originalPlayer);transitions.resume(native);
+        player.state["hp"]=0;player.state["dead"]=true;transitions.observe("player",{player});
+        player.state["hp"]=100;player.state["dead"]=false;transitions.observe("player",{player});
+        mechanism.state["active"]=false;transitions.observe("mechanism",{mechanism});
+        mechanism.state["active"]=true;transitions.observe("mechanism",{mechanism});
+        check(transitions.find("player","character")->ref==originalPlayer&&transitions.find("mechanism","door")->ref==originalDoor,
+            "revival and mechanism reactivation preserve their native allocation identities");
+        check(transitions.bind(2,1,originalPlayer),"native revival does not silently discard squad ownership");
+        player.nativeLife=2;transitions.observe("player",{player});
+        check(!transitions.find(originalPlayer)&&transitions.find("player","character")->ref!=originalPlayer,
+            "explicit native lifecycle replacement uses the same rules for players and minerals");
+        transitions.reset();
+    }
     auto gap=*host.changesSince(priorVersion);gap["base"]=priorVersion+1;
     check(!guest.delta(gap,true)&&guest.needsBaseline()&&guest.snapshot().empty(),"missing journal interval withdraws replica operations until baseline");
     check(!guest.baseline(baseline,scene(),true),"resync cannot roll back to an older baseline");
@@ -270,7 +303,8 @@ int main() {
     check(concurrent.status()["results_confirmed"]==2&&concurrent.find(oreRef)->state["hp_ratio"]==7000,
         "unissued future callback stamp cannot certify or replace native state");
     const auto privateWire=concurrent.baseline().dump();
-    check(privateWire.find("nativeStamp")==std::string::npos&&privateWire.find("native_stamp")==std::string::npos&&privateWire.find("cookie")==std::string::npos,
+    check(privateWire.find("nativeStamp")==std::string::npos&&privateWire.find("native_stamp")==std::string::npos&&
+        privateWire.find("nativeLife")==std::string::npos&&privateWire.find("cookie")==std::string::npos,
         "native capture order and identities remain private to the host");
     Host squadHost;Fixture squadAdapter;squadHost.reset(scene(),"fixture-only");
     std::vector<Observation> nativeSquad;std::vector<Ref> squad;

@@ -27,7 +27,8 @@
     }
     void sampleParty() {
         sampledParty=Json::array();std::set<int> present;
-        auto* player=api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"));
+        auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
+        auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
         auto* squad=player?readField<void*>(player,"GamePlayer","squadManager","Beyond.Gameplay"):nullptr;
         if(!squad)return;
         const int count=api.value<int>(gm("SquadManager","get_slotCount","","System.Int32"),squad);

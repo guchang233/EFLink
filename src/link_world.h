@@ -6,6 +6,7 @@
 #include "unity_bridge.h"
 #include "authority/native_build_policy.h"
 #include "authority/native_resource_state.h"
+#include "authority/native_battle_state.h"
 #include "authority/native_object_bindings.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
@@ -349,6 +350,7 @@ private:
     }
     #include "link_world_presentation.h"
     #include "link_world_resources.h"
+    #include "link_world_census.h"
     void sample(Net& net) {
         const auto now=nowMs();
         if(now-lastMap>1000) {lastMap=now;readMap();}
@@ -806,6 +808,7 @@ public:
         }
         updatePresentation(net,link);
         updateResources(net,link);
+        updateNativeCensus(net,link);
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
         perf.remotesMs=0; // no uncertified model/effect replay
@@ -818,6 +821,7 @@ public:
     void clear() {
         clearPresentation();
         clearResources();
+        clearNativeCensus();
     }
     void shutdown() {
         clearResources();
@@ -845,6 +849,7 @@ public:
                 {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},
                 {"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
             {"world_replication",{{"native_bindings",nativeObjectBindings.size()},
+                {"native_census",nativeCensusStatus()},
                 {"native_entities",0},{"private_enemies_quarantined",0},{"room_owned_enemies",0},{"matched",0},{"missing",0},
                 {"guest_policy",{{"ready",false},{"restricted",false},{"target_isolation_ready",false},{"supported",false}}},
                 {"native_feed",{{"enabled",false},{"filter_active",false},{"legacy_removed",true},{"supported",false}}},

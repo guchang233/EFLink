@@ -88,9 +88,11 @@ struct Ref {
         return {j.at("id").get<std::uint64_t>(),j.at("life").get<std::uint64_t>()};
     }
 };
-struct Observation {std::string key,kind;Json state;std::uint64_t cookie=0;};
+struct Observation {
+    std::string key,kind;Json state;std::uint64_t cookie=0,nativeLife=1;
+};
 struct Object {
-    Ref ref;std::string key,kind;Json state;std::uint64_t cookie=0,version=0,nativeStamp=0;
+    Ref ref;std::string key,kind;Json state;std::uint64_t cookie=0,version=0,nativeStamp=0,nativeLife=1;
     Json json() const {return {{"ref",ref.json()},{"key",key},{"kind",kind},{"version",version},{"state",state}};}
     static bool validWire(const Json& j) {
         try {
@@ -298,15 +300,16 @@ public:
         const auto stamp=captureNativeStamp();
         auto candidate=objects;auto id=nextObject,life=nextLife;std::set<std::string> seen;std::vector<std::pair<std::string,Object>> events;
         for(const auto& v:observations) {
-            if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!validState(v.state)||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
+            if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!v.nativeLife||!validState(v.state)||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
             const auto key=index(kind,v.key);auto it=candidate.find(key);
-            const bool regenerated=it!=candidate.end()&&
-                ((it->second.state.value("collected",false)&&!v.state.value("collected",false))||
-                 (it->second.state.value("dead",false)&&!v.state.value("dead",false))||
-                 (!it->second.state.value("active",true)&&v.state.value("active",true)));
-            if(it==candidate.end()||it->second.cookie!=v.cookie||regenerated) {
+            // Revive, opening a mechanism and reactivating an effect are state
+            // changes. Only the native allocation/lifecycle observer can issue
+            // a new lifetime; gameplay booleans cannot fabricate a respawn.
+            if(it!=candidate.end()&&it->second.cookie==v.cookie&&v.nativeLife<it->second.nativeLife)
+                throw std::runtime_error("native lifecycle observation regressed");
+            if(it==candidate.end()||it->second.cookie!=v.cookie||it->second.nativeLife!=v.nativeLife) {
                 if(it!=candidate.end())events.emplace_back("retire",it->second);
-                advance(id);advance(life);Object object{{id,life},v.key,kind,v.state,v.cookie,1,stamp};candidate[key]=object;events.emplace_back("upsert",object);
+                advance(id);advance(life);Object object{{id,life},v.key,kind,v.state,v.cookie,1,stamp,v.nativeLife};candidate[key]=object;events.emplace_back("upsert",object);
             }else {
                 it->second.nativeStamp=stamp;
                 if(it->second.state!=v.state) {advance(it->second.version);it->second.state=v.state;events.emplace_back("upsert",it->second);}

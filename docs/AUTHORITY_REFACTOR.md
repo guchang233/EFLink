@@ -206,3 +206,11 @@
 规则检查覆盖非法参数、放大移动输入、越权选人与伪造结果。实际 localhost 传输检查确认槽位/按键阶段经过 authenticated room 传到测试适配器，测试适配器依然不包含在生产 DLL 中。完整检查首次旧 link_session_test 因过期测试引用发生 Windows `0xc0000409`，直接复查通过；范围检查夹具补上持续的原生世界/准入心跳，额外验证超过三秒租期仍保持有效，避免范围拒绝其实来自过期准入。完整 20 组检查及修改后单独的租期回归通过，原始中止和恢复日志保留。
 
 恢复包 SHA256 `C7ADDEEF7748E1F1149A8A88E212E4EBB3888EA58E8448B2CE9E01AC34A54FFE`。生产执行、客机隔离/应用与个人恢复尚未实现和验收，不开放未知入口，不设置 full_sync_verified。只读元数据进一步确认候选 NPC 工厂属于现有全局 GameWorld 管理器；未找到可据此认证隔离的事实，未创建 NPC 或调用采集操作。
+
+## 原生队伍与怪物事实接入同一账本（.58）
+
+生产 World 增加真实 SquadManager 0–3 槽与 ObjectContainer 敌人枚举，读取 Entity/AbilitySystem 的模板、位置、HP、最大 HP、韧性、最大韧性及存活事实，经同一 NativeObjectBindings 和 Host.observe 进入已有矿石的统一基线/增量。身份包含原生分配 UID 和代数；账号/原生编号仍留在私有绑定中。没有韧性容量的对象不生成虚构韧性条。缺失管理器、部分初始化、无已验证关卡键的运行时怪物、无效原生数值和账本拒绝保留前次基线，并明确记录错误，不能把失败当成功。队伍采样也补上 GameInstance 接收对象。
+
+同时删除用 dead/active/collected 布尔变化猜测新生命周期的规则。原生分配 cookie 或编译适配提供的明确 nativeLife 才可换公共身份；角色复活与机关启停保留身份和队伍归属。nativeLife 不能由 JSON 意图提供或在房间消息中泄露，旧生命周期回退拒绝整个枚举。新增原生状态翻译及跨类别生命周期回归。
+
+`.58` 完整构建、20 组检查、源指纹及 V1/V2 ABI 通过，恢复包 SHA256 `60347B0F91EEB502E0969642254E6D852920F4A9FB060F1077688F598CECD5D6`。这是生产读取/统一发布代码接入，尚未替换两端运行主模块或实机证明读取路径；更不代表原生执行、客机应用、账号隔离和恢复已经支持。新增 native_census 各种类诊断均显式 read_only=true、execution_supported=false、dual_client_verified=false。整体目标仍未完成。

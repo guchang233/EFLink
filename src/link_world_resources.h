@@ -102,7 +102,10 @@
             for(const auto& observation:observations) {
                 auto state=observation.state;state["key"]=observation.key;state["kind"]=observation.kind;nativeResourceCensus.push_back(std::move(state));
             }
-            if(snapshot.role==Role::Host) {link.observeNativeObjects("mineral",observations);link.publishAuthority(net);}
+            if(snapshot.role==Role::Host) {
+                if(!link.observeNativeObjects("mineral",observations))throw std::runtime_error("unified authority rejected native mineral census; previous baseline retained");
+                link.publishAuthority(net);
+            }
             ++resourceScans;lastResourceSuccess=nowMs();resourceError.clear();
         }catch(const std::exception& e) {resourceError=e.what();}
     }
