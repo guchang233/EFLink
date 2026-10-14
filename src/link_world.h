@@ -1687,6 +1687,63 @@ private:
         return out;
     }
 public:
+    // Only local native references and asset metadata are examined. Public
+    // diagnostics expose comparisons, never raw pointers or account/entity IDs.
+    nlohmann::json inspectNativeAttackOrigin(void* board,void* target) {
+        nlohmann::json out={{"source_reference_valid",false},{"receiver_matches_target",false},
+            {"sender_matches_source",false},{"party_slot",-1},{"source_is_controlled",false},
+            {"cast_present",false},{"cast_owner_matches_source",false},{"cast_instance_present",false}};
+        if(!board||!target)return out;
+        auto* dictionary=readField<void*>(board,"ParamBlackboard","variableDict","Beyond.Gameplay");
+        if(!dictionary)return out;
+        authority::MetadataIndex metadata;
+        auto variable=[&](const char* name,const char* valueType)->void* {
+            auto* has=collection(dictionary,"ContainsKey",{api.string(name)});bool present=false;
+            if(has)std::memcpy(&present,runtime->object_unbox(runtime->context,has),sizeof present);
+            if(!present)return nullptr;
+            auto* value=collection(dictionary,"get_Item",{api.string(name)});
+            if(!value||metadata.parameterType(value).at("value_type")!=valueType)
+                throw std::runtime_error("unverified native attack parameter type");
+            return value;
+        };
+        struct Reference {void* entity=nullptr;std::uint32_t uid=0;};
+        auto entityReference=[&](const char* name)->Reference {
+            auto* value=variable(name,"Beyond.Gameplay.Core.EntityPtr");if(!value)return {};
+            auto* ptr=metadata.fieldObject(value,"m_value","Beyond.Gameplay.Core.EntityPtr");
+            eflink::unity::Api::TemporaryRoot ptrRoot(runtime,ptr);
+            auto* objectPtr=metadata.fieldObject(ptr,"<objectPtr>k__BackingField","Beyond.ObjectPtr<Beyond.Gameplay.Core.Entity>");
+            eflink::unity::Api::TemporaryRoot objectRoot(runtime,objectPtr);
+            auto* entity=metadata.fieldObject(objectPtr,"obj","Beyond.Gameplay.Core.Entity");
+            auto* cached=metadata.fieldObject(objectPtr,"cachedUid","System.UInt32");
+            std::uint32_t uid=0;if(cached)std::memcpy(&uid,runtime->object_unbox(runtime->context,cached),sizeof uid);
+            if(!uid||!usable(entity)||api.value<std::uint32_t>(gm("Entity","get_instanceUid","","System.UInt32"),entity)!=uid)return {};
+            return {entity,uid};
+        };
+        const auto source=entityReference("instigator"),sender=entityReference("@event_sender"),receiver=entityReference("@event_receiver");
+        out["source_reference_valid"]=source.entity!=nullptr;
+        out["sender_matches_source"]=source.entity&&source.entity==sender.entity&&source.uid==sender.uid;
+        out["receiver_matches_target"]=receiver.entity&&receiver.entity==target;
+        if(!source.entity)return out;
+        auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
+        auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
+        auto* squad=player?readField<void*>(player,"GamePlayer","squadManager","Beyond.Gameplay"):nullptr;
+        if(squad) {
+            const int count=api.value<int>(gm("SquadManager","get_slotCount","","System.Int32"),squad);
+            if(count<0||count>4)throw std::runtime_error("unverified native source squad size");
+            for(int slot=0;slot<count;++slot)if(api.call(gm("SquadManager","GetMemberBySlot","System.Int32","Beyond.Gameplay.Core.Entity"),squad,{&slot})==source.entity) {out["party_slot"]=slot;break;}
+        }
+        out["source_is_controlled"]=api.call(mainCharacter)==source.entity;
+        auto* skillVariable=variable("skill_id","System.String");
+        const auto skill=skillVariable?text(metadata.fieldObject(skillVariable,"m_value","System.String")):std::string{};
+        if(skill.empty()||skill.size()>128)return out;
+        auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),source.entity);void* nativeSkill=nullptr;
+        if(!ability||!api.value<bool>(gm("AbilitySystem","TryGetSkill","System.String|Beyond.Gameplay.Core.Skill&","System.Boolean"),ability,{api.string(skill),&nativeSkill})||!nativeSkill)return out;
+        eflink::unity::Api::TemporaryRoot skillRoot(runtime,nativeSkill);
+        out["cast_present"]=true;
+        out["cast_owner_matches_source"]=api.call(gm("Skill","get_owner","","Beyond.Gameplay.Core.AbilitySystem"),nativeSkill)==ability;
+        out["cast_instance_present"]=api.value<std::uint32_t>(gm("Skill","get_skillCastId","","System.UInt32"),nativeSkill)!=0;
+        return out;
+    }
     // Read-only callback diagnostic. No native operation is invoked, no state
     // is applied, and parameter VALUES/actor account IDs are deliberately omitted.
     nlohmann::json inspectNativeMineralAttack(const BE_HostApiV1* host,void* object,void* board) {
@@ -1729,11 +1786,13 @@ public:
             each(references,[&](const std::string& name,void* child){inspectBoard(child,path+"/"+name,depth+1);});
         };
         inspectBoard(board,"root",0);
+        nlohmann::json origin;
+        try {origin=inspectNativeAttackOrigin(board,entity);}catch(const std::exception& e) {origin={{"error",e.what()},{"source_reference_valid",false}};}
         return {{"map",mapId},{"level",levelId},{"key",key+"/mine"},
             {"hp_ratio",readField<int>(object,"InteractiveDoodadCommonComponent","m_hpRatioRuntime")},
             {"server_hp_ratio",readField<int>(object,"InteractiveDoodadCommonComponent","m_hpRatio")},
             {"collected",readField<bool>(object,"InteractiveDoodadCommonComponent","m_isCollected")},
-            {"board_class",boardClass},{"parameter_boards",parameterBoards},{"parameter_types",parameters},{"gameplay_modified",false}};
+            {"board_class",boardClass},{"parameter_boards",parameterBoards},{"parameter_types",parameters},{"origin",origin},{"gameplay_modified",false}};
     }
     // Used by the separate read-only resource inspector, on the native game thread.
     // This does not tick the room adapter or execute any gameplay operation.

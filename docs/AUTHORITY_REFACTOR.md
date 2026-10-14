@@ -88,6 +88,14 @@
 
 两端已停用 probe9、加载不可覆盖的 `resourceprobe10`。真实房主再次普攻后捕获 7 条回调，采样错误 0；静止房客记录 0。`instigator` / `@event_sender` / `@event_receiver` 的实际值类型均为 `Beyond.Gameplay.Core.EntityPtr`，`skill_id` 是字符串，`value` 是 float。只读元数据确认 EntityPtr 内有 ObjectPtr<Entity> backing field；下一步须核对缓存 UID、存活实体、队伍槽位、接收目标与实际 Skill 归属。字符串技能编号本身仍不能证明施法实例、执行结果或账号隔离。两端 trace 已停止，原生执行与全同步标记继续 false。
 
+## 原生引用、队伍与施法归属核对（.43）
+
+`.43` 按已读取的确切元数据类型对 EntityPtr / ObjectPtr<Entity> 字段进行托管 boxing 读取，避免猜测值类型布局；检查缓存 UID、实体未释放、接收对象、原生队伍槽位及技能 owner/cast ID 是否存在。只读取攻击参数、实体生命周期和技能资源信息，不读取登录凭据；公开诊断只有比较结果，没有原生地址或账号实体编号。字段类型未知、缺失或变化时明确记录来源错误，不能生成执行 witness。
+
+完整构建、18 组检查、源指纹与 V1/V2 ABI 通过；恢复包 SHA256 `346FC69F7E8EFDEC9AB307AD0AF12EAF294E504F164FFA808A3C21B14ADE8DC1`。主模块继续 `.37`，两端停用 probe10 后加载不可覆盖的 `resourceprobe11`。
+
+真实房主普攻捕获 8 条回调、采样错误 0；房客记录 0。四条受击回调中 instigator 引用有效，属于槽位 0 的主控角色，receiver 匹配实际受击矿石，Skill owner 与来源 AbilitySystem 相同，原生 skillCastId 非零。sender 与 instigator 不同，不能把事件 sender 当作攻击者。此次只证明当前主控攻击的来源与可见施法实例，不证明全部队友、施法请求绑定、远端意图执行、官方结果关联、客机隔离应用或真实恢复；所有对应认证仍为 false。两端 trace 已停止。
+
 - 各自原生登录与官方连接保留，不读取登录凭据。
 - 奖励、背包、任务、解锁及账号进度不由模组生成或补发。
 - 未验证游戏版本及原生入口默认停用，账号风险始终显示，不能声称官方认可或零封号风险。

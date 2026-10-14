@@ -69,6 +69,17 @@ public:
         return {{"class",typeText(symbol<const void*(*)(const void*)>("il2cpp_class_get_type")(klass))},
             {"value_type",field?typeText(symbol<const void*(*)(const void*)>("il2cpp_field_get_type")(field)):std::string{}}};
     }
+    // Exact, whitelisted instance fields only; managed boxing avoids guessing
+    // the layout of EntityPtr or a closed generic ObjectPtr<Entity> value.
+    void* fieldObject(void* object,const char* name,const std::string& expectedType) const {
+        if(!object)return nullptr;
+        const auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(object);
+        const auto* field=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass,name);
+        if(!field||(symbol<int(*)(const void*)>("il2cpp_field_get_flags")(field)&0x10)||
+            typeText(symbol<const void*(*)(const void*)>("il2cpp_field_get_type")(field))!=expectedType)
+            throw std::runtime_error("unverified native source field type");
+        return symbol<void*(*)(const void*,void*)>("il2cpp_field_get_value_object")(field,object);
+    }
     // Methods whose name contains `method` in classes whose name contains `klass`.
     nlohmann::json search(const std::string& method,const std::string& klass,std::size_t limit) const {
         static auto methodName=symbol<const char*(*)(const void*)>("il2cpp_method_get_name");
