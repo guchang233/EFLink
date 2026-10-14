@@ -17,7 +17,7 @@
         NativeResourceSample& operator=(const NativeResourceSample&)=delete;
     };
     void clearResources() {
-        nativeObjectBindings.retireKind("mineral");
+        nativeObjectBindings.retireKind("mineral");personalObjectBindings.retireKind("mineral");
         for(auto& [key,resource]:nativeResources)release(resource.root);
         nativeResources.clear();nativeResourceCensus=nlohmann::json::array();
         resourceRoom=0;resourceEpoch=lastResourceScan=lastResourceSuccess=0;
@@ -102,15 +102,18 @@
         const auto snapshot=net.snapshot();
         if(snapshot.role==Role::Offline||!link.followHost||!link.combat||!link.localSceneOperational()||!nativeSceneInitialized||
            link.snapshot().value("map",std::string{})!=mapId||link.snapshot().value("level",std::string{})!=levelId) {
-            if(resourceRoom)clearResources();return;
+            if(resourceRoom)clearResources();
+            if(guestRoomBindings.size())guestRoomBindings.clear();
+            return;
         }
         if(resourceRoom!=snapshot.roomId||resourceEpoch!=link.generation()) {
-            clearResources();resourceRoom=snapshot.roomId;resourceEpoch=link.generation();
+            clearResources();guestRoomBindings.clear();resourceRoom=snapshot.roomId;resourceEpoch=link.generation();
         }
         if(nowMs()-lastResourceScan<100)return;lastResourceScan=nowMs();
         NativeResourceSample sample(*this);
         try {
-            auto staged=nativeObjectBindings.preview();
+            auto& bindings=snapshot.role==Role::Host?nativeObjectBindings:personalObjectBindings;
+            auto staged=bindings.preview();
             sampleResources(staged,sample);
             std::map<std::string,std::vector<worldauthority::Observation>> frame;
             if(snapshot.role==Role::Host) {
@@ -120,7 +123,7 @@
                 }
                 frame["mineral"]=sample.facts;
             }
-            if(!nativeObjectBindings.commitWith(staged,[&] {return snapshot.role!=Role::Host||link.observeNativeFrame(frame);}))
+            if(!bindings.commitWith(staged,[&] {return snapshot.role!=Role::Host||link.observeNativeFrame(frame);}))
                 throw std::runtime_error("unified authority rejected native frame; bindings and previous baseline retained");
             nativeResources.swap(sample.resources);nativeResourceCensus.swap(sample.census);
             for(const auto& [kind,facts]:frame) {

@@ -312,3 +312,11 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 用户补齐队伍后，`.70` 已核对两端真实正式队伍均为 4 槽/4 角色，房客接收与房主相同的 45 矿石和 4 玩家公共对象。此为只读数据链验证，不是四角色表现或矿石端到端验收。只读原生方法核对确认 `ServerSyncInteractiveProperty` 经数据存储取得 `InteractiveInfo`，调用 `UpdateServerProperty`；消息编号不能直接冒充 NatureResourceManager 资源编号。未调用这些更新/创建路径，检查器已停用。
 
 完整构建、15 组独立检查、源指纹和 V1/V2 ABI 通过；不可覆盖的恢复包 SHA256 为 `6CAD17CCF157CECDFDB401181534A685EFC6B49A092E6B9BD7D27AEFF30AD482`。原生执行、客机隔离/应用、个人世界恢复和端到端验收仍未完成，`full_sync_verified=false`。
+
+## 原生绑定世界域隔离（.72）
+
+原生绑定表现在固定标记房主世界、房客个人世界或房客隔离房间，查找可操作的绑定时必须声明目标世界域并核对当前原生分配和游戏线程。房客只读采样写入个人世界表，不会再把相同稳定键的矿石混进房主表；隔离房间表单独建立，尚无生产对象会被加入。离房、换房和清理会撤销隔离房间绑定。
+
+离线测试覆盖相同矿石键跨域拒绝、外来事务拒绝和异线程查找拒绝。这是避免误写个人世界的必要前置约束，尚未实现官方消息隔离、房间原生对象创建/应用或个人世界恢复。原生执行与全部玩法继续默认关闭，`full_sync_verified=false`；待收尾时再做真实客户端验收。
+
+`.72` 不可覆盖恢复包 SHA256 `F45075D97D67CE1A12F08FE3F1EBDA0F44C916EB07F94D4328C8FAB87256BC8B`。

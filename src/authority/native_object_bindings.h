@@ -11,9 +11,11 @@ struct NativeAllocation {
     bool operator==(const NativeAllocation&) const=default;
     bool valid() const {return address&&allocation;}
 };
+enum class NativeDomain { Personal, HostWorld, GuestRoom };
 struct NativeBindingInput {std::string key;NativeAllocation allocation;};
-struct NativeBinding {std::string kind,key;NativeAllocation allocation;std::uint64_t cookie=0;};
+struct NativeBinding {std::string kind,key;NativeAllocation allocation;std::uint64_t cookie=0;NativeDomain domain=NativeDomain::Personal;};
 class NativeObjectBindings {
+    const NativeDomain domain;
     std::map<std::pair<std::string,std::string>,NativeBinding> entries;
     std::uint64_t nextCookie=0;
     std::uint64_t revision=0,sourceRevision=0;
@@ -21,14 +23,14 @@ class NativeObjectBindings {
     bool committing=false;
     std::thread::id owner;
     explicit NativeObjectBindings(const NativeObjectBindings& value,int)
-        :entries(value.entries),nextCookie(value.nextCookie),sourceRevision(value.revision),source(&value),owner(value.owner) {}
+        :domain(value.domain),entries(value.entries),nextCookie(value.nextCookie),sourceRevision(value.revision),source(&value),owner(value.owner) {}
     void thread() {
         if(committing)throw std::runtime_error("native binding mutation during authority commit");
         if(owner==std::thread::id{})owner=std::this_thread::get_id();
         if(owner!=std::this_thread::get_id())throw std::runtime_error("native binding mutation outside game thread");
     }
 public:
-    NativeObjectBindings()=default;
+    explicit NativeObjectBindings(NativeDomain value):domain(value) {}
     NativeObjectBindings(const NativeObjectBindings&)=delete;
     NativeObjectBindings& operator=(const NativeObjectBindings&)=delete;
     // Prepare all native kinds privately. Cookies and retirements become
@@ -36,7 +38,7 @@ public:
     NativeObjectBindings preview() {thread();return NativeObjectBindings(*this,0);}
     template<class Accept> bool commitWith(NativeObjectBindings& candidate,Accept accept) {
         thread();candidate.thread();
-        if(candidate.source!=this||candidate.sourceRevision!=revision)
+        if(candidate.source!=this||candidate.domain!=domain||candidate.sourceRevision!=revision)
             throw std::runtime_error("stale or foreign native binding transaction");
         committing=candidate.committing=true;bool accepted=false;
         try {accepted=accept();}catch(...) {committing=candidate.committing=false;throw;}
@@ -66,7 +68,7 @@ public:
                 if(counter==UINT64_MAX)throw std::runtime_error("native binding identity exhausted");
                 cookie=++counter;
             }
-            candidate[index]={kind,input.key,a,cookie};
+            candidate[index]={kind,input.key,a,cookie,domain};
         }
         for(auto it=candidate.begin();it!=candidate.end();) {
             if(it->first.first==kind&&!seen.contains(it->first.second))it=candidate.erase(it);else ++it;
@@ -77,14 +79,19 @@ public:
     // Scene/room teardown retires all bindings. Allocation counters survive
     // resets so a pooled address cannot resurrect a previous object's cookie.
     void clear() {thread();entries.clear();++revision;}
-    void retireKind(const std::string& kind) {reconcile(kind,{});}
+    void retireKind(const std::string& kind) {
+        thread();if(!knownKind(kind))throw std::runtime_error("unknown native binding kind");
+        for(auto it=entries.begin();it!=entries.end();)if(it->first.first==kind)it=entries.erase(it);else ++it;
+        ++revision;
+    }
     const NativeBinding* find(const std::string& kind,const std::string& key) const {
         auto it=entries.find({kind,key});return it==entries.end()?nullptr:&it->second;
     }
     // Revalidate the actual current native allocation immediately before an
     // operation; holding a GC root alone is not proof that it is still alive.
-    const NativeBinding* resolve(const std::string& kind,const std::string& key,const NativeAllocation& current) const {
-        auto* value=find(kind,key);return value&&current.valid()&&value->allocation==current?value:nullptr;
+    const NativeBinding* resolve(NativeDomain expectedDomain,const std::string& kind,const std::string& key,const NativeAllocation& current) const {
+        if(owner==std::thread::id{}||owner!=std::this_thread::get_id())return nullptr;
+        auto* value=find(kind,key);return value&&value->domain==expectedDomain&&current.valid()&&value->allocation==current?value:nullptr;
     }
     std::size_t size() const {return entries.size();}
 };

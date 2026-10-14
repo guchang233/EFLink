@@ -63,7 +63,11 @@ class World {
     float nativeTimeScale=1,nativeDeltaTime=0;
 
     Session* session=nullptr;
-    worldauthority::NativeObjectBindings nativeObjectBindings;
+    worldauthority::NativeObjectBindings nativeObjectBindings{worldauthority::NativeDomain::HostWorld};
+    worldauthority::NativeObjectBindings personalObjectBindings{worldauthority::NativeDomain::Personal};
+    // Shared guest instances will be registered here only after native room
+    // construction. Personal census bindings can never resolve as room objects.
+    worldauthority::NativeObjectBindings guestRoomBindings{worldauthority::NativeDomain::GuestRoom};
     HostMapConsent hostMapConsent;
     std::string hostMapChoiceMap,hostMapChoiceLevel;
     std::string replicationError;
@@ -603,7 +607,8 @@ public:
         nlohmann::json resources=nlohmann::json::array();
         nlohmann::json properties;
         try {
-            auto staged=nativeObjectBindings.preview();NativeResourceSample sample(*this);sampleResources(staged,sample);
+            auto staged=personalObjectBindings.preview();NativeResourceSample sample(*this);
+            sampleResources(staged,sample);
             resources.swap(sample.census);nativeResources.swap(sample.resources);properties=resourceProperties();
         }
         catch(...) {clearResources();throw;}
@@ -816,6 +821,7 @@ public:
         clearPresentation();
         clearResources();
         clearNativeCensus();
+        personalObjectBindings.clear();guestRoomBindings.clear();
     }
     void shutdown() {
         clearResources();
@@ -842,7 +848,10 @@ public:
             {"resources",{{"local",nativeResourceCensus},{"scans",resourceScans},{"unadapted_native_objects",resourceUnknown},
                 {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},
                 {"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
-            {"world_replication",{{"native_bindings",nativeObjectBindings.size()},
+            {"world_replication",{{"native_bindings",nativeObjectBindings.size()+personalObjectBindings.size()},
+                {"host_world_bindings",nativeObjectBindings.size()},
+                {"personal_bindings",personalObjectBindings.size()},
+                {"guest_room_bindings",guestRoomBindings.size()},
                 {"native_census",nativeCensusStatus()},
                 {"native_squad_source",nativeSquadSource},
                 {"native_entities",0},{"private_enemies_quarantined",0},{"room_owned_enemies",0},{"matched",0},{"missing",0},
