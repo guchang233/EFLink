@@ -269,7 +269,11 @@ int main() {
     longHost.bind(2,1,longActor);longHost.resume(longAdapter);
     bool continuous=true;
     for(std::uint64_t index=1;index<=10020;++index) {
-        Intent input{scene(),2,1,index,index,1,1,longActor,longOre,"mine"};
+        if(index==8193) {
+            Intent boundary{scene(),2,1,index,1,2,1,longActor,longOre,"mine"};
+            check(!longHost.submit(boundary.json(),2,longAdapter,index*2),"history eviction cannot dispatch the old action that it has just retired");
+        }
+        Intent input{scene(),2,1,index+(index>=8193?1:0),index,1,1,longActor,longOre,"mine"};
         const auto longTicket=longHost.submit(input.json(),2,longAdapter,index*2);
         if(!longTicket) {continuous=false;break;}
         longAdapter.result=Witness{*longTicket,10,20,index,mineral().state,longHost.captureNativeStamp()};
@@ -277,7 +281,7 @@ int main() {
     }
     check(continuous&&longHost.status()["results_confirmed"]==10020,"a long session does not stop when command/event dedup reaches its memory window");
     check(longHost.status()["dedup_commands"]==8192&&longHost.status()["dedup_event_paths"]==1,"long-session command and event history remains bounded");
-    Intent retired{scene(),2,1,10021,1,2,1,longActor,longOre,"mine"};
+    Intent retired{scene(),2,1,10022,1,2,1,longActor,longOre,"mine"};
     check(!longHost.submit(retired.json(),2,longAdapter,21000),"eviction cannot revive an old command with a new request number");
     auto newest=retired;newest.action=10021;newest.strike=1;
     const auto oldEventTicket=longHost.submit(newest.json(),2,longAdapter,21000);

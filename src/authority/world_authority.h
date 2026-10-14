@@ -331,6 +331,9 @@ public:
             if(intent.request<=m.highRequest||strikes.contains(strike)||!adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
             advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp(),adapter.path()};
             m.highRequest=intent.request;rememberStrike(strike,intent.request);
+            // Making room can retire this very old action. Consuming its new
+            // request identity must never dispatch it across that boundary.
+            if(commandRetired(intent)) {++rejected;return {};}
             if(now>UINT64_MAX-1500) {++rejected;return {};}
             pending.emplace(ticket.serial,Pending{ticket,&adapter,now+1500});
             // Consume request identity even when native dispatch fails: an
