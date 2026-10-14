@@ -2003,7 +2003,7 @@ public:
                     auto* value=collection(map,"get_Item",{api.string(name)});if(value)visit(name,value);
                 }
             };
-            each(dictionary,[&](const std::string& name,void* variable){parameters[path+"/"+name]=classOf(variable);});
+            each(dictionary,[&](const std::string& name,void* variable){parameters[path+"/"+name]=authority::MetadataIndex{}.parameterType(variable);});
             each(references,[&](const std::string& name,void* child){inspectBoard(child,path+"/"+name,depth+1);});
         };
         inspectBoard(board,"root",0);

@@ -17,7 +17,7 @@ std::mutex mutex;bool initialized=false,hooked=false;
 std::atomic<bool> requested=false;
 json captureResult;
 std::atomic<std::uint64_t> traceUntil{0};bool attackHooked=false,attackAttempted=false;std::uint64_t traceSequence=0;
-json attackTrace=json::array();std::string observedVersion;
+json attackTrace=json::array();std::string observedVersion;std::atomic<std::uint64_t> traceFaults{0};
 BE_ResolvedMethodV1 attackMethod{};
 using Attack=void(__fastcall*)(void*,void*,void*);Attack nextAttack=nullptr;
 BE_ResolvedMethodV1 receiveMethod{},runtimeHpMethod{},serverHpMethod{};
@@ -35,16 +35,17 @@ bool camera(void* object) noexcept {
 }
 json observeAttack(void* self,void* board) noexcept {
     try {eflink::World inspector;return inspector.inspectNativeMineralAttack(runtime(),self,board);}
-    catch(const std::exception& e) {return {{"error",e.what()},{"gameplay_modified",false}};}
-    catch(...) {return {{"error","native mineral callback inspection fault"},{"gameplay_modified",false}};}
+    catch(...) {++traceFaults;return nullptr;}
 }
 bool observing(void* self,void* info,const BE_ResolvedMethodV1& method) {
     const auto until=traceUntil.load();return until&&eflink::nowMs()<until&&self&&(!info||info==method.method_info);
 }
-void appendTrace(const char* phase,json before,json after) {
-    std::lock_guard lock(mutex);if(!initialized||!traceUntil.load())return;
-    attackTrace.push_back({{"phase",phase},{"sequence",++traceSequence},{"at",eflink::nowMs()},{"before",std::move(before)},{"after",std::move(after)}});
-    if(attackTrace.size()>64)attackTrace.erase(attackTrace.begin());
+void appendTrace(const char* phase,json before,json after) noexcept {
+    try {
+        std::lock_guard lock(mutex);if(!initialized||!traceUntil.load())return;
+        attackTrace.push_back({{"phase",phase},{"sequence",++traceSequence},{"at",eflink::nowMs()},{"before",std::move(before)},{"after",std::move(after)}});
+        if(attackTrace.size()>64)attackTrace.erase(attackTrace.begin());
+    }catch(...) {++traceFaults;}
 }
 void __fastcall attack(void* self,void* board,void* info) {
     // Every original call proceeds exactly once. The probe never gates actions,
@@ -144,11 +145,11 @@ BE_Result BE_CALL message(const char* request,const char* body) {
         if(action=="capture") {install();captureResult=nullptr;requested=true;output={{"queued",true},{"gameplay_modified",false}};}
         else if(action=="trace") {
             const auto duration=command.value("duration_ms",600000u);if(duration<1000||duration>600000)throw std::runtime_error("trace duration outside limits");
-            installAttack();attackTrace=json::array();traceSequence=0;traceUntil=eflink::nowMs()+duration;
+            installAttack();attackTrace=json::array();traceSequence=0;traceFaults=0;traceUntil=eflink::nowMs()+duration;
             output={{"observing",true},{"duration_ms",duration},{"gameplay_modified",false},{"execution_adapter_verified",false}};}
         else if(action=="stop_trace") {traceUntil=0;output={{"observing",false},{"gameplay_modified",false}};}
         else if(action=="status")output={{"pending",requested.load()},{"result",captureResult},{"attack_trace",attackTrace},{"observing",traceUntil.load()>eflink::nowMs()},
-            {"game_version",observedVersion},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
+            {"game_version",observedVersion},{"trace_faults",traceFaults.load()},{"gameplay_modified",false},{"execution_adapter_verified",false},{"full_sync_verified",false}};
         else throw std::runtime_error("unknown resource observer action");
     }catch(const std::exception& e){code=BE_Result_InvalidArgument;output={{"error",e.what()}};}
     const auto text=output.dump();return host.reply(host.context,request,code,text.c_str());

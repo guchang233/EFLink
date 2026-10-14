@@ -59,6 +59,16 @@ class MetadataIndex {
         return out;
     }
 public:
+    // Inspect closed generic metadata only. Reading ParamVariable`1 by its
+    // short class name loses T, so every attack parameter looked identical.
+    // No parameter values, entity IDs or account data are read here.
+    nlohmann::json parameterType(void* object) const {
+        if(!object)return nullptr;
+        const auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(object);
+        auto* field=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass,"m_value");
+        return {{"class",typeText(symbol<const void*(*)(const void*)>("il2cpp_class_get_type")(klass))},
+            {"value_type",field?typeText(symbol<const void*(*)(const void*)>("il2cpp_field_get_type")(field)):std::string{}}};
+    }
     // Methods whose name contains `method` in classes whose name contains `klass`.
     nlohmann::json search(const std::string& method,const std::string& klass,std::size_t limit) const {
         static auto methodName=symbol<const char*(*)(const void*)>("il2cpp_method_get_name");
