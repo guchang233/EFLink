@@ -27,14 +27,7 @@
     }
     void sampleParty() {
         sampledParty=Json::array();std::set<int> present;
-        auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
-        auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
-        auto* squad=player?readField<void*>(player,"GamePlayer","squadManager","Beyond.Gameplay"):nullptr;
-        if(!squad)return;
-        const int count=api.value<int>(gm("SquadManager","get_slotCount","","System.Int32"),squad);
-        if(count<0||count>4)throw std::runtime_error("unsupported native squad size");
-        for(int slot=0;slot<count;++slot) {
-            auto* entity=api.call(gm("SquadManager","GetMemberBySlot","System.Int32","Beyond.Gameplay.Core.Entity"),squad,{&slot});
+        for(const auto& [slot,entity]:nativeRealSquadMembers()) {
             if(!usable(entity)||!api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),entity))continue;
             auto* component=api.call(entityModel,entity);auto* object=component?api.call(modelGo,component):nullptr;
             if(!object||!alive(object))continue;

@@ -77,6 +77,7 @@ def run(args):
             raise RuntimeError("Read-only transport must not admit gameplay")
         report.update(object_kinds=dict(counts), objects_match=True,
                       native_census=values[0]["game"]["world_replication"]["native_census"],
+                      native_squad_source=values[0]["game"]["world_replication"].get("native_squad_source", {}),
                       scene_generation=states[0]["session"]["epoch"],
                       native_objects=states[0]["objects"])
         first = values[0]["world_session"]["world_authority"]["transport"]

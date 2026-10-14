@@ -298,3 +298,9 @@ SquadManager._CreateCharacter、CharBagSystem.CreateClientFriendCharInfo 等角�
 统一 Host/Replica 状态验证对 HP 使用极小的绝对舍入容差加 Double 精度容差，对韧性使用 Single 精度容差；小容量的容差按容量收缩，不能淹没真实超额。保留 HP/maxHP、poise/maxPoise 的两个原值，未夹紧、归一化、改写或省略异常数值；矿石整数耐久比较不加入容差。契约 revision 18，公共 ABI 不变。独立回归覆盖实际采集到的 HP 值、明显超额、极小容量、Single 一步舍入和整数耐久超额。
 
 完整构建、15 组检查、源指纹与 ABI 通过，恢复包 SHA256 `2412BC1038987654EE31F3E9F94888D14C06E7C924867B652A03888B28E92183`。两真实客户端 `.69` 同版本 1.5.3 只读房间接收到完全一致的 45 个矿石与 1 个玩家公共对象，8.125 秒测量发送 7 次基线、60 次心跳、105457 字节，约 12979 字节/秒；这里只测 localhost 数据传输，未声称受控 RTT/丢包性能验收。自动离房后检查房间引用清空、双方保持 Personal、未保留共享世界快照。实机证据在忽略的 `ore-reference/live-readonly-room-69.json`；1 个玩家不证明四人队伍或多人角色表现，45 个矿石数据一致也不证明受击/破坏/原生执行/客机应用/恢复。全部玩法能力仍未支持，完整目标尚未完成。
+
+## 原生完整队伍来源（.70）
+
+玩家账本与只读表现采样共用 ServerSquad 的实际 slots/GetMemberBySlot，避免把临时采矿/剧情 currentSquad 当作整个正式队伍。检查真实队伍是否释放、槽位容量、角色别名和实际成员，未构造角色、补空槽或查询外来账号；世界 JSON 增加 real_slots/real_entities/current_slots/current_is_real 的来源诊断。采到一个成员就只发布一个成员，不能伪造剩余三人。
+
+完整构建、15 组检查、源指纹和 ABI 通过，恢复包 SHA256 `431AB5414A764AD2FA43CC7D02BF87AC55DBDFC55FF3030145538F262B9FE32A`。两真实客户端 `.70` 只读验证一致的 45 个矿石与 1 个玩家，实机正式队伍确实 real_slots=1/real_entities=1 且 current_is_real=true；因此这次测试不能验证四人队伍或“剩余三个角色”的表现。自动离房与引用清理通过，没有共享玩法执行、原生世界隔离/应用或个人世界恢复测试。只读接口核对还确认 NetResponse 的 headMsg/msgBody、原生交互属性通知结构与 WorldManagerCollection；未读取实际登录消息或调用管理器初始化/释放。旧只读 inspector 已停用。整个目标继续未完成，下一步必须推进生产原生执行和隔离路径。

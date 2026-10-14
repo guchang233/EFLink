@@ -45,18 +45,8 @@
     std::vector<worldauthority::Observation> sampleNativeBattle(const std::string& kind) {
         std::vector<std::pair<std::string,void*>> entities;
         if(kind=="player") {
-            auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
-            auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
-            auto* squad=player?readField<void*>(player,"GamePlayer","squadManager","Beyond.Gameplay"):nullptr;
-            if(!squad)throw std::runtime_error("native squad is unavailable; previous census retained");
-            const auto count=api.value<int>(gm("SquadManager","get_slotCount","","System.Int32"),squad);
-            if(count<0||count>4)throw std::runtime_error("unsupported native squad size");
-            for(int slot=0;slot<count;++slot) {
-                auto* entity=api.call(gm("SquadManager","GetMemberBySlot","System.Int32","Beyond.Gameplay.Core.Entity"),squad,{&slot});
-                // A vacant squad slot is not an allocation; a present but
-                // partially initialized actor fails the entire census below.
-                if(entity)entities.emplace_back(levelId+":host-squad:"+std::to_string(slot),entity);
-            }
+            for(const auto& [slot,entity]:nativeRealSquadMembers())
+                entities.emplace_back(levelId+":host-squad:"+std::to_string(slot),entity);
         }else if(kind=="enemy") {
             auto* container=staticObject("objectContainer");
             if(!container||!api.call(gm("ObjectContainer","get_allEnemies","","Beyond.UnorderedList<Beyond.Gameplay.Core.Entity>"),container))

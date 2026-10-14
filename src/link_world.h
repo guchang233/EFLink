@@ -347,6 +347,7 @@ private:
         mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
         mapHash=mapId.empty()?0:proto::fnv32(mapId);
     }
+    #include "link_world_squad.h"
     #include "link_world_presentation.h"
     #include "link_world_resources.h"
     #include "link_world_census.h"
@@ -841,6 +842,7 @@ public:
                 {"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
             {"world_replication",{{"native_bindings",nativeObjectBindings.size()},
                 {"native_census",nativeCensusStatus()},
+                {"native_squad_source",nativeSquadSource},
                 {"native_entities",0},{"private_enemies_quarantined",0},{"room_owned_enemies",0},{"matched",0},{"missing",0},
                 {"guest_policy",{{"ready",false},{"restricted",false},{"target_isolation_ready",false},{"supported",false}}},
                 {"native_feed",{{"enabled",false},{"filter_active",false},{"legacy_removed",true},{"supported",false}}},
