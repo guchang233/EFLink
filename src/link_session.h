@@ -585,7 +585,7 @@ public:
         nativeMembers[peer]=member;return true;
     }
     bool submitNativeIntent(Net& net,worldauthority::Ref actor,worldauthority::Ref target,const std::string& operation,
-                            std::uint64_t action,std::uint64_t strike) {
+                            std::uint64_t action,std::uint64_t strike,const Json& input=Json::object()) {
         const worldauthority::Scope scope{room,worldIncarnation,epoch};
         if(role!=Role::Client||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
            !protocolCompatible(proto::kHostId)||nativeGrant.is_null()||!nativeHandoff.roomOperationAllowed(scope)||
@@ -598,7 +598,7 @@ public:
         }
         if(!found||!actorLive)return false;
         worldauthority::Intent intent{scope,net.snapshot().localId,nativeGrant.at("member").get<std::uint64_t>(),++nativeRequest,
-            action,strike,found->at("version").get<std::uint64_t>(),actor,target,operation};
+            action,strike,found->at("version").get<std::uint64_t>(),actor,target,operation,input};
         try {worldauthority::Intent::parse(intent.json());}catch(...) {return false;}
         return send(net,{{"kind","world_intent"},{"intent",intent.json()}},proto::kHostId);
     }

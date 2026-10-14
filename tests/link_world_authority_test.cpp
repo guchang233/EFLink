@@ -43,7 +43,45 @@ struct PerTicketFixture:Fixture {
         auto value=found->second;callbacks.erase(found);return value;
     }
 };
+struct InputFixture:Fixture {
+    Json received;
+    bool supports(const std::string&,const std::string&) const override {return true;}
+    bool begin(const Ticket& ticket) override {received=ticket.intent.input;return Fixture::begin(ticket);}
+};
 int main() {
+    check(Intent::validInput("cast",{{"slot",3},{"phase","press"}})&&
+          Intent::validInput("attack",{{"button","primary"},{"phase","release"}})&&
+          Intent::validInput("interact",{{"choice",0}}),"native controls select host-resolved slots, buttons and interaction choices");
+    check(!Intent::validInput("cast",{{"slot",4},{"phase","press"}})&&
+          !Intent::validInput("cast",{{"slot",-1},{"phase","press"}})&&
+          !Intent::validInput("cast",{{"slot",0},{"phase","press"},{"skill","untrusted/path"}})&&
+          !Intent::validInput("interact",{{"choice",0},{"reward",100}}),"controls cannot smuggle skill names, rewards or invalid selections");
+    Json movement={{"axes",{.6,.8}},{"heading",1.2},{"mode","run"},{"duration_ms",50}};
+    check(Intent::validInput("move",movement),"movement is bounded input instead of a guest-provided final position");
+    auto invalidMove=movement;invalidMove["axes"]={1,1};
+    check(!Intent::validInput("move",invalidMove),"diagonal movement cannot amplify the allowed input magnitude");
+    invalidMove=movement;invalidMove["duration_ms"]=1000;
+    check(!Intent::validInput("move",invalidMove),"one input cannot hold native movement indefinitely");
+    invalidMove=movement;invalidMove["position"]={100,200,300};
+    check(!Intent::validInput("move",invalidMove)&&!Intent::validInput("mine",{{"hp_ratio",0}}),"movement and mining inputs cannot contain claimed outcomes");
+    {
+        Host inputs;InputFixture native;inputs.reset(scene(),"fixture-only");
+        inputs.observe("player",{{"own","player",{{"hp",100}},10},{"companion","player",{{"hp",100}},11},{"other","player",{{"hp",100}},12}});
+        inputs.observe("mineral",{mineral()});
+        auto own=inputs.find("player","own")->ref,companion=inputs.find("player","companion")->ref,other=inputs.find("player","other")->ref;
+        inputs.bindGroup(2,1,{own,companion});inputs.bind(3,1,other);inputs.resume(native);
+        Intent move{scene(),2,1,1,1,1,1,own,own,"move",movement};
+        check(inputs.submit(move.json(),2,native,100)&&native.received==movement,"validated controls reach the compiled adapter unchanged");
+        move.request=2;move.action=2;move.target=other;
+        check(!inputs.submit(move.json(),2,native,101)&&native.starts==1,"movement cannot operate another player's actor");
+        move.target=companion;move.operation="select";move.input=Json::object();
+        check(inputs.submit(move.json(),2,native,102).has_value(),"selection stays within the host-granted native squad");
+        move.request=3;move.action=3;move.target=other;
+        check(!inputs.submit(move.json(),2,native,103),"selection cannot take over another member's squad");
+        move.target=own;move.operation="cast";move.input={{"slot",2},{"phase","press"}};
+        check(inputs.submit(move.json(),2,native,104)&&native.received==move.input,"cast slot is an input rather than a guest-asserted skill result");
+        inputs.reset();
+    }
     NativeTraceWindow trace;
     trace.singleAttack();check(trace.active(1000000)&&trace.awaitingAttack()&&!trace.collecting(1000000),
         "single native capture waits for a delayed human operation without collecting idle state");

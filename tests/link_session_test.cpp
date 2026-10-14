@@ -48,9 +48,15 @@ int main() {
     HostOptions options;options.port=47841;host.host(options);check(wait([&]{return host.currentRole()==Role::Host;}),"host room starts");
     guest.join("127.0.0.1:47841","");check(wait([&]{return guest.currentRole()==Role::Client&&host.snapshot().peers.size()==2;}),"guest joins");
     Realm::NativeState nativeFixture{{0,0,0},100,100,true};
+    bool maintainWorldCensus=false;std::uint64_t lastFixtureCensus=0;
     auto tick=[&]{pose.timeMs=std::uint32_t(nowMs());host.setLocalState(pose);guest.setLocalState(pose);late.setLocalState(pose);h.update(host);g.update(guest);l.update(late);
         g.publishAppearance(guest,growthModel,advertisedAppearance);
-        h.observePlayer(1,h.playerEntity(1),h.generation(),nativeFixture);h.observePlayer(2,h.playerEntity(2),h.generation(),nativeFixture);};tick();
+        h.observePlayer(1,h.playerEntity(1),h.generation(),nativeFixture);h.observePlayer(2,h.playerEntity(2),h.generation(),nativeFixture);
+        if(maintainWorldCensus) {
+            if(nowMs()-lastFixtureCensus>=400) {lastFixtureCensus=nowMs();h.publish(host,scene(),true);}
+            g.reportEntry(guest,ReplicaFacts{true,true,true,true});
+        }
+    };tick();
     check(h.publish(host,scene(),true),"host publishes a real world snapshot");
     check(wait([&]{tick();return g.ready();}),"guest receives host map and enemies");
     check(wait([&]{tick();return h.protocolCompatible(2)&&g.protocolCompatible(1);}),"both game adapters negotiate the current cooperation contract");
@@ -287,14 +293,19 @@ int main() {
         check(wait([&]{tick();return h.status()["rejected"].get<unsigned>()>count;})&&h.takePlayerHits().empty()&&h.takeEnemyStates().empty()&&h.takeEnemyCasts().empty(),
             "legacy result packets cannot enter settlement even through raw transport");
     }
+    // The production host refreshes its census. A slow test machine must not
+    // expire that world while this fixture waits for the skill cooldown/range.
+    maintainWorldCensus=true;lastFixtureCensus=0;tick();
     auto lastAccepted=nowMs();
     nativeFixture.position[0]=50;pose.position[0]=0;guest.setLocalState(pose);
-    check(wait([&]{tick();return nowMs()-lastAccepted>=1100;}),"cooldown expires before testing native range validation");
+    check(wait([&]{tick();return nowMs()-lastAccepted>=3100;},4500)&&h.ready()&&h.canAct(2),
+        "periodic native census and entry heartbeats survive a wait longer than the lease");
     rejectIntent(Json::object(),"forged near UDP pose cannot bypass the host's native skill range");
     pose.position[0]=50;guest.setLocalState(pose);
     check(wait([&]{tick();for(const auto& peer:host.snapshot().peers)if(peer.id==2&&!peer.states.empty())return peer.states.back().state.position[0]==50;return false;}),
         "host observes the attacker's updated position");
     rejectIntent(Json::object(),"skill range comes from the host's catalog");
+    maintainWorldCensus=false;
     pose.position[0]=0;nativeFixture.position[0]=0;
     h.publish(host,scene("map02","map02_lv001"),true);
     check(h.requestedAppearance(2).is_null(),"map changes discard previous-world appearance before new metadata arrives");

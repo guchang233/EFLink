@@ -103,19 +103,43 @@ struct Object {
 };
 struct Intent {
     Scope scope;std::uint16_t peer=0;std::uint64_t member=0,request=0,action=0,strike=0,expectedVersion=0;
-    Ref actor,target;std::string operation;
+    Ref actor,target;std::string operation;Json input=Json::object();
+    // These are input controls, never outcomes, native IDs or executable names.
+    // The native adapter resolves a skill/interaction from the host's actor.
+    static bool validInput(const std::string& op,const Json& value) {
+        if(!value.is_object()||value.dump().size()>256)return false;
+        auto smallInteger=[](const Json& n,unsigned maximum) {
+            return n.is_number_integer()&&(n.is_number_unsigned()||n.get<std::int64_t>()>=0)&&n.get<std::uint64_t>()<=maximum;
+        };
+        if(op=="mine"||op=="interrupt"||op=="revive"||op=="select")return value.empty();
+        if(op=="attack")return exactFields(value,{"button","phase"})&&
+            (value.at("button")=="primary"||value.at("button")=="secondary")&&
+            (value.at("phase")=="press"||value.at("phase")=="release");
+        if(op=="cast")return exactFields(value,{"slot","phase"})&&smallInteger(value.at("slot"),3)&&
+            (value.at("phase")=="press"||value.at("phase")=="release");
+        if(op=="interact")return exactFields(value,{"choice"})&&smallInteger(value.at("choice"),31);
+        if(op=="move") {
+            if(!exactFields(value,{"axes","heading","mode","duration_ms"})||!vector(value.at("axes"),2)||
+               !value.at("heading").is_number()||!std::isfinite(value.at("heading").get<double>())||
+               std::abs(value.at("heading").get<double>())>3.141592653589793||
+               (value.at("mode")!="walk"&&value.at("mode")!="run")||!positive(value.at("duration_ms"))||
+               !smallInteger(value.at("duration_ms"),50))return false;
+            const auto x=value.at("axes")[0].get<double>(),y=value.at("axes")[1].get<double>();
+            return x*x+y*y<=1.000001;
+        }
+        return false;
+    }
     Json json() const {return {{"scope",scope.json()},{"peer",peer},{"member",member},{"request",request},{"action",action},
-        {"strike",strike},{"actor",actor.json()},{"target",target.json()},{"expected_version",expectedVersion},{"operation",operation}};}
+        {"strike",strike},{"actor",actor.json()},{"target",target.json()},{"expected_version",expectedVersion},{"operation",operation},{"input",input}};}
     static Intent parse(const Json& j) {
-        if(!exactFields(j,{"scope","peer","member","request","action","strike","actor","target","expected_version","operation"}))throw std::runtime_error("intent contains outcome or unsupported fields");
+        if(!exactFields(j,{"scope","peer","member","request","action","strike","actor","target","expected_version","operation","input"}))throw std::runtime_error("intent contains outcome or unsupported fields");
         for(auto name:{"peer","member","request","action","strike","expected_version"})if(!positive(j.at(name)))throw std::runtime_error("invalid intent identity");
         if(j.at("peer").get<std::uint64_t>()>65535)throw std::runtime_error("invalid sender");
         auto op=j.at("operation").get<std::string>();
-        static const std::set<std::string> operations={"attack","mine","interact","cast","interrupt","revive"};
-        if(!operations.contains(op))throw std::runtime_error("unsupported operation");
+        if(!validInput(op,j.at("input")))throw std::runtime_error("unsupported operation or input controls");
         return {Scope::parse(j.at("scope")),j.at("peer").get<std::uint16_t>(),j.at("member").get<std::uint64_t>(),
             j.at("request").get<std::uint64_t>(),j.at("action").get<std::uint64_t>(),j.at("strike").get<std::uint64_t>(),
-            j.at("expected_version").get<std::uint64_t>(),Ref::parse(j.at("actor")),Ref::parse(j.at("target")),op};
+            j.at("expected_version").get<std::uint64_t>(),Ref::parse(j.at("actor")),Ref::parse(j.at("target")),op,j.at("input")};
     }
 };
 inline bool validReceipt(const Json& value) {
@@ -226,6 +250,8 @@ class Host {
         auto m=members.find(intent.peer);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
         return !suspended&&intent.scope==scope_&&m!=members.end()&&m->second.active&&m->second.incarnation==intent.member&&
             owns(m->second,intent.actor)&&actor&&actor->kind=="player"&&target&&intent.expectedVersion>0&&target->version>=intent.expectedVersion&&
+            (intent.operation!="move"||intent.target==intent.actor)&&
+            (intent.operation!="select"||(target->kind=="player"&&owns(m->second,intent.target)))&&
             !actor->state.value("dead",false)&&!actor->state.value("downed",false)&&!target->state.value("collected",false)&&
             target->state.value("active",true);
     }

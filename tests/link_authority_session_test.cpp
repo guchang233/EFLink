@@ -6,17 +6,19 @@ using namespace eflink::worldauthority;
 static void check(bool value,const char* name) {if(!value)throw std::runtime_error(name);std::cout<<"PASS "<<name<<std::endl;}
 template<class F> static bool wait(F f) {for(int i=0;i<200;++i) {if(f())return true;std::this_thread::sleep_for(std::chrono::milliseconds(15));}return f();}
 struct Fixture final:NativeAdapter {
-    Session* session=nullptr;bool certified=true,saved=false,restoreReady=false,restoreStarted=false;
+    Session* session=nullptr;bool certified=true,saved=false,restoreReady=false,restoreStarted=false,acceptCast=false;
+    Json lastInput;
     std::uint64_t revision=0,event=0;unsigned begins=0,cancels=0;std::optional<Witness> result;
     std::string gameVersion() const override{return "fixture-game";}
     std::string path() const override{return "transport-fixture-only";}
     bool executionVerified() const override{return certified;}
     bool isolationVerified() const override{return certified;}
     bool recoveryVerified() const override{return certified;}
-    bool supports(const std::string& kind,const std::string& op) const override{return kind=="mineral"&&op=="mine";}
+    bool supports(const std::string& kind,const std::string& op) const override{return kind=="mineral"&&(op=="mine"||(acceptCast&&op=="cast"));}
     bool validate(const Intent&,const Object& actor,const Object& target) const override{return actor.kind=="player"&&target.kind=="mineral";}
     bool begin(const Ticket& ticket) override {
         ++begins;
+        lastInput=ticket.intent.input;
         result=Witness{ticket.serial,ticket.actorCookie,ticket.targetCookie,++event,
             {{"template","ore"},{"hp_ratio",9000},{"max_hp_ratio",10000},{"collected",false}},session->captureNativeResultStamp()};
         return true;
@@ -87,6 +89,11 @@ int run() {
     const auto spoofRejected=h.status()["rejected"].get<std::uint64_t>();wire=replay.dump();guest.sendData(worldChannel,1,wire.data(),wire.size(),true);
     check(wait([&]{tick();return h.status()["rejected"].get<std::uint64_t>()>spoofRejected;})&&ha.begins==1,"authenticated sender cannot claim another room member's identity");
     check(g.status()["world_authority"]["full_sync_verified"]==false,"transport fixture never claims real-game full synchronization");
+    const Json controls={{"slot",2},{"phase","press"}};ha.acceptCast=true;
+    check(!g.submitNativeIntent(guest,actor,target,"cast",2,1,{{"slot",2},{"phase","press"},{"damage",500}}),
+        "guest input serialization rejects result fields before sending");
+    check(g.submitNativeIntent(guest,actor,target,"cast",2,1,controls)&&
+          wait([&]{tick();return ha.begins==2&&ha.lastInput==controls;}),"typed native controls cross the actual authenticated transport");
     g.setLocalSceneReady(false);g.update(guest);
     check(ga.saved&&ga.restoreStarted&&!g.submitNativeIntent(guest,actor,target,"mine",3,1),"loading closes intents and retains personal recovery until observed");
     bool detachRejected=false;try {g.attachNativeAdapter(nullptr);}catch(...) {detachRejected=true;}
