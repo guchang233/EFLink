@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <limits>
 #include <optional>
@@ -232,6 +233,30 @@ struct Witness {
     // they are not per-caster skill IDs or client-supplied hit identifiers.
     std::uint64_t serial=0,actorCookie=0,targetCookie=0,event=0;Json state;std::uint64_t nativeStamp=0;
 };
+// Issued only while Host dispatches an admitted ticket. Native entrypoints use
+// this one-shot permit; packets and diagnostics cannot construct it. Preparing
+// native arguments may re-enter the game, so consume revalidates live authority.
+class NativeDispatchPermit {
+    friend class Host;
+    const Ticket* ticket;
+    const void* issuer;
+    std::thread::id thread;
+    std::function<bool()> current;
+    mutable bool used=false;
+    NativeDispatchPermit(const Ticket& value,const void* adapter,std::function<bool()> check)
+        :ticket(&value),issuer(adapter),thread(std::this_thread::get_id()),current(std::move(check)) {}
+public:
+    NativeDispatchPermit(const NativeDispatchPermit&)=delete;
+    NativeDispatchPermit& operator=(const NativeDispatchPermit&)=delete;
+    bool issuedTo(const void* adapter) const {return issuer==adapter;}
+    bool allows(const Ticket& value,const std::string& path) const {
+        if(used||ticket!=&value||thread!=std::this_thread::get_id()||value.path!=path)return false;
+        try {return current();}catch(...) {return false;}
+    }
+    bool consume(const Ticket& value,const std::string& path) const {
+        if(!allows(value,path))return false;used=true;return true;
+    }
+};
 enum class NativeActorDomain { Unknown, HostPersonal, RoomProxy };
 struct NativeActorContext {std::uint16_t peer=0;NativeActorDomain domain=NativeActorDomain::Unknown;};
 class NativeAdapter {
@@ -247,7 +272,7 @@ public:
     virtual NativeActorContext actorContext(const Object&) const {return {};}
     virtual bool supports(const std::string&,const std::string&) const {return false;}
     virtual bool validate(const Intent&,const Object&,const Object&) const {return false;}
-    virtual bool begin(const Ticket&) {return false;}
+    virtual bool begin(const Ticket&,const NativeDispatchPermit&) {return false;}
     virtual std::optional<Witness> poll(const Ticket&) {return {};}
     virtual void cancel(const Ticket&) noexcept {}
     // Personal snapshot handles stay private to the native adapter. Room JSON
@@ -465,21 +490,39 @@ public:
             Intent intent=Intent::parse(body);
             if(sender!=intent.peer||!usable(intent)||pending.size()>=128||commandRetired(intent)||!adapter.executionVerified()||!adapter.isolationVerified()||
                 !adapter.recoveryVerified()||!adapter.dualClientVerified()||adapter.gameVersion()!=gameVersion_||adapter.path().empty()||adapter.path().size()>128) {++rejected;return {};}
-            auto& m=members.at(sender);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
+            const auto actor=*find(intent.actor),target=*find(intent.target);
             Strike strike{sender,intent.member,intent.actor.id,intent.actor.life,intent.action,intent.target.id,intent.target.life,intent.strike};
-            if(intent.request<=m.highRequest||strikes.contains(strike)||!nativeActorOwnedBy(adapter,sender,*actor)||
-               !adapter.supports(target->kind,intent.operation)||!adapter.validate(intent,*actor,*target)) {++rejected;return {};}
-            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor->cookie,target->cookie,target->version,intent,captureNativeStamp(),adapter.path()};
+            if(intent.request<=members.at(sender).highRequest||strikes.contains(strike)||!nativeActorOwnedBy(adapter,sender,actor)||
+               !adapter.supports(target.kind,intent.operation)||!adapter.validate(intent,actor,target)) {++rejected;return {};}
+            // Adapter validation may invoke native code and re-enter a scene or
+            // census callback. No borrowed map pointer/reference survives it.
+            if(!usable(intent)||!adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified()||
+               adapter.gameVersion()!=gameVersion_||!find(intent.actor)||!find(intent.target)||
+               find(intent.actor)->cookie!=actor.cookie||find(intent.target)->cookie!=target.cookie) {++rejected;return {};}
+            advance(nextTicket);Ticket ticket{scope_,nextTicket,actor.cookie,target.cookie,target.version,intent,captureNativeStamp(),adapter.path()};
+            auto& m=members.at(sender);
             m.highRequest=intent.request;rememberStrike(strike,intent.request);
             // Making room can retire this very old action. Consuming its new
             // request identity must never dispatch it across that boundary.
             if(commandRetired(intent)) {++rejected;return {};}
             if(now>UINT64_MAX-1500) {++rejected;return {};}
             pending.emplace(ticket.serial,Pending{ticket,&adapter,now+1500});
+            NativeDispatchPermit permit(ticket,&adapter,[this,&ticket,&adapter] {
+                if(!pending.contains(ticket.serial)||!usable(ticket.intent)||adapter.gameVersion()!=gameVersion_||adapter.path()!=ticket.path||
+                   !adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified())return false;
+                const auto* nativeActor=find(ticket.intent.actor);const auto* nativeTarget=find(ticket.intent.target);
+                if(!nativeActor||!nativeTarget||nativeActor->cookie!=ticket.actorCookie||nativeTarget->cookie!=ticket.targetCookie)return false;
+                const auto actor=*nativeActor,target=*nativeTarget;
+                if(!nativeActorOwnedBy(adapter,ticket.intent.peer,actor)||!adapter.validate(ticket.intent,actor,target))return false;
+                nativeActor=find(ticket.intent.actor);nativeTarget=find(ticket.intent.target);
+                return pending.contains(ticket.serial)&&usable(ticket.intent)&&adapter.gameVersion()==gameVersion_&&adapter.path()==ticket.path&&
+                    adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified()&&adapter.dualClientVerified()&&nativeActor&&nativeTarget&&
+                    nativeActor->cookie==ticket.actorCookie&&nativeTarget->cookie==ticket.targetCookie;
+            });
             // Consume request identity even when native dispatch fails: an
             // ambiguous failure must not be retried as a second native action.
-            bool began=false;try {began=adapter.begin(ticket);}catch(...) {}
-            if(!began) {adapter.cancel(ticket);pending.erase(ticket.serial);++rejected;return {};}
+            bool began=false;try {began=adapter.begin(ticket,permit);}catch(...) {}
+            if(!began||!permit.used) {adapter.cancel(ticket);pending.erase(ticket.serial);++rejected;return {};}
             ++accepted;return ticket.serial;
         }catch(...) {++rejected;return {};}
     }

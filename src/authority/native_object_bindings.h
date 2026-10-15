@@ -128,6 +128,13 @@ public:
         if(committing||!current||current->cookie!=expectedCookie||current->allocation!=binding.allocation)return false;
         return use(binding);
     }
+    template<class Probe,class Use> bool withResolved(NativeDomain expectedDomain,const std::string& kind,std::uint64_t expectedCookie,
+                                                    Probe probe,Use use) const {
+        if(committing||!pins||owner!=std::this_thread::get_id()||!expectedCookie)return false;
+        for(const auto& [key,entry]:entries)if(entry.value.kind==kind&&entry.value.cookie==expectedCookie&&entry.value.domain==expectedDomain)
+            return withResolved(expectedDomain,kind,key.second,expectedCookie,std::move(probe),std::move(use));
+        return false;
+    }
     std::size_t size() const {return entries.size();}
 };
 }

@@ -19,9 +19,19 @@ FIXTURE_EXPORT const void* il2cpp_class_get_methods(const void* klass,void** ite
     if(*iterator)return nullptr;*iterator=reinterpret_cast<void*>(1);return static_cast<const AbiFixtureClass*>(klass)->method;
 }
 FIXTURE_EXPORT const char* il2cpp_method_get_name(const void* method) {return static_cast<const AbiFixtureMethod*>(method)->name;}
-FIXTURE_EXPORT const void* il2cpp_method_get_return_type(const void* method) {return static_cast<const AbiFixtureMethod*>(method)->returns;}
+FIXTURE_EXPORT const void* il2cpp_method_get_return_type(const void* method) {return &static_cast<const AbiFixtureMethod*>(method)->returns;}
+FIXTURE_EXPORT const void* il2cpp_method_get_param(const void* method,unsigned index) {
+    const auto* value=static_cast<const AbiFixtureMethod*>(method);return index<value->count&&index<3?value->parameters[index]:nullptr;
+}
+FIXTURE_EXPORT const void* il2cpp_class_from_type(const void* type) {return type?static_cast<const AbiFixtureType*>(type)->klass:nullptr;}
+FIXTURE_EXPORT const void* il2cpp_class_get_field_from_name(const void* klass,const char* name) {
+    const auto* field=static_cast<const AbiFixtureClass*>(klass)->field;return field&&!std::strcmp(field->name,name)?field:nullptr;
+}
+FIXTURE_EXPORT int il2cpp_field_get_flags(const void* field) {return static_cast<const AbiFixtureField*>(field)->flags;}
+FIXTURE_EXPORT const void* il2cpp_field_get_type(const void* field) {return &static_cast<const AbiFixtureField*>(field)->type;}
+FIXTURE_EXPORT void il2cpp_field_static_get_value(const void* field,void* output) {std::memcpy(output,&static_cast<const AbiFixtureField*>(field)->value,sizeof(int));}
 FIXTURE_EXPORT char* il2cpp_type_get_name(const void* type) {
-    const auto* name=static_cast<const char*>(type);const auto bytes=std::strlen(name)+1;
+    if(!type)return nullptr;const auto* name=static_cast<const AbiFixtureType*>(type)->name;const auto bytes=std::strlen(name)+1;
     auto* copy=static_cast<char*>(std::malloc(bytes));if(copy)std::memcpy(copy,name,bytes);return copy;
 }
 FIXTURE_EXPORT void il2cpp_free(void* value) {std::free(value);}

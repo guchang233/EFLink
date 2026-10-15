@@ -256,6 +256,8 @@ public:
         shutdownBarrierAvailable=value;
         if(!value)nativeAuthority.suspend();
     }
+    bool hasShutdownBarrier() const {return shutdownBarrierAvailable;}
+    worldauthority::Scope nativeHostScope() const {return nativeAuthority.scope();}
     // Called on the game thread before the host removes callbacks and hooks.
     // A pending or failed native restore keeps the module active and the gate
     // closed; only observed restoration permits teardown.

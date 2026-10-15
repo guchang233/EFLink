@@ -30,7 +30,9 @@ struct Fixture:NativeAdapter {
     }
     bool supports(const std::string& kind,const std::string& op) const override {return kind=="mineral"&&op=="mine";}
     bool validate(const Intent&,const Object&,const Object&) const override {return true;}
-    bool begin(const Ticket&) override {++starts;return began;}
+    bool begin(const Ticket& ticket,const NativeDispatchPermit& permit) override {
+        if(!permit.consume(ticket,path()))return false;++starts;return began;
+    }
     std::optional<Witness> poll(const Ticket&) override {auto out=result;result.reset();return out;}
     void cancel(const Ticket&) noexcept override {++cancels;}
     std::optional<std::uint64_t> capturePersonal() override {if(!allowCapture)return {};retained=true;return 99;}
@@ -53,7 +55,7 @@ struct PerTicketFixture:Fixture {
 struct InputFixture:Fixture {
     Json received;
     bool supports(const std::string&,const std::string&) const override {return true;}
-    bool begin(const Ticket& ticket) override {received=ticket.intent.input;return Fixture::begin(ticket);}
+    bool begin(const Ticket& ticket,const NativeDispatchPermit& permit) override {received=ticket.intent.input;return Fixture::begin(ticket,permit);}
 };
 int main() {
     {

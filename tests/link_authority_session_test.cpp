@@ -22,7 +22,8 @@ struct Fixture final:NativeAdapter {
     }
     bool supports(const std::string& kind,const std::string& op) const override{return kind=="mineral"&&(op=="mine"||(acceptCast&&op=="cast"));}
     bool validate(const Intent&,const Object& actor,const Object& target) const override{return actor.kind=="player"&&target.kind=="mineral";}
-    bool begin(const Ticket& ticket) override {
+    bool begin(const Ticket& ticket,const NativeDispatchPermit& permit) override {
+        if(!permit.consume(ticket,path()))return false;
         ++begins;
         lastInput=ticket.intent.input;
         result=Witness{ticket.serial,ticket.actorCookie,ticket.targetCookie,++event,

@@ -9,6 +9,7 @@
 #include "authority/native_battle_state.h"
 #include "authority/native_construction_state.h"
 #include "authority/native_object_bindings.h"
+#include "authority/native_mine_entry.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_metadata.h"
@@ -70,6 +71,28 @@ class World {
     // Shared guest instances will be registered here only after native room
     // construction. Personal census bindings can never resolve as room objects.
     worldauthority::NativeObjectBindings guestRoomBindings{worldauthority::NativeDomain::GuestRoom,&nativePins};
+    std::string nativeVersion;
+    worldauthority::NativeMineEntry nativeMine;
+    // Compiled candidate adapter. No config/RPC can change its inherited false
+    // execution, isolation, recovery or dual-client certificates.
+    class GameAdapter final:public worldauthority::NativeAdapter {
+        World* world;
+    public:
+        explicit GameAdapter(World* value):world(value) {}
+        std::string gameVersion() const override {return world->nativeVersion;}
+        std::string path() const override {return worldauthority::NativeMineEntry::path;}
+        bool supports(const std::string& kind,const std::string& operation) const override {
+            return executionVerified()&&kind=="mineral"&&operation=="mine";
+        }
+        worldauthority::NativeActorContext actorContext(const worldauthority::Object& actor) const override {return world->nativeActorContext(actor);}
+        bool validate(const worldauthority::Intent& intent,const worldauthority::Object& actor,const worldauthority::Object& target) const override {
+            return world->validateNativeMine(intent,actor,target);
+        }
+        bool begin(const worldauthority::Ticket& ticket,const worldauthority::NativeDispatchPermit& permit) override {
+            return world->dispatchNativeMine(*this,ticket,permit);
+        }
+    } nativeAdapter{this};
+    bool nativeAdapterAttached=false;
     HostMapConsent hostMapConsent;
     std::string hostMapChoiceMap,hostMapChoiceLevel;
     std::string replicationError;
@@ -192,6 +215,74 @@ class World {
     }
     bool currentEntity(void* entity,const NativeIdentity& identity) {
         return usable(entity)&&identity.matches(identityOf(entity));
+    }
+    worldauthority::NativeAllocation probeNativeActor(const worldauthority::NativeAllocation& expected) {
+        auto* entity=reinterpret_cast<void*>(expected.address);
+        if(!usable(entity)||api.value<int>(gm("Entity","get_objectType","","Beyond.Gameplay.Core.ObjectType"),entity)!=enumValue<int>("ObjectType","Character"))return {};
+        const auto identity=identityOf(entity);
+        return {expected.address,identity.instance,0,identity.generation,identity.server,0};
+    }
+    struct NativeMineralSource {const char* type;const char* space;void* entity;void* component;};
+    NativeMineralSource mineralSource(void* object) {
+        const auto klass=classOf(object);
+        if(klass=="Beyond.Gameplay.Core.InteractiveDoodadCommonComponent")
+            return {"InteractiveDoodadCommonComponent","Beyond.Gameplay.Core",api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),object),object};
+        if(klass=="Beyond.Gameplay.InteractiveLogicDoodadCommon") {
+            auto* component=readField<void*>(object,"InteractiveLogicBase","<controller>k__BackingField","Beyond.Gameplay");
+            return {"InteractiveLogicDoodadCommon","Beyond.Gameplay",component?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),component):nullptr,component};
+        }
+        throw std::runtime_error("native mineral source class is unverified");
+    }
+    worldauthority::NativeAllocation probeNativeMineral(const worldauthority::NativeAllocation& expected) {
+        auto* object=reinterpret_cast<void*>(expected.address);const auto source=mineralSource(object);
+        if(!source.component||!usable(source.entity)||api.value<int>(gm(source.type,"get_natureResourceType","","Beyond.Gameplay.ENatureType",source.space),object)!=enumValue<int>("ENatureType","Mine","Beyond.Gameplay"))return {};
+        const auto identity=identityOf(source.entity);
+        const auto component=readField<std::uint32_t>(source.component,"BaseComponent","<instanceUid>k__BackingField");
+        const auto id=api.value<std::uint64_t>(gm(source.type,"get_natureResourceId","","System.UInt64",source.space),object);
+        return {expected.address,identity.instance,component,identity.generation,identity.server,id};
+    }
+    worldauthority::NativeActorContext nativeActorContext(const worldauthority::Object& actor) {
+        worldauthority::NativeActorContext result;
+        if(actor.kind!="player")return result;
+        nativeObjectBindings.withResolved(worldauthority::NativeDomain::HostWorld,"player",actor.key,actor.cookie,
+            [this](const auto& allocation){return probeNativeActor(allocation);},[&](const auto& binding) {
+                for(const auto& [slot,entity]:nativeRealSquadMembers())if(reinterpret_cast<std::uintptr_t>(entity)==binding.allocation.address) {
+                    result={proto::kHostId,worldauthority::NativeActorDomain::HostPersonal};return true;
+                }
+                // Real room-proxy ownership will come from its private native
+                // factory; a guest never inherits one of these official actors.
+                return false;
+            });
+        return result;
+    }
+    bool validateNativeMine(const worldauthority::Intent& intent,const worldauthority::Object& actor,const worldauthority::Object& target) {
+        if(!session||nativeVersion!=worldauthority::NativeMineEntry::game||intent.scope!=session->nativeHostScope()||
+           !nativeSceneInitialized||actor.kind!="player"||target.kind!="mineral"||intent.operation!="mine"||!intent.input.empty())return false;
+        auto* level=staticObject("levelLoader");auto* info=staticObject("worldInfo");
+        if(!level||!info||api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),level)||
+           !api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info)||text(api.call(mapIdText,info))!=mapId||text(api.call(levelIdText,info))!=levelId)return false;
+        return nativeObjectBindings.withResolved(worldauthority::NativeDomain::HostWorld,"player",actor.key,actor.cookie,
+            [this](const auto& allocation){return probeNativeActor(allocation);},[&](const auto& player) {
+                if(!api.value<bool>(entityAlive,reinterpret_cast<void*>(player.allocation.address)))return false;
+                return nativeObjectBindings.withResolved(worldauthority::NativeDomain::HostWorld,"mineral",target.key,target.cookie,
+                    [this](const auto& allocation){return probeNativeMineral(allocation);},[&](const auto& mineral) {
+                        auto* object=reinterpret_cast<void*>(mineral.allocation.address);const auto source=mineralSource(object);
+                        auto mining=enumValue<int>("ENatureOperation","Mining","Beyond.Gameplay");
+                        return !readField<bool>(object,source.type,"m_isCollected",source.space)&&
+                            api.value<bool>(gm(source.type,"CheckCanDoOperation","Beyond.Gameplay.ENatureOperation","System.Boolean",source.space),object,{&mining});
+                    });
+            });
+    }
+    bool dispatchNativeMine(const worldauthority::NativeAdapter& adapter,const worldauthority::Ticket& ticket,const worldauthority::NativeDispatchPermit& permit) {
+        if(!session||ticket.scope!=session->nativeHostScope()||!permit.issuedTo(&adapter)||!permit.allows(ticket,adapter.path()))return false;
+        nativeMine.bind(runtime,nativeVersion);
+        return nativeObjectBindings.withResolved(worldauthority::NativeDomain::HostWorld,"player",ticket.actorCookie,
+            [this](const auto& allocation){return probeNativeActor(allocation);},[&](const auto& actor) {
+                return nativeObjectBindings.withResolved(worldauthority::NativeDomain::HostWorld,"mineral",ticket.targetCookie,
+                    [this](const auto& allocation){return probeNativeMineral(allocation);},[&](const auto& target) {
+                        return nativeMine.invoke(adapter,ticket,permit,actor,target,staticObject("natureResourceManager"));
+                    });
+            });
     }
     std::string entityKey(void* entity) {
         auto* data=api.call(gm("Entity","get_inLevelData","","Beyond.Gameplay.LevelEntityData"),entity);
@@ -828,7 +919,9 @@ public:
         try {
             if(!nativePins.sweep())throw std::runtime_error("native roots could not be released on the game thread");
             resolve();
-            link.setAdapterVersion(text(api.call(m("Application","get_version","","System.String"))));
+            nativeVersion=text(api.call(m("Application","get_version","","System.String")));link.setAdapterVersion(nativeVersion);
+            session=&link;
+            if(link.hasShutdownBarrier()) {link.attachNativeAdapter(&nativeAdapter);nativeAdapterAttached=true;}
             const auto now=nowMs();
             // Bones are only read while in a room; offline the module costs nothing per frame.
             if((net.currentRole()!=Role::Offline)&&now-lastSample>=33) {lastSample=now;sample(net);}
@@ -886,6 +979,9 @@ public:
             {"authority_architecture",{{"phase","native_adapters_in_progress"},{"shared_world_supported",false},
                 {"full_sync_verified",false},{"guest_result_submission",false},{"guest_ai_authority",false},
                 {"native_gameplay_replay",false},{"account_risk",true},{"official_safety_guaranteed",false},{"native_paths_verified",false}}},
+            {"native_candidate",{{"adapter_attached",nativeAdapterAttached},{"path",nativeAdapter.path()},{"mine_entry_implemented",true},
+                {"contracts_resolved",nativeMine.contractsResolved()},{"native_dispatch_calls",nativeMine.calls()},{"native_dispatch_accepted",nativeMine.acceptedCalls()},
+                {"execution_verified",false},{"native_witness_bridge",false},{"isolation_verified",false},{"recovery_verified",false},{"full_sync_verified",false}}},
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage","metadata_only"},{"lookup_ready",false},{"effects_replayed",false}}},

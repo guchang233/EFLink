@@ -110,6 +110,40 @@ public:
         if(!match)throw std::runtime_error("native virtual getter declaration unavailable");
         BE_ResolvedMethodV1 result{};result.method_info=match;methods.emplace(key,result);return result;
     }
+    // Construct a boxed native value containing a managed reference through its
+    // real closed constructor (ObjectPtr<Entity> in the mining adapter). Never
+    // guess a generic struct's obj/cachedUid offsets or write its references.
+    void constructReferenceValue(void* boxed,void* reference,const char* expectedReference) {
+        const auto dll=GetModuleHandleW(L"GameAssembly.dll");
+        auto objectClass=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(dll,"il2cpp_object_get_class"));
+        auto each=reinterpret_cast<const void*(*)(const void*,void**)>(GetProcAddress(dll,"il2cpp_class_get_methods"));
+        auto name=reinterpret_cast<const char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_name"));
+        auto count=reinterpret_cast<unsigned(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_param_count"));
+        auto flags=reinterpret_cast<unsigned(*)(const void*,unsigned*)>(GetProcAddress(dll,"il2cpp_method_get_flags"));
+        auto parameter=reinterpret_cast<const void*(*)(const void*,unsigned)>(GetProcAddress(dll,"il2cpp_method_get_param"));
+        auto resultType=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_return_type"));
+        auto klassFrom=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_from_type"));
+        auto assignable=reinterpret_cast<bool(*)(const void*,const void*)>(GetProcAddress(dll,"il2cpp_class_is_assignable_from"));
+        auto typeName=reinterpret_cast<char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_type_get_name"));
+        auto release=reinterpret_cast<void(*)(void*)>(GetProcAddress(dll,"il2cpp_free"));
+        if(!boxed||!reference||!expectedReference||!objectClass||!each||!name||!count||!flags||!parameter||!resultType||!klassFrom||!assignable||!typeName||!release)
+            throw std::runtime_error("native reference-value constructor metadata unavailable");
+        const auto* klassValue=objectClass(boxed);authority::requireNativeValueShape(valueShape(klassValue));
+        const void* match=nullptr;void* iterator=nullptr;
+        while(const auto* candidate=each(klassValue,&iterator)) {
+            unsigned implementation=0;const auto* label=name(candidate);
+            if(!label||std::strcmp(label,".ctor")||count(candidate)!=1||(flags(candidate,&implementation)&0x410))continue;
+            const auto* type=parameter(candidate,0);auto* text=type?typeName(type):nullptr;
+            const bool same=text&&std::strcmp(text,expectedReference)==0;if(text)release(text);if(!same)continue;
+            auto* result=typeName(resultType(candidate));const bool returnsVoid=result&&std::strcmp(result,"System.Void")==0;
+            if(result)release(result);if(!returnsVoid)continue;
+            const auto* expected=klassFrom(type);
+            if(!expected||valueShape(expected).isValue||!assignable(expected,objectClass(reference)))continue;
+            if(match)throw std::runtime_error("ambiguous native reference-value constructor");match=candidate;
+        }
+        auto* raw=api->object_unbox(api->context,boxed);if(!match||!raw)throw std::runtime_error("native reference-value constructor unavailable");
+        BE_ResolvedMethodV1 methodValue{};methodValue.method_info=match;call(methodValue,raw,{reference});
+    }
     void* call(BE_ResolvedMethodV1 method,void* object=nullptr,std::initializer_list<void*> args={}) {
         void* exception=nullptr;
         std::vector<void*> parameters(args);
