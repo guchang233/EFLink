@@ -91,7 +91,8 @@
         for(const auto& [key,entity]:entities) {
             facts.push_back(readNativeBattle(entity,kind,key,kind=="player"?partySlots.at(entity):-1));
             const auto identity=identityOf(entity);
-            bindings.push_back({key,{reinterpret_cast<std::uintptr_t>(entity),identity.instance,0,identity.generation,identity.server,0}});
+            worldauthority::NativeAllocation allocation{reinterpret_cast<std::uintptr_t>(entity),identity.instance,0,identity.generation,identity.server,0};
+            bindings.push_back({key,allocation,staged.retain(kind,key,allocation)});
         }
         staged.reconcile(kind,bindings);
         for(auto& fact:facts) {

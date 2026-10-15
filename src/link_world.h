@@ -64,11 +64,12 @@ class World {
     float nativeTimeScale=1,nativeDeltaTime=0;
 
     Session* session=nullptr;
-    worldauthority::NativeObjectBindings nativeObjectBindings{worldauthority::NativeDomain::HostWorld};
-    worldauthority::NativeObjectBindings personalObjectBindings{worldauthority::NativeDomain::Personal};
+    worldauthority::NativeObjectPins nativePins;
+    worldauthority::NativeObjectBindings nativeObjectBindings{worldauthority::NativeDomain::HostWorld,&nativePins};
+    worldauthority::NativeObjectBindings personalObjectBindings{worldauthority::NativeDomain::Personal,&nativePins};
     // Shared guest instances will be registered here only after native room
     // construction. Personal census bindings can never resolve as room objects.
-    worldauthority::NativeObjectBindings guestRoomBindings{worldauthority::NativeDomain::GuestRoom};
+    worldauthority::NativeObjectBindings guestRoomBindings{worldauthority::NativeDomain::GuestRoom,&nativePins};
     HostMapConsent hostMapConsent;
     std::string hostMapChoiceMap,hostMapChoiceLevel;
     std::string replicationError;
@@ -142,6 +143,16 @@ class World {
     }
     std::uint32_t rootOf(void* object) {return runtime->gchandle_new(runtime->context,object,0);}
     void release(std::uint32_t& handle) {if(handle) runtime->gchandle_free(runtime->context,handle);handle=0;}
+    void bindNativePins() {
+        if(!runtime||!runtime->gchandle_new||!runtime->gchandle_free||!assembly)throw std::runtime_error("native retention runtime unavailable");
+        const auto* host=runtime;const auto image=assembly;
+        nativePins.bind(host,[host](std::uintptr_t object) {return host->gchandle_new(host->context,reinterpret_cast<void*>(object),0);},
+            [host,image](std::uint64_t handle) {
+                if(GetModuleHandleW(L"GameAssembly.dll")!=image)throw std::runtime_error("native retention runtime changed before release");
+                host->gchandle_free(host->context,std::uint32_t(handle));
+            });
+        if(!nativePins.sweep())throw std::runtime_error("native roots await a successful game-thread release");
+    }
 
     BE_ResolvedMethodV1 gm(const char* type,const char* name,const char* params="",const char* returns="System.Void",const char* space="Beyond.Gameplay.Core") {
         return m(type,name,params,returns,"Gameplay.Beyond.dll",space);
@@ -642,12 +653,13 @@ public:
         nlohmann::json resources=nlohmann::json::array();
         nlohmann::json properties;
         try {
-            auto staged=personalObjectBindings.preview();NativeResourceSample sample(*this);
+            auto staged=personalObjectBindings.preview();NativeFrameSample sample;
             sampleResources(staged,sample);
             resources.swap(sample.census);nativeResources.swap(sample.resources);properties=resourceProperties();
         }
         catch(...) {clearResources();throw;}
         auto types=resourceNativeTypes;auto unknown=resourceUnknown;clearResources();
+        if(!nativePins.sweep()||!nativePins.safeToUnload())throw std::runtime_error("native inspection roots could not be released");
         return {{"map",mapId},{"level",levelId},{"resources",resources},{"properties",properties},{"native_types",types},{"unadapted",unknown},{"gameplay_modified",false}};
     }
     const nlohmann::json& markerSnapshot() const {return markers;}
@@ -814,6 +826,7 @@ public:
         runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");
         const auto frameStart=std::chrono::steady_clock::now();
         try {
+            if(!nativePins.sweep())throw std::runtime_error("native roots could not be released on the game thread");
             resolve();
             link.setAdapterVersion(text(api.call(m("Application","get_version","","System.String"))));
             const auto now=nowMs();
@@ -854,7 +867,9 @@ public:
     void clear() {
         clearResources();
         clearNativeCensus();
+        nativeObjectBindings.clear();
         personalObjectBindings.clear();guestRoomBindings.clear();
+        if(!nativePins.sweep()||!nativePins.safeToUnload())throw std::runtime_error("native bindings remain retained; module shutdown must wait");
     }
     void shutdown() {
         clearResources();
@@ -880,6 +895,8 @@ public:
                 {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},
                 {"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},
             {"world_replication",{{"native_bindings",nativeObjectBindings.size()+personalObjectBindings.size()},
+                {"managed_roots",{{"retained",nativePins.live()},{"release_failures",nativePins.failures()},
+                    {"release_uncertain",nativePins.releaseUncertain()},{"safe_to_unload",nativePins.safeToUnload()}}},
                 {"host_world_bindings",nativeObjectBindings.size()},
                 {"personal_bindings",personalObjectBindings.size()},
                 {"guest_room_bindings",guestRoomBindings.size()},

@@ -4,31 +4,29 @@
     nlohmann::json nativeResourceCensus=nlohmann::json::array();
     std::map<std::string,std::size_t> resourceNativeTypes;
     std::string resourceError;std::uint64_t resourceScans=0,resourceUnknown=0,lastResourceSuccess=0;
-    struct NativeResource {void* object=nullptr;std::uint32_t root=0,component=0;std::uint64_t incarnation=0,natureId=0;
+    struct NativeResource {void* object=nullptr;std::uint32_t component=0;std::uint64_t incarnation=0,natureId=0;
         NativeIdentity identity;std::string type,space,key;};
     std::map<std::string,NativeResource> nativeResources;
-    struct NativeResourceSample {
-        World& world;std::map<std::string,NativeResource> resources;
+    struct NativeFrameSample {
+        std::map<std::string,NativeResource> resources;
         std::vector<worldauthority::Observation> facts;
         nlohmann::json census=nlohmann::json::array();
-        explicit NativeResourceSample(World& value):world(value) {}
-        ~NativeResourceSample() {for(auto& [key,value]:resources)world.release(value.root);}
-        NativeResourceSample(const NativeResourceSample&)=delete;
-        NativeResourceSample& operator=(const NativeResourceSample&)=delete;
+        NativeFrameSample()=default;
+        NativeFrameSample(const NativeFrameSample&)=delete;
+        NativeFrameSample& operator=(const NativeFrameSample&)=delete;
     };
     void clearResources() {
         nativeObjectBindings.retireKind("mineral");personalObjectBindings.retireKind("mineral");
-        for(auto& [key,resource]:nativeResources)release(resource.root);
         nativeResources.clear();nativeResourceCensus=nlohmann::json::array();
         resourceRoom=0;resourceEpoch=lastResourceScan=lastResourceSuccess=0;
         clearNativeCensus();
     }
-    void sampleResources(worldauthority::NativeObjectBindings& staged,NativeResourceSample& output) {
+    void sampleResources(worldauthority::NativeObjectBindings& staged,NativeFrameSample& output) {
+        bindNativePins();
         std::vector<worldauthority::Observation> result;
         std::vector<worldauthority::NativeBindingInput> bindings;
         std::map<std::string,NativeResource> sampled;
-        auto cleanup=[&] {for(auto& [key,value]:sampled)release(value.root);};
-        try {
+        {
             auto* manager=staticObject("natureResourceManager");
             if(!manager)throw std::runtime_error("native nature resource manager unavailable");
             auto* dictionary=readField<void*>(manager,"NatureResourceManager","m_resources","Beyond.Gameplay");
@@ -43,6 +41,7 @@
                 std::memcpy(&more,runtime->object_unbox(runtime->context,box),sizeof more);
                 if(!more){complete=true;break;}
                 auto* object=genericValueCall(enumerator,"get_Current");if(!object)continue;
+                eflink::unity::Api::TemporaryRoot sampleRoot(runtime,object);
                 const auto full=classOf(object);++resourceNativeTypes[full];std::string type,space,key,resourceTemplate;std::uint64_t incarnation=0,natureId=0;
                 if(full=="Beyond.Gameplay.InteractiveLogicDoodadCommon") {type="InteractiveLogicDoodadCommon";space="Beyond.Gameplay";}
                 else if(full=="Beyond.Gameplay.Core.InteractiveDoodadCommonComponent") {type="InteractiveDoodadCommonComponent";space="Beyond.Gameplay.Core";}
@@ -81,11 +80,10 @@
                 worldauthority::applyNativeConstruction(observation,nativeConstruction(entity));
                 if(!currentEntity(entity,identity))throw std::runtime_error("native mineral allocation changed during census");
                 if(sampled.contains(key))throw std::runtime_error("multiple native minerals share an identity");
-                auto root=rootOf(object);if(!root)throw std::runtime_error("native mineral rooting failed");
-                try {sampled.emplace(key,NativeResource{object,root,component,incarnation,natureId,identity,type,space,key});}
-                catch(...) {release(root);throw;}
-                bindings.push_back({key,{reinterpret_cast<std::uintptr_t>(object),identity.instance,component,
-                    identity.generation,identity.server,natureId}});
+                sampled.emplace(key,NativeResource{object,component,incarnation,natureId,identity,type,space,key});
+                worldauthority::NativeAllocation allocation{reinterpret_cast<std::uintptr_t>(object),identity.instance,component,
+                    identity.generation,identity.server,natureId};
+                bindings.push_back({key,allocation,staged.retain("mineral",key,allocation)});
                 result.push_back(std::move(observation));
                 if(result.size()>512)throw std::runtime_error("native mineral baseline exceeds capacity");
             }
@@ -99,7 +97,7 @@
                 output.census.push_back(std::move(state));
             }
             output.resources.swap(sampled);output.facts.swap(result);
-        }catch(...) {cleanup();throw;}
+        }
     }
     void updateResources(Net& net,Session& link) {
         const auto snapshot=net.snapshot();
@@ -113,7 +111,7 @@
             clearResources();guestRoomBindings.clear();resourceRoom=snapshot.roomId;resourceEpoch=link.generation();
         }
         if(nowMs()-lastResourceScan<100)return;lastResourceScan=nowMs();
-        NativeResourceSample sample(*this);
+        NativeFrameSample sample;
         try {
             auto& bindings=snapshot.role==Role::Host?nativeObjectBindings:personalObjectBindings;
             auto staged=bindings.preview();
