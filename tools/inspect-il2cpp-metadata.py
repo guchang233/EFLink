@@ -259,6 +259,7 @@ class Metadata:
                 params = self.parameters[method[3]:method[3] + method[9]] if method[9] else []
                 rows.append({"index": index, "token": method[5], "name": method_name,
                              "return": type_name(method[2]), "static": bool(method[6] & 0x10),
+                             "virtual": bool(method[6] & 0x40), "abstract": bool(method[6] & 0x400),
                              "parameters": [{"name": self.string(p[0]), "type": type_name(p[2]),
                                              "type_index": p[2]} for p in params]})
             fields = [{"name": self.string(f[0]), "type": type_name(f[1]), "type_index": f[1]}

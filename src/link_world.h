@@ -7,6 +7,7 @@
 #include "authority/native_build_policy.h"
 #include "authority/native_resource_state.h"
 #include "authority/native_battle_state.h"
+#include "authority/native_construction_state.h"
 #include "authority/native_object_bindings.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
@@ -165,6 +166,18 @@ class World {
         return {api.value<std::uint32_t>(gm("Entity","get_instanceUid","","System.UInt32"),entity),
             api.value<std::uint32_t>(gm("Entity","get_serverGeneration","","System.UInt32"),entity),
             api.value<std::uint64_t>(gm("Entity","get_serverId","","System.UInt64"),entity),true};
+    }
+    worldauthority::NativeConstructionReading nativeConstruction(void* entity) {
+        auto* nativeTemplate=api.call(gm("Entity","get_templateData","","Beyond.Gameplay.EntityTemplateData"),entity);
+        if(!nativeTemplate)throw std::runtime_error("native entity construction template unavailable");
+        eflink::unity::Api::TemporaryRoot templateRoot(runtime,nativeTemplate);
+        const auto allocatedType=api.value<int>(gm("Entity","get_objectType","","Beyond.Gameplay.Core.ObjectType"),entity);
+        const auto templateType=api.virtualValue<int>(api.virtualGetter("BaseTemplateData","get_objectType","Beyond.Gameplay.Core.ObjectType"),nativeTemplate);
+        if(allocatedType!=templateType)throw std::runtime_error("native allocation and construction template types differ");
+        auto archetype=text(readField<void*>(nativeTemplate,"BaseTemplateData","name","Beyond.Gameplay"));
+        const auto rotation=api.value<Q>(gm("Entity","get_rotation","","UnityEngine.Quaternion"),entity);
+        const auto scale=api.value<V3>(gm("Entity","get_scale","","UnityEngine.Vector3"),entity);
+        return {std::move(archetype),{rotation.x,rotation.y,rotation.z,rotation.w},{scale.x,scale.y,scale.z}};
     }
     bool currentEntity(void* entity,const NativeIdentity& identity) {
         return usable(entity)&&identity.matches(identityOf(entity));

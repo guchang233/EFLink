@@ -59,10 +59,10 @@
             api.value<float>(gm("AbilitySystem","get_poise","","System.Single"),ability),
             api.value<float>(gm("AbilitySystem","get_maxPoise","","System.Single"),ability),
             api.value<bool>(entityAlive,entity)});
-        const auto rotation=api.value<Q>(gm("Entity","get_rotation","","UnityEngine.Quaternion"),entity);
-        observation.state["rotation"]={rotation.x,rotation.y,rotation.z,rotation.w};
+        worldauthority::applyNativeConstruction(observation,nativeConstruction(entity));
         observation.state.update(appearance);
-        if(!worldauthority::validStateForKind(kind,observation.state))throw std::runtime_error("native appearance state is unadapted; previous frame retained");
+        if(!currentEntity(entity,identity)||!worldauthority::validStateForKind(kind,observation.state))
+            throw std::runtime_error("native appearance or allocation changed; previous frame retained");
         return observation;
     }
     std::vector<worldauthority::Observation> sampleNativeBattle(const std::string& kind,worldauthority::NativeObjectBindings& staged) {

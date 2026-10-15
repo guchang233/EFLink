@@ -43,6 +43,25 @@ public:
         if(shape.isValue)shape.bytes=size(klass,&shape.alignment);
         return shape;
     }
+    BE_ResolvedMethodV1 virtualMethod(BE_ResolvedMethodV1 declaration,void* object) {
+        const auto dll=GetModuleHandleW(L"GameAssembly.dll");
+        auto lookup=reinterpret_cast<const void*(*)(void*,const void*)>(GetProcAddress(dll,"il2cpp_object_get_virtual_method"));
+        auto owner=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_class"));
+        auto objectClass=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(dll,"il2cpp_object_get_class"));
+        auto assignable=reinterpret_cast<bool(*)(const void*,const void*)>(GetProcAddress(dll,"il2cpp_class_is_assignable_from"));
+        auto flags=reinterpret_cast<unsigned(*)(const void*,unsigned*)>(GetProcAddress(dll,"il2cpp_method_get_flags"));
+        auto count=reinterpret_cast<unsigned(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_param_count"));
+        if(!declaration.method_info||!object||!lookup||!owner||!objectClass||!assignable||!flags||!count)
+            throw std::runtime_error("native virtual metadata unavailable");
+        unsigned implementationFlags=0;
+        auto* receiverClass=objectClass(object);auto* declaredClass=owner(declaration.method_info);
+        if(!receiverClass||!declaredClass||(flags(declaration.method_info,&implementationFlags)&0x10)||!assignable(declaredClass,receiverClass))
+            throw std::runtime_error("native virtual receiver differs");
+        const auto* target=lookup(object,declaration.method_info);
+        if(!target||(flags(target,&implementationFlags)&0x410)||!owner(target)||!assignable(owner(target),receiverClass)||
+           count(target)!=count(declaration.method_info))throw std::runtime_error("native virtual implementation unavailable");
+        BE_ResolvedMethodV1 result{};result.method_info=target;return result;
+    }
     BE_ResolvedClassV1 klass(const char* type,const char* assembly="UnityEngine.CoreModule.dll",const char* space="UnityEngine") {
         std::string key=std::string(assembly)+space+type;
         if(auto found=classes.find(key);found!=classes.end()) return found->second;
@@ -61,6 +80,35 @@ public:
         if(api->resolve_method(api->context,&descriptor,&result)!=BE_Result_Ok||!result.method_info)
             throw std::runtime_error("method unavailable: "+key);
         methods.emplace(key,result);return result;
+    }
+    // Host resolve_method intentionally requires a callable entry and therefore
+    // rejects abstract declarations. Resolve a zero-argument virtual getter as
+    // metadata only, then virtualMethod selects its real receiver implementation.
+    BE_ResolvedMethodV1 virtualGetter(const char* type,const char* name,const char* returns,
+        const char* assembly="Gameplay.Beyond.dll",const char* space="Beyond.Gameplay") {
+        const std::string key=std::string("virtual-getter|")+assembly+space+type+name+returns;
+        if(auto found=methods.find(key);found!=methods.end())return found->second;
+        auto dll=GetModuleHandleW(L"GameAssembly.dll");
+        auto each=reinterpret_cast<const void*(*)(const void*,void**)>(GetProcAddress(dll,"il2cpp_class_get_methods"));
+        auto methodName=reinterpret_cast<const char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_name"));
+        auto count=reinterpret_cast<unsigned(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_param_count"));
+        auto flags=reinterpret_cast<unsigned(*)(const void*,unsigned*)>(GetProcAddress(dll,"il2cpp_method_get_flags"));
+        auto resultType=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_return_type"));
+        auto typeName=reinterpret_cast<char*(*)(const void*)>(GetProcAddress(dll,"il2cpp_type_get_name"));
+        auto release=reinterpret_cast<void(*)(void*)>(GetProcAddress(dll,"il2cpp_free"));
+        if(!each||!methodName||!count||!flags||!resultType||!typeName||!release)
+            throw std::runtime_error("native virtual getter metadata unavailable");
+        auto klassValue=klass(type,assembly,space);void* iterator=nullptr;const void* match=nullptr;
+        while(const auto* candidate=each(klassValue.class_info,&iterator)) {
+            unsigned implementation=0;const auto attributes=flags(candidate,&implementation);
+            const auto* label=methodName(candidate);
+            if(!label||std::strcmp(label,name)||count(candidate)||(attributes&0x10)||!(attributes&0x40))continue;
+            auto* nativeReturn=typeName(resultType(candidate));const bool same=nativeReturn&&std::strcmp(nativeReturn,returns)==0;
+            if(nativeReturn)release(nativeReturn);if(!same)continue;
+            if(match)throw std::runtime_error("ambiguous native virtual getter");match=candidate;
+        }
+        if(!match)throw std::runtime_error("native virtual getter declaration unavailable");
+        BE_ResolvedMethodV1 result{};result.method_info=match;methods.emplace(key,result);return result;
     }
     void* call(BE_ResolvedMethodV1 method,void* object=nullptr,std::initializer_list<void*> args={}) {
         void* exception=nullptr;
@@ -99,6 +147,11 @@ public:
         authority::requireNativeValue<T>(valueShape(boxedClassOf(result)));
         auto* raw=api->object_unbox(api->context,result);
         if(!raw) throw std::runtime_error("missing boxed bridge result data");T output;std::memcpy(&output,raw,sizeof(T));return output;
+    }
+    template<class T> T virtualValue(BE_ResolvedMethodV1 declaration,void* object,std::initializer_list<void*> args={}) {
+        if(!object)throw std::runtime_error("native virtual instance unavailable");
+        TemporaryRoot instanceRoot(api,object);
+        return value<T>(virtualMethod(declaration,object),object,args);
     }
     void* keep(void* object) {
         if(!object) throw std::runtime_error("missing Unity object");

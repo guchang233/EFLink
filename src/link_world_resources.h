@@ -78,6 +78,8 @@
                 const bool collected=readField<bool>(object,type.c_str(),"m_isCollected",space.c_str());
                 auto observation=worldauthority::mineralObservation({key,resourceTemplate,{position.x,position.y,position.z},incarnation,hp,
                     readField<int>(object,type.c_str(),"m_hpRatioRuntime",space.c_str()),max,collected});
+                worldauthority::applyNativeConstruction(observation,nativeConstruction(entity));
+                if(!currentEntity(entity,identity))throw std::runtime_error("native mineral allocation changed during census");
                 if(sampled.contains(key))throw std::runtime_error("multiple native minerals share an identity");
                 auto root=rootOf(object);if(!root)throw std::runtime_error("native mineral rooting failed");
                 try {sampled.emplace(key,NativeResource{object,root,component,incarnation,natureId,identity,type,space,key});}

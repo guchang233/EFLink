@@ -4,6 +4,7 @@
 
 | 需求 | 已核对的路径 | 对实现的约束 |
 | --- | --- | --- |
+| 通用原生构建资料 | 实体持有 `EntityTemplateData`，其 `BaseTemplateData.name` 与资源组件的 doodad 配置属于不同层级；`get_objectType` 是抽象属性 | 通过真实模板对象做虚拟派发，核对实体和模板类型；不能把矿石玩法配置直接当作实体创建键，也不能直接调用没有原生入口的抽象声明 |
 | 房间角色资料 | `ClientCharInfo` 的实际资料构造函数可持有独立的武器/装备数据，使用原生 runtime client ID | 不调用满级/完美抽卡工厂。好友工厂会写入全局客户端容器，不能当成私有资料构造。仍须核对技能、属性和物品引用 |
 | 角色原生分配 | `_CreateCharacter` 使用 `EntityAllocator.AllocateObject`、`CharacterRootComponent.InitServerData`、`Entity.Init`、`ObjectContainer.Register` | `_CreateCharacter` 自身从全局 CharBag 查找，不能直接用于私有房间资料。底层路径须保持私有资料、ID、归属及逐对象清理，不得替换账号背包 |
 | 临时队伍 | `ClientSquad` 存在 `_ReportToServer`；队伍切换同时影响个人正式队伍 | 不直接把临时队伍当成官方上报隔离层，不无条件调用 Pop/ClearAll 清理其他系统的临时队伍 |
@@ -16,3 +17,5 @@
 实现顺序仍是：私有原生角色和共享对象归属 → 全类别输入/事件/官方发送隔离 → 房主原生执行与真实观察关联 → 隔离对象的原生结果应用 → 离房观察恢复。不能因为已找到某个方法就省略其他环节，也不能以这一离线表替代矿石端到端双客户端验收。
 
 原始本地报告、类型索引及反汇编保存在忽略的 `build/cooperation-stage1/ore-reference`，不会随模组发布。工具见 [OFFLINE_NATIVE_ANALYSIS.md](OFFLINE_NATIVE_ANALYSIS.md)。V1/V2 ABI 保持不变，`full_sync_verified=false`。
+
+调用桥的离线测试使用 `tests/support/native_abi_fixture.cpp` 自行编译的微型导出 DLL。测试仅在独立测试进程内按明确路径加载该夹具，不加载安装目录的 GameAssembly，也不安装到游戏。它验证元数据选择、抽象声明拒绝、实际实现派发、值尺寸和 GC 根清理；这不能代替真实游戏 ABI 或世界隔离验收。

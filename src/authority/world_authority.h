@@ -48,8 +48,9 @@ inline bool validState(const Json& state) {
     if(!state.is_object()||state.empty()||state.size()>20||state.dump().size()>4096)return false;
     for(auto it=state.begin();it!=state.end();++it) {
         const auto& k=it.key();const auto& v=it.value();
-        if(k=="position") {if(!vector(v))return false;}
+        if(k=="position"||k=="scale") {if(!vector(v))return false;}
         else if(k=="rotation") {if(!vector(v,4))return false;}
+        else if(k=="archetype") {if(!v.is_string()||v.get_ref<const std::string&>().empty()||v.get_ref<const std::string&>().size()>256)return false;}
         else if(k=="template"||k=="phase"||k=="animation") {if(!v.is_string()||v.get_ref<const std::string&>().size()>256)return false;}
         else if(k=="active"||k=="dead"||k=="collected"||k=="downed"||k=="controlled") {if(!v.is_boolean())return false;}
         else if(k=="weapon_template") {

@@ -107,6 +107,15 @@ class OfflineMetadataTest(unittest.TestCase):
         with self.assertRaises(reader.MetadataError):
             reader.Metadata(data)
 
+    def test_abstract_virtual_declaration_is_not_a_direct_call_target(self):
+        data = fixture()
+        offset = reader.Metadata(data).tables["methods"][0]
+        struct.pack_into("<H", data, offset + 24, 0x440)
+        method = reader.Metadata(data).select("Actor")[0]["methods"][0]
+        self.assertTrue(method["virtual"])
+        self.assertTrue(method["abstract"])
+        self.assertFalse(method["static"])
+
     def test_truncated_and_version(self):
         with self.assertRaises(reader.MetadataError):
             reader.Metadata(b"\0" * 8)
