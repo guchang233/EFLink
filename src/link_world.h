@@ -213,8 +213,17 @@ class World {
     template<class T> T readField(void* object,const char* type,const char* name,const char* space="Beyond.Gameplay.Core",const char* library="Gameplay.Beyond.dll") {
         auto klass=api.klass(type,library,space);
         auto* descriptor=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,name);
-        if(!descriptor) throw std::runtime_error(std::string("field unavailable: ")+type+"."+name);
-        T value{};symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value")(object,descriptor,&value);return value;
+        if(!object||!descriptor) throw std::runtime_error(std::string("field unavailable: ")+type+"."+name);
+        auto fieldType=symbol<const void*(*)(const void*)>("il2cpp_field_get_type");
+        auto klassFrom=symbol<const void*(*)(const void*)>("il2cpp_class_from_type");
+        auto classOf=symbol<const void*(*)(void*)>("il2cpp_object_get_class");
+        auto assignable=symbol<bool(*)(const void*,const void*)>("il2cpp_class_is_assignable_from");
+        auto flags=symbol<int(*)(const void*)>("il2cpp_field_get_flags");
+        auto read=symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value");
+        if(!fieldType||!klassFrom||!classOf||!assignable||!flags||!read)throw std::runtime_error("native field metadata unavailable");
+        const auto shape=eflink::unity::Api::valueShape(klassFrom(fieldType(descriptor)));
+        authority::requireNativeField<T>(shape,bool(flags(descriptor)&0x10),assignable(klass.class_info,classOf(object)));
+        T value{};read(object,descriptor,&value);return value;
     }
     void* collection(void* object,const char* name,std::initializer_list<void*> args={}) {
         auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(object);

@@ -1,5 +1,6 @@
 #pragma once
 #include "BetterEndfield/ThirdPartyModule.h"
+#include "authority/native_value_abi.h"
 #include <windows.h>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,15 @@ public:
     };
     void bind(const BE_HostApiV1* value) {api=value;}
     const BE_HostApiV1* raw() const {return api;}
+    static authority::NativeValueShape valueShape(const void* klass) {
+        auto dll=GetModuleHandleW(L"GameAssembly.dll");
+        auto isValue=reinterpret_cast<bool(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_is_valuetype"));
+        auto size=reinterpret_cast<int(*)(const void*,unsigned*)>(GetProcAddress(dll,"il2cpp_class_value_size"));
+        if(!klass||!isValue||!size)throw std::runtime_error("native value metadata unavailable");
+        authority::NativeValueShape shape;shape.isValue=isValue(klass);
+        if(shape.isValue)shape.bytes=size(klass,&shape.alignment);
+        return shape;
+    }
     BE_ResolvedClassV1 klass(const char* type,const char* assembly="UnityEngine.CoreModule.dll",const char* space="UnityEngine") {
         std::string key=std::string(assembly)+space+type;
         if(auto found=classes.find(key);found!=classes.end()) return found->second;
@@ -73,19 +83,22 @@ public:
         auto dll=GetModuleHandleW(L"GameAssembly.dll");
         auto parameter=reinterpret_cast<const void*(*)(const void*,unsigned)>(GetProcAddress(dll,"il2cpp_method_get_param"));
         auto klassFrom=reinterpret_cast<const void*(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_from_type"));
-        auto isValue=reinterpret_cast<bool(*)(const void*)>(GetProcAddress(dll,"il2cpp_class_is_valuetype"));
-        auto size=reinterpret_cast<int(*)(const void*,unsigned*)>(GetProcAddress(dll,"il2cpp_class_value_size"));
-        if(!parameter||!klassFrom||!isValue||!size)throw std::runtime_error("value parameter metadata unavailable");
-        auto* type=parameter(method.method_info,index);auto* klass=type?klassFrom(type):nullptr;unsigned align=0;
-        const int bytes=klass?size(klass,&align):0;
-        if(!klass||!isValue(klass)||bytes<=0||bytes>4096||align>16)throw std::runtime_error("value parameter ABI unavailable");
+        auto count=reinterpret_cast<unsigned(*)(const void*)>(GetProcAddress(dll,"il2cpp_method_get_param_count"));
+        if(!parameter||!klassFrom||!count||!method.method_info||index>=count(method.method_info))throw std::runtime_error("value parameter metadata unavailable");
+        auto* type=parameter(method.method_info,index);auto* klass=type?klassFrom(type):nullptr;
+        const auto shape=valueShape(klass);authority::requireNativeValueShape(shape);
         auto* boxed=api->object_new(api->context,klass);auto* raw=boxed?api->object_unbox(api->context,boxed):nullptr;
         if(!raw)throw std::runtime_error("value parameter allocation failed");
-        std::memset(raw,0,bytes);return boxed;
+        std::memset(raw,0,std::size_t(shape.bytes));return boxed;
     }
     template<class T> T value(BE_ResolvedMethodV1 method,void* object=nullptr,std::initializer_list<void*> args={}) {
-        auto* result=call(method,object,args);auto* raw=result?api->object_unbox(api->context,result):nullptr;
-        if(!raw) throw std::runtime_error("missing boxed bridge result");T output;std::memcpy(&output,raw,sizeof(T));return output;
+        auto* result=call(method,object,args);if(!result)throw std::runtime_error("missing boxed bridge result");
+        TemporaryRoot root(api,result);
+        auto classOf=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"),"il2cpp_object_get_class"));
+        if(!classOf)throw std::runtime_error("boxed bridge result type unavailable");
+        authority::requireNativeValue<T>(valueShape(classOf(result)));
+        auto* raw=api->object_unbox(api->context,result);
+        if(!raw) throw std::runtime_error("missing boxed bridge result data");T output;std::memcpy(&output,raw,sizeof(T));return output;
     }
     void* keep(void* object) {
         if(!object) throw std::runtime_error("missing Unity object");
