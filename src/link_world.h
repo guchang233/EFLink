@@ -11,6 +11,7 @@
 #include "authority/native_object_bindings.h"
 #include "authority/native_mine_entry.h"
 #include "authority/native_entity_withdrawal.h"
+#include "authority/native_character_info.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_metadata.h"
@@ -75,6 +76,7 @@ class World {
     std::string nativeVersion;
     worldauthority::NativeMineEntry nativeMine;
     worldauthority::NativeEntityWithdrawal nativeEntityWithdrawal;
+    std::vector<std::unique_ptr<worldauthority::NativeCharacterInfo>> privateCharacterData;
     // Compiled candidate adapter. No config/RPC can change its inherited false
     // execution, isolation, recovery or dual-client certificates.
     class GameAdapter final:public worldauthority::NativeAdapter {
@@ -390,6 +392,15 @@ class World {
         if(!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified())return false;
         bindNativePins();nativeEntityWithdrawal.bind(runtime,nativeVersion,nativePins);
         return nativeEntityWithdrawal.acquire(adapter,staticObject("entityManager"),[this](void* manager,std::uint32_t handle){return observeEntityWithdrawal(manager,handle);});
+    }
+    std::optional<worldauthority::NativeCharacterInfo::Lease> constructPrivateCharacterData(const worldauthority::Scope& scope,worldauthority::NativeDomain domain,
+            std::uint16_t peer,std::uint64_t member,unsigned slot,void* nativePublicProfile,int nativeScope,int friendship,const std::function<bool()>& current) {
+        if(!nativeAdapter.executionVerified()||!nativeAdapter.isolationVerified()||!nativeAdapter.recoveryVerified()||!nativeAdapter.dualClientVerified()||privateCharacterData.size()>=16)return {};
+        bindNativePins();auto data=std::make_unique<worldauthority::NativeCharacterInfo>();data->bind(runtime,nativeVersion,nativePins);
+        // Own the recovery record before invoking the constructor: its native
+        // callbacks may attach listeners even if construction later throws.
+        auto* entry=data.get();privateCharacterData.push_back(std::move(data));
+        return entry->construct(nativeAdapter,scope,domain,peer,member,slot,nativePublicProfile,nativeScope,friendship,current);
     }
     static std::string operatorTemplate(const std::string& path) {
         return characterTemplate(path);
@@ -989,6 +1000,8 @@ public:
     }
     // Game thread only.
     void clear() {
+        for(const auto& data:privateCharacterData)if(!data->cleanup())throw std::runtime_error("private native character data remains retained; cleanup must finish before unload");
+        privateCharacterData.clear();
         if(nativeEntityWithdrawal.retained()&&(!nativeEntityWithdrawal.retire(staticObject("entityManager"),
                 [this](void* manager,std::uint32_t handle){return observeEntityWithdrawal(manager,handle);})||nativeEntityWithdrawal.retained()))
             throw std::runtime_error("native personal entity lease retained; shutdown must wait for restoration");
@@ -1008,6 +1021,7 @@ public:
         resetAppearance();
     }
     nlohmann::json status() const {
+        auto privateDataStatus=nlohmann::json::array();for(const auto& data:privateCharacterData)privateDataStatus.push_back(data->status());
         auto result=nlohmann::json{{"local_model",localModel},{"map_id",mapId},{"level_id",levelId},
             {"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},
             {"authority_architecture",{{"phase","native_adapters_in_progress"},{"shared_world_supported",false},
@@ -1017,6 +1031,7 @@ public:
                 {"contracts_resolved",nativeMine.contractsResolved()},{"native_dispatch_calls",nativeMine.calls()},{"native_dispatch_accepted",nativeMine.acceptedCalls()},
                 {"execution_verified",false},{"native_witness_bridge",false},{"isolation_verified",false},{"recovery_verified",false},{"full_sync_verified",false}}},
             {"native_entity_withdrawal",nativeEntityWithdrawal.status()},
+            {"private_character_data",{{"records",privateDataStatus},{"native_actor_created",false},{"supported",false},{"full_sync_verified",false}}},
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage","metadata_only"},{"lookup_ready",false},{"effects_replayed",false}}},

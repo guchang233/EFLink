@@ -2,6 +2,7 @@
 #include "native_abi_fixture.h"
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #define FIXTURE_EXPORT extern "C" __declspec(dllexport)
 FIXTURE_EXPORT const void* il2cpp_object_get_class(void* object) {return object?static_cast<AbiFixtureObject*>(object)->klass:nullptr;}
 FIXTURE_EXPORT bool il2cpp_class_is_valuetype(const void* klass) {return static_cast<const AbiFixtureClass*>(klass)->value;}
@@ -16,7 +17,9 @@ FIXTURE_EXPORT bool il2cpp_class_is_assignable_from(const void* expected,const v
 }
 FIXTURE_EXPORT const void* il2cpp_object_get_virtual_method(void*,const void* method) {return static_cast<const AbiFixtureMethod*>(method)->implementation;}
 FIXTURE_EXPORT const void* il2cpp_class_get_methods(const void* klass,void** iterator) {
-    if(*iterator)return nullptr;*iterator=reinterpret_cast<void*>(1);return static_cast<const AbiFixtureClass*>(klass)->method;
+    if(*iterator==reinterpret_cast<void*>(1))return nullptr;
+    const auto* value=*iterator?static_cast<const AbiFixtureMethod*>(*iterator)->next:static_cast<const AbiFixtureClass*>(klass)->method;
+    *iterator=value?const_cast<AbiFixtureMethod*>(value):reinterpret_cast<void*>(1);return value;
 }
 FIXTURE_EXPORT const char* il2cpp_method_get_name(const void* method) {return static_cast<const AbiFixtureMethod*>(method)->name;}
 FIXTURE_EXPORT const void* il2cpp_method_get_return_type(const void* method) {return &static_cast<const AbiFixtureMethod*>(method)->returns;}
@@ -25,11 +28,29 @@ FIXTURE_EXPORT const void* il2cpp_method_get_param(const void* method,unsigned i
 }
 FIXTURE_EXPORT const void* il2cpp_class_from_type(const void* type) {return type?static_cast<const AbiFixtureType*>(type)->klass:nullptr;}
 FIXTURE_EXPORT const void* il2cpp_class_get_field_from_name(const void* klass,const char* name) {
-    for(auto* field=static_cast<const AbiFixtureClass*>(klass)->field;field;field=field->next)if(!std::strcmp(field->name,name))return field;return nullptr;
+    for(auto* type=static_cast<const AbiFixtureClass*>(klass);type;type=type->parent)
+        for(auto* field=type->field;field;field=field->next)if(!std::strcmp(field->name,name))return field;return nullptr;
 }
+FIXTURE_EXPORT const void* il2cpp_field_get_parent(const void* field) {return static_cast<const AbiFixtureField*>(field)->owner;}
 FIXTURE_EXPORT int il2cpp_field_get_flags(const void* field) {return static_cast<const AbiFixtureField*>(field)->flags;}
 FIXTURE_EXPORT const void* il2cpp_field_get_type(const void* field) {return &static_cast<const AbiFixtureField*>(field)->type;}
 FIXTURE_EXPORT void il2cpp_field_static_get_value(const void* field,void* output) {std::memcpy(output,&static_cast<const AbiFixtureField*>(field)->value,sizeof(int));}
+FIXTURE_EXPORT void il2cpp_field_get_value(void* object,const void* field,void* output) {
+    const auto* f=static_cast<const AbiFixtureField*>(field);const auto* type=f->type.klass;
+    std::memcpy(output,static_cast<AbiFixtureObject*>(object)->data+f->offset,type->value?type->bytes:sizeof(void*));
+}
+FIXTURE_EXPORT void il2cpp_field_set_value(void* object,const void* field,void* input) {
+    const auto* f=static_cast<const AbiFixtureField*>(field);const auto* type=f->type.klass;
+    std::memcpy(static_cast<AbiFixtureObject*>(object)->data+f->offset,input,type->value?type->bytes:sizeof(void*));
+}
+FIXTURE_EXPORT int il2cpp_class_get_rank(const void* klass) {return static_cast<const AbiFixtureClass*>(klass)->rank;}
+FIXTURE_EXPORT const void* il2cpp_class_get_element_class(const void* klass) {return static_cast<const AbiFixtureClass*>(klass)->element;}
+FIXTURE_EXPORT void* il2cpp_array_new(const void* element,std::uintptr_t count) {
+    static std::vector<std::unique_ptr<AbiFixtureArray>> arrays;
+    if(count>4096)return nullptr;auto array=std::make_unique<AbiFixtureArray>();
+    array->type={false,0,0,nullptr,nullptr,nullptr,static_cast<const AbiFixtureClass*>(element),1};array->object.klass=&array->type;
+    array->elements.resize(count);auto* result=&array->object;arrays.push_back(std::move(array));return result;
+}
 FIXTURE_EXPORT char* il2cpp_type_get_name(const void* type) {
     if(!type)return nullptr;const auto* name=static_cast<const AbiFixtureType*>(type)->name;const auto bytes=std::strlen(name)+1;
     auto* copy=static_cast<char*>(std::malloc(bytes));if(copy)std::memcpy(copy,name,bytes);return copy;
