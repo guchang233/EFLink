@@ -71,7 +71,25 @@ struct ReentrantFixture:Fixture {
         Fixture::cancel(ticket);auto callback=std::move(duringCancel);if(callback)callback();
     }
 };
+struct ProbeBudgetFixture:Fixture {
+    mutable unsigned ownershipProbes=0;
+    NativeActorContext actorContext(const Object& actor) const override {++ownershipProbes;return Fixture::actorContext(actor);}
+};
 int main() {
+    {
+        ProbeBudgetFixture adapter;Host host;host.reset(scene(),"fixture-only");
+        host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});
+        host.bind(2,1,host.find("player","hero")->ref);host.resume(adapter);
+        Intent intent{scene(),2,1,1,1,1,1,host.find("player","hero")->ref,host.find("mineral","ore-12")->ref,"mine"};
+        bool admitted=true;for(unsigned i=1;i<=128;++i) {intent.request=i;intent.action=i;admitted=admitted&&host.submit(intent.json(),2,adapter,10).has_value();}
+        adapter.ownershipProbes=0;host.poll(11);
+        check(admitted&&host.status()["pending"]==128&&adapter.ownershipProbes==256,
+            "128 native operations revalidate ownership linearly instead of performing a full native rescan per callback");
+        adapter.ownershipProbes=0;host.revoke(2);
+        check(host.status()["pending"]==0&&adapter.ownershipProbes==0&&adapter.cancels==128,
+            "revoked membership cancels an entire native queue without unnecessary native actor calls");
+        host.reset();
+    }
     {
         ReentrantFixture adapter;Host host;host.reset(scene(),"fixture-only");
         host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});

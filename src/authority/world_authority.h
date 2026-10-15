@@ -385,11 +385,7 @@ class Host {
         for(const auto serial:serials) {
             auto it=pending.find(serial);if(it==pending.end())continue;
             const auto ticket=it->second.ticket;auto* adapter=it->second.adapter;
-            const auto* actor=find(ticket.intent.actor);
-            // actorContext invokes native code. Pass a value copy and validate
-            // the ticket again after it returns, including reentrant resets.
-            bool owned=false;if(actor) {const auto copy=*actor;owned=nativeActorOwnedBy(*adapter,ticket.intent.peer,copy);}
-            if(!owned||!pendingIdentity(ticket,adapter))cancelTicket(serial);
+            if(!pendingOwned(ticket,adapter))cancelTicket(serial);
         }
     }
     bool pendingIdentity(const Ticket& t,const NativeAdapter* adapter) const {
@@ -397,6 +393,13 @@ class Host {
         const auto m=members.find(t.intent.peer);
         return it!=pending.end()&&it->second.adapter==adapter&&t.scope==scope_&&a&&o&&a->cookie==t.actorCookie&&o->cookie==t.targetCookie&&
             m!=members.end()&&m->second.active&&m->second.incarnation==t.intent.member&&owns(m->second,t.intent.actor);
+    }
+    bool pendingOwned(const Ticket& ticket,const NativeAdapter* adapter) const {
+        if(!pendingIdentity(ticket,adapter))return false;
+        // Native probing can re-enter. Keep a copy and recheck the exact
+        // ticket afterwards; other tickets need no second full census here.
+        const auto actor=*find(ticket.intent.actor);
+        return nativeActorOwnedBy(*adapter,ticket.intent.peer,actor)&&pendingIdentity(ticket,adapter);
     }
 public:
     static constexpr std::size_t maxObjects=1024,maxWire=240*1024;
@@ -564,7 +567,8 @@ public:
                 std::optional<Witness> observed;try {observed=adapter->poll(t);}catch(...) {}
                 // The actual native callback can retire any pending operation
                 // or the entire world. Resolve again before storing its result.
-                invalidatePending();it=pending.find(serial);
+                if(!pendingOwned(t,adapter)) {cancelTicket(serial);continue;}
+                it=pending.find(serial);
                 if(it==pending.end()||!pendingIdentity(t,adapter))continue;
                 if(!adapter->executionVerified()||!adapter->isolationVerified()||!adapter->recoveryVerified()||!adapter->dualClientVerified()||
                    adapter->gameVersion()!=gameVersion_||adapter->path()!=t.path) {cancelTicket(serial);++rejected;continue;}

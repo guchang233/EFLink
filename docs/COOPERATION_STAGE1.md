@@ -2,6 +2,8 @@
 
 本文件记录开发证据，不是正式发布能力清单。各账号继续使用官方登录和官方连接；模组房间同步房主世界，不会把官方账号加入同一个官方副本实例。背包、奖励、任务和解锁由官方服务器处理。
 
+**当前状态（2026-10-15）：以下早期人物复制、伤害转发、独立技能/表现回放等实验实现已经删除。** 历史检查结果不能用于当前权威架构的能力声明。最新实现与未完成接入见 [NATIVE_INTEGRATION_STATUS.md](NATIVE_INTEGRATION_STATUS.md)；完整矿石闭环、客机隔离应用和个人世界恢复尚未实现/验收，`full_sync_verified=false`。
+
 ## 可恢复基线与测试入口
 
 - 修改前源码及构建：`build/cooperation-stage1/baseline-20261012.zip`，散列清单 `baseline-manifest.json`。
