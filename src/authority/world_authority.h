@@ -250,7 +250,7 @@ public:
     NativeDispatchPermit& operator=(const NativeDispatchPermit&)=delete;
     bool issuedTo(const void* adapter) const {return issuer==adapter;}
     bool allows(const Ticket& value,const std::string& path) const {
-        if(used||ticket!=&value||thread!=std::this_thread::get_id()||value.path!=path)return false;
+        if(thread!=std::this_thread::get_id()||used||ticket!=&value||value.path!=path)return false;
         try {return current();}catch(...) {return false;}
     }
     bool consume(const Ticket& value,const std::string& path) const {
@@ -304,7 +304,7 @@ class Host {
     std::map<std::string,EventWindow> nativeEvents;
     std::deque<Json> journal;
     std::uint64_t nextObject=0,nextLife=0,nextTicket=0,nextNativeStamp=0,revision=0,accepted=0,rejected=0,confirmed=0,expired=0;
-    bool suspended=true;
+    bool suspended=true,transitioning=false,invalidating=false;
     void thread() {
         if(owner==std::thread::id{})owner=std::this_thread::get_id();
         if(owner!=std::this_thread::get_id())throw std::runtime_error("authority mutation outside game thread");
@@ -336,7 +336,18 @@ class Host {
         advance(revision);Json event={{"scope",scope_.json()},{"revision",revision},{"type",type},{"object",object.json()},{"receipt",std::move(receipt)}};
         journal.push_back(std::move(event));while(journal.size()>256)journal.pop_front();
     }
-    void cancelAll() noexcept {for(auto& [id,p]:pending)p.adapter->cancel(p.ticket);pending.clear();}
+    // Native callbacks may re-enter reset/revoke/observe. Retire the ticket
+    // before calling adapter code; no map iterator or borrowed Ticket survives.
+    void cancelTicket(std::uint64_t serial) noexcept {
+        auto found=pending.find(serial);if(found==pending.end())return;
+        auto value=std::move(found->second);pending.erase(found);value.adapter->cancel(value.ticket);
+    }
+    void cancelAll() noexcept {
+        const auto wasTransitioning=transitioning;transitioning=true;
+        std::map<std::uint64_t,Pending> retired;retired.swap(pending);
+        for(auto& [id,p]:retired)p.adapter->cancel(p.ticket);
+        transitioning=wasTransitioning;
+    }
     static bool owns(const Member& member,Ref actor) {return std::find(member.actors.begin(),member.actors.end(),actor)!=member.actors.end();}
     bool nativeActorOwnedBy(const NativeAdapter& adapter,std::uint16_t peer,const Object& actor) const {
         try {const auto context=adapter.actorContext(actor);
@@ -355,7 +366,7 @@ class Host {
     }
     bool usable(const Intent& intent) const {
         auto m=members.find(intent.peer);const auto* actor=find(intent.actor);const auto* target=find(intent.target);
-        return !suspended&&intent.scope==scope_&&m!=members.end()&&m->second.active&&m->second.incarnation==intent.member&&
+        return !suspended&&!transitioning&&intent.scope==scope_&&m!=members.end()&&m->second.active&&m->second.incarnation==intent.member&&
             owns(m->second,intent.actor)&&actor&&actor->kind=="player"&&target&&intent.expectedVersion>0&&target->version>=intent.expectedVersion&&
             (intent.operation!="move"||intent.target==intent.actor)&&
             (intent.operation!="select"||(target->kind=="player"&&owns(m->second,intent.target)))&&
@@ -363,20 +374,29 @@ class Host {
             target->state.value("active",true);
     }
     void invalidatePending() {
+        if(invalidating)return;
+        struct Guard {bool& flag;explicit Guard(bool& value):flag(value){flag=true;}~Guard(){flag=false;}} guard(invalidating);
         for(auto it=retiredActions.begin();it!=retiredActions.end();) {
             const Ref actor{std::get<2>(it->first),std::get<3>(it->first)};
             auto member=members.find(std::get<0>(it->first));
             if(!find(actor)||member==members.end()||member->second.incarnation!=std::get<1>(it->first))it=retiredActions.erase(it);else ++it;
         }
-        for(auto it=pending.begin();it!=pending.end();) {
-            const auto& t=it->second.ticket;const auto* a=find(t.intent.actor);const auto* o=find(t.intent.target);
-            auto m=members.find(t.intent.peer);
-            if(t.scope!=scope_||!a||!o||a->cookie!=t.actorCookie||o->cookie!=t.targetCookie||
-               m==members.end()||!m->second.active||m->second.incarnation!=t.intent.member||!owns(m->second,t.intent.actor)||
-               !nativeActorOwnedBy(*it->second.adapter,t.intent.peer,*a)) {
-                it->second.adapter->cancel(t);it=pending.erase(it);
-            }else ++it;
+        std::vector<std::uint64_t> serials;for(const auto& [serial,p]:pending)serials.push_back(serial);
+        for(const auto serial:serials) {
+            auto it=pending.find(serial);if(it==pending.end())continue;
+            const auto ticket=it->second.ticket;auto* adapter=it->second.adapter;
+            const auto* actor=find(ticket.intent.actor);
+            // actorContext invokes native code. Pass a value copy and validate
+            // the ticket again after it returns, including reentrant resets.
+            bool owned=false;if(actor) {const auto copy=*actor;owned=nativeActorOwnedBy(*adapter,ticket.intent.peer,copy);}
+            if(!owned||!pendingIdentity(ticket,adapter))cancelTicket(serial);
         }
+    }
+    bool pendingIdentity(const Ticket& t,const NativeAdapter* adapter) const {
+        const auto it=pending.find(t.serial);const auto* a=find(t.intent.actor);const auto* o=find(t.intent.target);
+        const auto m=members.find(t.intent.peer);
+        return it!=pending.end()&&it->second.adapter==adapter&&t.scope==scope_&&a&&o&&a->cookie==t.actorCookie&&o->cookie==t.targetCookie&&
+            m!=members.end()&&m->second.active&&m->second.incarnation==t.intent.member&&owns(m->second,t.intent.actor);
     }
 public:
     static constexpr std::size_t maxObjects=1024,maxWire=240*1024;
@@ -384,7 +404,7 @@ public:
     Host(const Host&)=delete;Host& operator=(const Host&)=delete;
     // Adapter lifetime must exceed all pending tickets. Reset before destruction.
     void reset(Scope scope={},std::string gameVersion={}) {
-        thread();cancelAll();scope_=std::move(scope);gameVersion_=std::move(gameVersion);objects.clear();members.clear();
+        thread();suspended=true;cancelAll();scope_=std::move(scope);gameVersion_=std::move(gameVersion);objects.clear();members.clear();
         strikes.clear();strikeOrder.clear();retiredActions.clear();nativeEvents.clear();journal.clear();revision=0;suspended=true;
         // Allocators survive room/scene resets, including reuse of a network ID.
     }
@@ -482,7 +502,7 @@ public:
     // Admission can be opened only for a compiled adapter matching the native
     // build and proven isolation/recovery. Observation support grants nothing.
     bool resume(const NativeAdapter& adapter) {
-        thread();suspended=!(scope_.valid()&&!gameVersion_.empty()&&adapter.gameVersion()==gameVersion_&&!adapter.path().empty()&&
+        thread();suspended=!( !transitioning&&scope_.valid()&&!gameVersion_.empty()&&adapter.gameVersion()==gameVersion_&&!adapter.path().empty()&&
             adapter.path().size()<=128&&adapter.executionVerified()&&adapter.isolationVerified()&&adapter.recoveryVerified()&&adapter.dualClientVerified());return !suspended;
     }
     std::optional<std::uint64_t> submit(const Json& body,std::uint16_t sender,NativeAdapter& adapter,std::uint64_t now) {
@@ -496,7 +516,8 @@ public:
                !adapter.supports(target.kind,intent.operation)||!adapter.validate(intent,actor,target)) {++rejected;return {};}
             // Adapter validation may invoke native code and re-enter a scene or
             // census callback. No borrowed map pointer/reference survives it.
-            if(!usable(intent)||!adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified()||
+            if(!usable(intent)||intent.request<=members.at(sender).highRequest||strikes.contains(strike)||commandRetired(intent)||
+               !adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified()||
                adapter.gameVersion()!=gameVersion_||!find(intent.actor)||!find(intent.target)||
                find(intent.actor)->cookie!=actor.cookie||find(intent.target)->cookie!=target.cookie) {++rejected;return {};}
             advance(nextTicket);Ticket ticket{scope_,nextTicket,actor.cookie,target.cookie,target.version,intent,captureNativeStamp(),adapter.path()};
@@ -522,39 +543,49 @@ public:
             // Consume request identity even when native dispatch fails: an
             // ambiguous failure must not be retried as a second native action.
             bool began=false;try {began=adapter.begin(ticket,permit);}catch(...) {}
-            if(!began||!permit.used) {adapter.cancel(ticket);pending.erase(ticket.serial);++rejected;return {};}
+            if(!began||!permit.used||!pendingIdentity(ticket,&adapter)) {cancelTicket(ticket.serial);++rejected;return {};}
             ++accepted;return ticket.serial;
         }catch(...) {++rejected;return {};}
     }
     void poll(std::uint64_t now) {
         thread();invalidatePending();
-        for(auto it=pending.begin();it!=pending.end();) {
-            auto& p=it->second;const auto& t=p.ticket;
-            if(!p.adapter->executionVerified()||!p.adapter->isolationVerified()||!p.adapter->recoveryVerified()||!p.adapter->dualClientVerified()||
-               p.adapter->gameVersion()!=gameVersion_||p.adapter->path()!=t.path) {
-                p.adapter->cancel(t);it=pending.erase(it);++rejected;continue;
+        std::vector<std::uint64_t> serials;for(const auto& [serial,p]:pending)serials.push_back(serial);
+        for(const auto serial:serials) {
+            auto it=pending.find(serial);if(it==pending.end())continue;
+            const auto t=it->second.ticket;auto* adapter=it->second.adapter;
+            if(!adapter->executionVerified()||!adapter->isolationVerified()||!adapter->recoveryVerified()||!adapter->dualClientVerified()||
+               adapter->gameVersion()!=gameVersion_||adapter->path()!=t.path) {
+                cancelTicket(serial);++rejected;continue;
             }
-            if(now>=p.deadline) {p.adapter->cancel(t);it=pending.erase(it);++expired;continue;}
-            if(!p.event) {try {p.event=p.adapter->poll(t);}catch(...) {}}
-            if(!p.event) {++it;continue;}
-            const auto& witness=p.event;
+            if(now>=it->second.deadline) {cancelTicket(serial);++expired;continue;}
+            if(!it->second.event) {
+                std::optional<Witness> observed;try {observed=adapter->poll(t);}catch(...) {}
+                // The actual native callback can retire any pending operation
+                // or the entire world. Resolve again before storing its result.
+                invalidatePending();it=pending.find(serial);
+                if(it==pending.end()||!pendingIdentity(t,adapter))continue;
+                if(!adapter->executionVerified()||!adapter->isolationVerified()||!adapter->recoveryVerified()||!adapter->dualClientVerified()||
+                   adapter->gameVersion()!=gameVersion_||adapter->path()!=t.path) {cancelTicket(serial);++rejected;continue;}
+                it->second.event=std::move(observed);
+            }
+            const auto witness=it->second.event;if(!witness)continue;
             auto* existing=find(t.intent.target);
             if(witness->serial!=t.serial||witness->actorCookie!=t.actorCookie||witness->targetCookie!=t.targetCookie||!witness->event||
                 !validState(witness->state)||!existing||repeatedEvent(t.path,witness->event)||
                 !witness->nativeStamp||witness->nativeStamp<=t.beginStamp||witness->nativeStamp>nextNativeStamp||
                 revision==UINT64_MAX) {
-                ++rejected;p.adapter->cancel(t);it=pending.erase(it);continue;
+                ++rejected;cancelTicket(serial);continue;
             }
             // Native callbacks can precede the next complete census. Retain
             // the one-shot event until the host has actually observed this
             // state, or expire the ticket without manufacturing any result.
             if(existing->nativeStamp<=t.beginStamp||witness->nativeStamp>existing->nativeStamp||witness->state!=existing->state) {
-                ++it;continue;
+                continue;
             }
             auto& object=objects.at(index(existing->kind,existing->key));
             rememberEvent(t.path,witness->event);
             record("receipt",object,{{"peer",t.intent.peer},{"member",t.intent.member},{"request",t.intent.request},{"action",t.intent.action},{"strike",t.intent.strike}});
-            ++confirmed;it=pending.erase(it);
+            ++confirmed;pending.erase(serial);
         }
     }
     std::optional<Json> changesSince(std::uint64_t since) const {

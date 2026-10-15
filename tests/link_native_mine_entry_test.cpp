@@ -21,7 +21,7 @@ struct Runtime {
     AbiFixtureObject actor{&actorClass,{}},ore{&oreClass,{}},manager{&managerClass,{}},idBox{&wide,{}},boolBox{&boolean,{}};
     std::uint64_t resource=12345,seenId=0;void* seenActor=nullptr;int seenMining=0;
     unsigned constructors=0,operations=0,nextRoot=0,releases=0,invalid=0;bool accept=true,ctorError=false;
-    std::set<unsigned> roots;std::vector<std::unique_ptr<AbiFixtureObject>> boxes;std::function<void()> onConstruct;
+    std::set<unsigned> roots;std::vector<std::unique_ptr<AbiFixtureObject>> boxes;std::function<void()> onConstruct,onOperation;
     Runtime() {pointerClass.method=&ctor;nature.method=&declaration;integer.field=&mining;}
     static BE_Result BE_CALL klass(void* context,const char* assembly,const char* space,const char* name,BE_ResolvedClassV1* result) {
         auto& self=*static_cast<Runtime*>(context);*result={};
@@ -56,7 +56,7 @@ struct Runtime {
         if(method==&self.getter&&object==&self.ore) {std::memcpy(self.idBox.data,&self.resource,8);return &self.idBox;}
         if(method==&self.operation&&object==&self.manager) {
             ++self.operations;std::memcpy(&self.seenActor,args[0],sizeof(void*));self.seenMining=*static_cast<int*>(args[1]);self.seenId=*static_cast<std::uint64_t*>(args[2]);
-            std::memcpy(self.boolBox.data,&self.accept,1);return &self.boolBox;
+            if(self.onOperation)self.onOperation();std::memcpy(self.boolBox.data,&self.accept,1);return &self.boolBox;
         }
         ++self.invalid;*error=&self.actor;return nullptr;
     }
@@ -141,6 +141,11 @@ int run(const wchar_t* path) {
     {
         FixtureAdapter a;a.vm.onConstruct=[&]{a.host.revoke(2);};
         check(!a.submit()&&!a.vm.operations&&a.vm.roots.empty(),"membership revocation during argument preparation cancels native dispatch");
+    }
+    {
+        FixtureAdapter a;a.vm.onOperation=[&]{a.host.reset();};
+        check(!a.submit()&&a.vm.operations==1&&a.cancelled==1&&a.vm.roots.empty()&&a.host.status()["intents_accepted"]==0,
+            "native dispatch that resets its world cannot leave a dangling accepted ticket or cancel twice");
     }
     {
         FixtureAdapter a;a.onValidate=[&]{if(a.validations>=3)a.certified=false;};

@@ -57,7 +57,58 @@ struct InputFixture:Fixture {
     bool supports(const std::string&,const std::string&) const override {return true;}
     bool begin(const Ticket& ticket,const NativeDispatchPermit& permit) override {received=ticket.intent.input;return Fixture::begin(ticket,permit);}
 };
+struct ReentrantFixture:Fixture {
+    std::function<void()> duringPoll,duringCancel,duringContext;
+    NativeActorContext actorContext(const Object& actor) const override {
+        auto& self=*const_cast<ReentrantFixture*>(this);auto callback=std::move(self.duringContext);
+        if(callback)callback();return Fixture::actorContext(actor);
+    }
+    std::optional<Witness> poll(const Ticket& ticket) override {
+        auto callback=std::move(duringPoll);if(callback)callback();return Fixture::poll(ticket);
+    }
+    void cancel(const Ticket& ticket) noexcept override {
+        Fixture::cancel(ticket);auto callback=std::move(duringCancel);if(callback)callback();
+    }
+};
 int main() {
+    for(unsigned mode=0;mode<5;++mode) {
+        ReentrantFixture adapter;Host host;host.reset(scene(),"fixture-only");
+        host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});
+        host.bind(2,1,host.find("player","hero")->ref);host.resume(adapter);
+        Intent intent{scene(),2,1,1,1,1,1,host.find("player","hero")->ref,host.find("mineral","ore-12")->ref,"mine"};
+        const auto ticket=host.submit(intent.json(),2,adapter,10);check(ticket.has_value(),"reentrant native fixture admits one operation");
+        const auto stamp=host.captureNativeStamp();host.observe("mineral",{mineral(9000)});
+        adapter.result=Witness{*ticket,10,20,1,mineral(9000).state,stamp};
+        if(mode==0)adapter.duringPoll=[&]{host.reset();};
+        if(mode==1)adapter.duringPoll=[&]{host.revoke(2);};
+        if(mode==2)adapter.duringPoll=[&]{host.observe("mineral",{mineral(8000,21)});};
+        if(mode==3)adapter.duringPoll=[&]{host.suspend();};
+        if(mode==4)adapter.duringPoll=[&]{adapter.certified=false;};
+        host.poll(11);
+        check(host.status()["pending"]==0&&host.status()["results_confirmed"]==0&&adapter.cancels==1,
+            "native poll cannot acknowledge a ticket revoked reentrantly by world, owner, allocation or certification changes");
+        host.reset();
+    }
+    {
+        ReentrantFixture adapter;Host host;host.reset(scene(),"fixture-only");
+        host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});
+        host.bind(2,1,host.find("player","hero")->ref);host.resume(adapter);
+        Intent intent{scene(),2,1,1,1,1,1,host.find("player","hero")->ref,host.find("mineral","ore-12")->ref,"mine"};
+        check(host.submit(intent.json(),2,adapter,10).has_value(),"cancellation fixture has a live native ticket");
+        bool reopened=true;adapter.duringCancel=[&]{reopened=host.resume(adapter);host.reset();};host.suspend();
+        check(!reopened&&adapter.cancels==1&&host.status()["pending"]==0&&host.status()["suspended"]==true,
+            "reset from native cancellation neither cancels twice nor reopens authority during teardown");
+    }
+    {
+        ReentrantFixture adapter;Host host;host.reset(scene(),"fixture-only");
+        host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});
+        host.bind(2,1,host.find("player","hero")->ref);host.resume(adapter);
+        Intent intent{scene(),2,1,1,1,1,1,host.find("player","hero")->ref,host.find("mineral","ore-12")->ref,"mine"};
+        host.submit(intent.json(),2,adapter,10);adapter.duringContext=[&]{host.reset();};
+        host.observe("mineral",{mineral(9000)});
+        check(adapter.cancels==1&&host.status()["pending"]==0&&host.status()["objects"]==0,
+            "native ownership probing may reset the scene without dangling pending iterators");
+    }
     {
         Host graph;graph.reset(scene(),"fixture-only");
         Observation caster{"caster","player",{{"active",true}},10};
