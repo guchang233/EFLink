@@ -1,7 +1,8 @@
 The declaration layout reference used by `inspect-il2cpp-metadata.py` is
-`Il2CppDumper/Il2Cpp/MetadataClass.cs` from Perfare/Il2CppDumper, commit
+`Il2CppDumper/Il2Cpp/MetadataClass.cs` and `Il2CppClass.cs` from Perfare/Il2CppDumper, commit
 `4741d46ba9cd6159c5d853eb9d6fc48b4bfa2b1a`.
 https://github.com/Perfare/Il2CppDumper/blob/4741d46ba9cd6159c5d853eb9d6fc48b4bfa2b1a/Il2CppDumper/Il2Cpp/MetadataClass.cs
+https://github.com/Perfare/Il2CppDumper/blob/4741d46ba9cd6159c5d853eb9d6fc48b4bfa2b1a/Il2CppDumper/Il2Cpp/Il2CppClass.cs
 
 MIT License
 
