@@ -304,7 +304,7 @@ class Host {
     std::map<std::string,EventWindow> nativeEvents;
     std::deque<Json> journal;
     std::uint64_t nextObject=0,nextLife=0,nextTicket=0,nextNativeStamp=0,revision=0,accepted=0,rejected=0,confirmed=0,expired=0;
-    bool suspended=true,transitioning=false,invalidating=false;
+    bool suspended=true,transitioning=false,invalidating=false,polling=false;
     void thread() {
         if(owner==std::thread::id{})owner=std::this_thread::get_id();
         if(owner!=std::this_thread::get_id())throw std::runtime_error("authority mutation outside game thread");
@@ -548,7 +548,9 @@ public:
         }catch(...) {++rejected;return {};}
     }
     void poll(std::uint64_t now) {
-        thread();invalidatePending();
+        thread();if(polling||invalidating||transitioning)return;
+        struct Guard {bool& flag;explicit Guard(bool& value):flag(value){flag=true;}~Guard(){flag=false;}} guard(polling);
+        invalidatePending();
         std::vector<std::uint64_t> serials;for(const auto& [serial,p]:pending)serials.push_back(serial);
         for(const auto serial:serials) {
             auto it=pending.find(serial);if(it==pending.end())continue;

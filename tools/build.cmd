@@ -29,7 +29,7 @@ if errorlevel 1 exit /b 1
 if not exist native-abi-fixture mkdir native-abi-fixture
 cl %TASK_FLAGS% /LD ..\tests\support\native_abi_fixture.cpp /Fe:native-abi-fixture\GameAssembly.dll /link /DYNAMICBASE /NXCOMPAT
 if errorlevel 1 exit /b 1
-for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_coop_contract_test link_world_authority_test link_native_bindings_test link_native_pins_test link_native_value_abi_test link_unity_bridge_test link_native_mine_entry_test link_authority_appearance_test link_native_construction_test link_authority_session_test link_damage_scope_test link_world_delta_test link_appearance_test link_input_ownership_test link_map_consent_test) do (
+for %%T in (link_net_test link_api_test link_protocol_test link_session_test link_coop_contract_test link_world_authority_test link_native_bindings_test link_native_pins_test link_native_value_abi_test link_unity_bridge_test link_native_mine_entry_test link_native_withdrawal_test link_authority_appearance_test link_native_construction_test link_authority_session_test link_damage_scope_test link_world_delta_test link_appearance_test link_input_ownership_test link_map_consent_test) do (
     cl %TASK_FLAGS% ..\tests\%%T.cpp /Fe:%%T.exe /link ws2_32.lib iphlpapi.lib
     if errorlevel 1 exit /b 1
 )
@@ -57,6 +57,8 @@ if not "%errorlevel%"=="0" exit /b 1
 link_unity_bridge_test.exe "%CD%\native-abi-fixture\GameAssembly.dll"
 if not "%errorlevel%"=="0" exit /b 1
 link_native_mine_entry_test.exe "%CD%\native-abi-fixture\GameAssembly.dll"
+if not "%errorlevel%"=="0" exit /b 1
+link_native_withdrawal_test.exe "%CD%\native-abi-fixture\GameAssembly.dll"
 if not "%errorlevel%"=="0" exit /b 1
 link_authority_appearance_test.exe
 if not "%errorlevel%"=="0" exit /b 1

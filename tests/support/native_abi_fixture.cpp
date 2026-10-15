@@ -25,7 +25,7 @@ FIXTURE_EXPORT const void* il2cpp_method_get_param(const void* method,unsigned i
 }
 FIXTURE_EXPORT const void* il2cpp_class_from_type(const void* type) {return type?static_cast<const AbiFixtureType*>(type)->klass:nullptr;}
 FIXTURE_EXPORT const void* il2cpp_class_get_field_from_name(const void* klass,const char* name) {
-    const auto* field=static_cast<const AbiFixtureClass*>(klass)->field;return field&&!std::strcmp(field->name,name)?field:nullptr;
+    for(auto* field=static_cast<const AbiFixtureClass*>(klass)->field;field;field=field->next)if(!std::strcmp(field->name,name))return field;return nullptr;
 }
 FIXTURE_EXPORT int il2cpp_field_get_flags(const void* field) {return static_cast<const AbiFixtureField*>(field)->flags;}
 FIXTURE_EXPORT const void* il2cpp_field_get_type(const void* field) {return &static_cast<const AbiFixtureField*>(field)->type;}

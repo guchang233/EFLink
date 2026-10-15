@@ -6,5 +6,5 @@ struct AbiFixtureClass {bool value;int bytes;unsigned alignment;const AbiFixture
 struct AbiFixtureType {const char* name;const AbiFixtureClass* klass=nullptr;};
 struct AbiFixtureMethod {const AbiFixtureClass* owner;const AbiFixtureMethod* implementation;unsigned flags,count;
     const char* name="get_type";AbiFixtureType returns{"System.Int32"};const AbiFixtureType* parameters[3]{};};
-struct AbiFixtureField {const char* name;AbiFixtureType type;int value;unsigned flags=0x10;};
+struct AbiFixtureField {const char* name;AbiFixtureType type;int value;unsigned flags=0x10;const AbiFixtureField* next=nullptr;};
 struct AbiFixtureObject {const AbiFixtureClass* klass;alignas(16) unsigned char data[16];};

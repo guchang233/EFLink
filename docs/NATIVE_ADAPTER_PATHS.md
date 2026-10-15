@@ -21,3 +21,5 @@
 调用桥的离线测试使用 `tests/support/native_abi_fixture.cpp` 自行编译的微型导出 DLL。测试仅在独立测试进程内按明确路径加载该夹具，不加载安装目录的 GameAssembly，也不安装到游戏。它验证元数据选择、抽象声明拒绝、实际实现派发、值尺寸和 GC 根清理；这不能代替真实游戏 ABI 或世界隔离验收。
 
 `.84` 的 `NativeMineEntry` 从 HostWorld 的根绑定解析操作者和资源，核对私有 cookie、当前原生资源编号；通过真实闭合 `ObjectPtr<Entity>` 的 `.ctor(Entity)` 构造引用，Mining 枚举值由实际元数据读取，最终调用 `NatureResourceManager.DoOperation`。没有猜测泛型值偏移、写耐久或伪造攻击消息。Host 签发的不可复制许可只允许一次调用，并在原生参数构造之后重新检查成员、场景、原生归属及认证；RPC 和配置不能创建这种许可。函数返回 true 只表示调度接受，不能生成 Witness。生产候选未实现原生回调归属、客机对象创建/隔离/应用及个人恢复，也没有认证；不会因为接入 Session 自动开放。
+
+`.86` 实现 `NativeEntityWithdrawal` 候选，调用原生 HideAllTypeOfEntity / RevertHideAllTypeOfEntity，只保留并撤销自己获得的句柄。掩码取自运行时枚举，管理器和 EntityDataStorage 由统一 GC 根保活；观察精确存储、分配计数器和句柄字典，不能用函数返回当成撤销证明。官方对同一存储的数据更新仍由原生游戏处理，没有旧值覆盖或账号结果补造。该入口需要编译适配器的隔离/恢复/双端认证，生产认证均为 false；World 的原生存储观察及卸载屏障已接入，入房流程尚未调用此片段。它只覆盖 Interactive、Enemy、Npc，不包含角色、技能、投射物及官方上报隔离，句柄退休也不证明个人世界完整恢复。完整适配仍缺，不开放共享操作。

@@ -58,19 +58,30 @@ struct InputFixture:Fixture {
     bool begin(const Ticket& ticket,const NativeDispatchPermit& permit) override {received=ticket.intent.input;return Fixture::begin(ticket,permit);}
 };
 struct ReentrantFixture:Fixture {
+    unsigned polls=0;
     std::function<void()> duringPoll,duringCancel,duringContext;
     NativeActorContext actorContext(const Object& actor) const override {
         auto& self=*const_cast<ReentrantFixture*>(this);auto callback=std::move(self.duringContext);
         if(callback)callback();return Fixture::actorContext(actor);
     }
     std::optional<Witness> poll(const Ticket& ticket) override {
-        auto callback=std::move(duringPoll);if(callback)callback();return Fixture::poll(ticket);
+        ++polls;auto callback=std::move(duringPoll);if(callback)callback();return Fixture::poll(ticket);
     }
     void cancel(const Ticket& ticket) noexcept override {
         Fixture::cancel(ticket);auto callback=std::move(duringCancel);if(callback)callback();
     }
 };
 int main() {
+    {
+        ReentrantFixture adapter;Host host;host.reset(scene(),"fixture-only");
+        host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});
+        host.bind(2,1,host.find("player","hero")->ref);host.resume(adapter);
+        Intent intent{scene(),2,1,1,1,1,1,host.find("player","hero")->ref,host.find("mineral","ore-12")->ref,"mine"};
+        const auto ticket=host.submit(intent.json(),2,adapter,10);const auto stamp=host.captureNativeStamp();host.observe("mineral",{mineral(9000)});
+        adapter.result=Witness{*ticket,10,20,1,mineral(9000).state,stamp};adapter.duringPoll=[&]{host.poll(11);};host.poll(11);
+        check(adapter.polls==1&&host.status()["results_confirmed"]==1,"nested native polling cannot recursively poll or consume the same callback twice");
+        host.reset();
+    }
     for(unsigned mode=0;mode<5;++mode) {
         ReentrantFixture adapter;Host host;host.reset(scene(),"fixture-only");
         host.observeFrame({{"player",{{"hero","player",{{"active",true}},10}}},{"mineral",{mineral()}}});

@@ -10,6 +10,7 @@
 #include "authority/native_construction_state.h"
 #include "authority/native_object_bindings.h"
 #include "authority/native_mine_entry.h"
+#include "authority/native_entity_withdrawal.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_metadata.h"
@@ -73,6 +74,7 @@ class World {
     worldauthority::NativeObjectBindings guestRoomBindings{worldauthority::NativeDomain::GuestRoom,&nativePins};
     std::string nativeVersion;
     worldauthority::NativeMineEntry nativeMine;
+    worldauthority::NativeEntityWithdrawal nativeEntityWithdrawal;
     // Compiled candidate adapter. No config/RPC can change its inherited false
     // execution, isolation, recovery or dual-client certificates.
     class GameAdapter final:public worldauthority::NativeAdapter {
@@ -359,6 +361,35 @@ class World {
             if(!self)throw std::runtime_error("native iterator boxed value unavailable");
         }
         BE_ResolvedMethodV1 methodValue{};methodValue.method_info=method;return api.call(methodValue,self);
+    }
+    // Observe the exact private lease in native storage. This is evidence of
+    // handle ownership/retirement only, never full world or account recovery.
+    worldauthority::NativeEntityWithdrawal::StorageObservation observeEntityWithdrawal(void* manager,std::uint32_t handle) {
+        if(!manager||staticObject("entityManager")!=manager)return {};
+        auto* storage=readField<void*>(manager,"EntityManager","m_dataStorage");if(!storage)return {};
+        eflink::unity::Api::TemporaryRoot storageRoot(runtime,storage);
+        const auto counter=readField<std::uint32_t>(storage,"EntityManager/EntityDataStorage","m_handleCounter");
+        auto* dictionary=readField<void*>(storage,"EntityManager/EntityDataStorage","m_hideEntityByTypeHandleDict");
+        if(!dictionary)throw std::runtime_error("native entity lease dictionary unavailable");
+        bool present=false;
+        if(handle) {
+            eflink::unity::Api::TemporaryRoot dictionaryRoot(runtime,dictionary);
+            auto* boxed=collection(dictionary,"ContainsKey",{&handle});
+            if(!boxed)throw std::runtime_error("native entity lease membership unavailable");
+            eflink::unity::Api::TemporaryRoot valueRoot(runtime,boxed);
+            authority::requireNativeValue<bool>(eflink::unity::Api::valueShape(symbol<const void*(*)(void*)>("il2cpp_object_get_class")(boxed)));
+            auto* data=runtime->object_unbox(runtime->context,boxed);if(!data)throw std::runtime_error("native entity lease membership value unavailable");
+            std::memcpy(&present,data,sizeof present);
+        }
+        if(staticObject("entityManager")!=manager||readField<void*>(manager,"EntityManager","m_dataStorage")!=storage)return {};
+        return {reinterpret_cast<std::uintptr_t>(storage),counter,present};
+    }
+    bool withdrawPersonalEntitySlice(const worldauthority::NativeAdapter& adapter) {
+        // Only the compiled adapter may eventually request this slice. It is
+        // not routed from room messages, config or diagnostic commands.
+        if(!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified())return false;
+        bindNativePins();nativeEntityWithdrawal.bind(runtime,nativeVersion,nativePins);
+        return nativeEntityWithdrawal.acquire(adapter,staticObject("entityManager"),[this](void* manager,std::uint32_t handle){return observeEntityWithdrawal(manager,handle);});
     }
     static std::string operatorTemplate(const std::string& path) {
         return characterTemplate(path);
@@ -958,6 +989,9 @@ public:
     }
     // Game thread only.
     void clear() {
+        if(nativeEntityWithdrawal.retained()&&(!nativeEntityWithdrawal.retire(staticObject("entityManager"),
+                [this](void* manager,std::uint32_t handle){return observeEntityWithdrawal(manager,handle);})||nativeEntityWithdrawal.retained()))
+            throw std::runtime_error("native personal entity lease retained; shutdown must wait for restoration");
         clearResources();
         clearNativeCensus();
         nativeObjectBindings.clear();
@@ -982,6 +1016,7 @@ public:
             {"native_candidate",{{"adapter_attached",nativeAdapterAttached},{"path",nativeAdapter.path()},{"mine_entry_implemented",true},
                 {"contracts_resolved",nativeMine.contractsResolved()},{"native_dispatch_calls",nativeMine.calls()},{"native_dispatch_accepted",nativeMine.acceptedCalls()},
                 {"execution_verified",false},{"native_witness_bridge",false},{"isolation_verified",false},{"recovery_verified",false},{"full_sync_verified",false}}},
+            {"native_entity_withdrawal",nativeEntityWithdrawal.status()},
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage","metadata_only"},{"lookup_ready",false},{"effects_replayed",false}}},
