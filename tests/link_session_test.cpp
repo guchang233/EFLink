@@ -66,7 +66,7 @@ int run() {
         "a heartbeat cannot repair a missing baseline or reopen operations");
     censusEnabled=true;check(h.publishAuthority(host,true)&&wait([&]{tick();return g.sharedObjects()==before;}),
         "complete native baseline repairs a missing authoritative version");
-    for(const char* kind:{"entry_prepare","entry_result","player_cast","skill_intent","hit_claim","hit","player_hit","enemy_state","enemy_cast","resource_baseline","character_growth","character_appearance","location","teleport_request","teleport","teleport_error"}) {
+    for(const char* kind:{"entry_prepare","entry_result","player_cast","skill_intent","hit_claim","hit","player_hit","enemy_state","enemy_cast","resource_baseline","character_growth","character_appearance","presentation","location","teleport_request","teleport","teleport_error"}) {
         const auto hr=h.status()["rejected"].get<std::uint64_t>(),gr=g.status()["rejected"].get<std::uint64_t>();
         Json packet={{"kind",kind},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"active",true},{"amount",999},{"epoch",h.generation()}};
         raw(guest,packet,1);raw(host,packet,2);
@@ -75,11 +75,8 @@ int run() {
     }
     bool teleportRejected=false;try {g.requestTeleport(guest,1);}catch(...) {teleportRejected=true;}
     check(teleportRejected,"V2 teleport cannot issue an unverified native travel command");
-    Json member={{"slot",0},{"life",1ull},{"controlled",true},{"model",info.modelPath},{"flags",1},{"position",{0,0,0}},{"rotation",{0,0,0,1}},
-        {"root",{0,0,0}},{"bones",Json::array()},{"names",Json::array()},{"growth",{{"template","chr_test"},{"level",50},{"break_stage",2},{"potential",0}}},
-        {"appearance",{{"template","chr_test"},{"weapon_template",8002}}}};
-    const Json display={{"sample_time",nowMs()},{"members",Json::array({member})},{"effects",Json::array()}};
-    check(g.publishPresentation(guest,display)&&wait([&]{tick();return !h.presentation(2).is_null();})&&!h.canAct(2),"display metadata stays read-only and does not recreate actors");
+    check(h.status()["presentation"]["parallel_relay_removed"]==true&&g.status()["presentation"]["parallel_relay_removed"]==true,
+        "native appearances have no independent guest presentation relay");
     auto fakeScene=h.snapshot();fakeScene["players"][0]["native_bound"]=true;
     rejected=g.status()["rejected"].get<std::uint64_t>();
     raw(host,{{"kind","snapshot"},{"schema",coopWorldSchema},{"room",host.snapshot().roomId},{"epoch",h.generation()},{"revision",h.worldRevision()+1000},{"world",fakeScene}},2);

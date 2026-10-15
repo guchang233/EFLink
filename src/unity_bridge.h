@@ -94,9 +94,9 @@ public:
     template<class T> T value(BE_ResolvedMethodV1 method,void* object=nullptr,std::initializer_list<void*> args={}) {
         auto* result=call(method,object,args);if(!result)throw std::runtime_error("missing boxed bridge result");
         TemporaryRoot root(api,result);
-        auto classOf=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"),"il2cpp_object_get_class"));
-        if(!classOf)throw std::runtime_error("boxed bridge result type unavailable");
-        authority::requireNativeValue<T>(valueShape(classOf(result)));
+        auto boxedClassOf=reinterpret_cast<const void*(*)(void*)>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"),"il2cpp_object_get_class"));
+        if(!boxedClassOf)throw std::runtime_error("boxed bridge result type unavailable");
+        authority::requireNativeValue<T>(valueShape(boxedClassOf(result)));
         auto* raw=api->object_unbox(api->context,result);
         if(!raw) throw std::runtime_error("missing boxed bridge result data");T output;std::memcpy(&output,raw,sizeof(T));return output;
     }

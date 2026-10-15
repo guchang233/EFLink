@@ -51,7 +51,13 @@ inline bool validState(const Json& state) {
         if(k=="position") {if(!vector(v))return false;}
         else if(k=="rotation") {if(!vector(v,4))return false;}
         else if(k=="template"||k=="phase"||k=="animation") {if(!v.is_string()||v.get_ref<const std::string&>().size()>256)return false;}
-        else if(k=="active"||k=="dead"||k=="collected"||k=="downed") {if(!v.is_boolean())return false;}
+        else if(k=="active"||k=="dead"||k=="collected"||k=="downed"||k=="controlled") {if(!v.is_boolean())return false;}
+        else if(k=="weapon_template") {
+            if(!v.is_string()||v.get_ref<const std::string&>().size()>256||
+               v.get_ref<const std::string&>().find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos)return false;
+        } else if(k=="party_slot"||k=="weapon_state") {
+            if(!v.is_number_integer()||v.get<std::int64_t>()<0||v.get<std::uint64_t>()>(k=="party_slot"?3u:5u))return false;
+        }
         else if(k=="hp"||k=="max_hp"||k=="poise"||k=="max_poise") {
             if(!v.is_number()||!std::isfinite(v.get<double>())||v.get<double>()<0||v.get<double>()>1e12)return false;
         } else if(k=="hp_ratio"||k=="max_hp_ratio"||k=="stage"||k=="wave") {
@@ -70,6 +76,11 @@ inline bool validState(const Json& state) {
             (std::min)(1e-8,capacity*1e-8)+capacity*std::numeric_limits<double>::epsilon()*8;
         if(value>capacity&&value-capacity>tolerance)return false;
     }
+    return true;
+}
+inline bool validStateForKind(const std::string& kind,const Json& state) {
+    if(!knownKind(kind)||!validState(state))return false;
+    if(kind!="player")for(const char* name:{"party_slot","controlled","weapon_template","weapon_state"})if(state.contains(name))return false;
     return true;
 }
 struct Scope {
@@ -131,7 +142,7 @@ struct Object {
             Ref::parse(j.at("ref"));
             return exactFields(j,{"ref","key","kind","version","state","relations"})&&positive(j.at("version"))&&j.at("key").is_string()&&
                 !j.at("key").get_ref<const std::string&>().empty()&&j.at("key").get_ref<const std::string&>().size()<=160&&
-                knownKind(j.at("kind").get<std::string>())&&validState(j.at("state"))&&validRelations(j.at("relations"));
+                validStateForKind(j.at("kind").get<std::string>(),j.at("state"))&&validRelations(j.at("relations"));
         }catch(...) {return false;}
     }
 };
@@ -374,7 +385,7 @@ public:
             if(!knownKind(kind)||observations.size()>maxObjects)throw std::runtime_error("unavailable native census");
             std::set<std::string> seen;
             for(const auto& v:observations) {
-                if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!v.nativeLife||!validState(v.state)||
+                if(v.kind!=kind||v.key.empty()||v.key.size()>160||!v.cookie||!v.nativeLife||!validStateForKind(kind,v.state)||
                    v.relations.size()>6||!seen.insert(index(kind,v.key)).second)throw std::runtime_error("invalid or ambiguous native identity");
                 for(const auto& [name,target]:v.relations)if(!relationName(name)||!knownKind(target.kind)||target.key.empty()||target.key.size()>160||!target.cookie||!target.nativeLife)
                     throw std::runtime_error("invalid native relation anchor");

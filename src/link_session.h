@@ -4,10 +4,7 @@
 #include "link_net.h"
 #include "link_coop_contract.h"
 #include "link_world_delta.h"
-#include "link_profile.h"
 #include "link_version.h"
-#include "link_presentation.h"
-#include "link_presentation_codec.h"
 #include "authority/world_authority.h"
 #include <optional>
 
@@ -53,10 +50,6 @@ class Session {
     std::uint64_t baselinesSent=0,deltasSent=0,wireBytes=0,congestionSkipped=0;
     struct Compatibility {bool compatible=false;std::uint64_t seen=0;std::string build;};
     std::map<std::uint16_t,Compatibility> compatibility;std::uint64_t lastHello=0;std::string adapterVersion;
-    struct Presentation {Json data;std::uint64_t seen=0;};
-    std::map<std::uint16_t,Presentation> presentations;
-    std::atomic<std::uint64_t> presentationCoalesced{0};
-    std::uint64_t presentationSequence=0,lastPresentation=0,presentationReceived=0,presentationSkipped=0,presentationRawBytes=0,presentationWireBytes=0,presentationPacked=0;
     std::uint64_t rejected=0,received=0,legacyRejected=0;std::string error;
     worldauthority::Host nativeAuthority;worldauthority::Replica nativeReplica;worldauthority::WorldHandoff nativeHandoff;
     worldauthority::NativeAdapter* nativeAdapter=nullptr;
@@ -85,12 +78,9 @@ class Session {
     }
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
         body["schema"]=coopWorldSchema;body["room"]=room;
-        const auto plain=body.dump();const bool presentation=body.value("kind",Json{})=="presentation";
-        const auto text=presentation?packPresentation(plain,proto::kMaxReliableData):plain;
+        const auto text=body.dump();
         if(text.size()>proto::kMaxReliableData) {error="世界消息超过网络上限";return false;}
-        const bool sent=net.sendData(worldChannel,to,text.data(),text.size(),true);
-        if(sent&&presentation) {presentationRawBytes+=plain.size();presentationWireBytes+=text.size();if(packedPresentation(text.data(),text.size()))++presentationPacked;}
-        return sent;
+        return net.sendData(worldChannel,to,text.data(),text.size(),true);
     }
     const PeerView* find(const Snapshot& s,std::uint16_t id) const {for(const auto& p:s.peers)if(p.id==id)return &p;return nullptr;}
     bool fresh(const PeerView* p) const {return p&&p->hasInfo&&!p->states.empty()&&(p->states.back().state.flags&proto::StateValid)&&nowMs()-p->states.back().receivedMs<3000;}
@@ -102,27 +92,16 @@ class Session {
     }
     static bool retired(const std::string& kind) {
         static const std::set<std::string> kinds={"entry_prepare","entry_result","player_cast","skill_intent","hit_claim","hit","player_hit",
-            "enemy_state","enemy_cast","resource_baseline","character_growth","character_appearance","location","teleport_request","teleport","teleport_error"};
+            "enemy_state","enemy_cast","resource_baseline","character_growth","character_appearance","presentation","location","teleport_request","teleport","teleport_error"};
         return kinds.contains(kind);
     }
 public:
     bool followHost=true,combat=true;
     void receive(std::uint16_t from,const void* data,std::size_t size) {
         if(!data||!size||size>proto::kMaxReliableData)return;
-        const bool packed=packedPresentation(data,size);std::optional<std::string> decoded;
-        if(packed) {decoded=unpackPresentation(data,size,proto::kMaxReliableData);if(!decoded)return;data=decoded->data();size=decoded->size();}
         auto parsed=Json::parse(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size,nullptr,false);
-        if(parsed.is_discarded()||!parsed.is_object()||(packed&&parsed.value("kind",Json{})!="presentation"))return;
+        if(parsed.is_discarded()||!parsed.is_object())return;
         std::lock_guard lock(inboxMutex);
-        if(parsed.value("kind",Json{})=="presentation"&&parsed.contains("seq")&&parsed.at("seq").is_number_unsigned()) {
-            for(auto it=inbox.begin();it!=inbox.end();) {
-                if(it->from==from&&it->body.value("kind",Json{})=="presentation"&&it->body.value("room",Json{})==parsed.value("room",Json{})&&
-                   it->body.value("epoch",Json{})==parsed.value("epoch",Json{})&&it->body.value("peer",Json{})==parsed.value("peer",Json{})&&
-                   it->body.contains("seq")&&it->body.at("seq").is_number_unsigned()&&it->body.at("seq").get<std::uint64_t>()<parsed.at("seq").get<std::uint64_t>()) {
-                    inboxBytes-=it->size;it=inbox.erase(it);++presentationCoalesced;
-                }else ++it;
-            }
-        }
         if(inbox.size()>=128||inboxBytes+size>4u*1024*1024)return;
         inbox.push_back({from,std::move(parsed),size});inboxBytes+=size;
     }
@@ -131,11 +110,10 @@ public:
         if(s.roomId!=room||s.role!=role) {
             room=s.roomId;role=s.role;epoch=revision=seenAt=lastPublish=0;world=Json::object();sentWorld=nullptr;
             lastBaseline=sentRevision=0;baselineMissing=publishBlocked=sceneResetPending=false;
-            presentations.clear();presentationSequence=lastPresentation=0;compatibility.clear();lastHello=0;error.clear();
+            compatibility.clear();lastHello=0;error.clear();
             resetSharedObjects();worldIncarnation=role==Role::Host?worldauthority::newWorldIncarnation():std::string{};
         }
         for(auto it=compatibility.begin();it!=compatibility.end();)if(!find(s,it->first))it=compatibility.erase(it);else ++it;
-        for(auto it=presentations.begin();it!=presentations.end();)if(!find(s,it->first))it=presentations.erase(it);else ++it;
         if((role==Role::Host||role==Role::Client)&&(!lastHello||nowMs()-lastHello>=1000)) {
             if(send(net,{{"kind","coop_hello"},{"world_schema",coopWorldSchema},{"contract_revision",coopContractRevision},{"contract",coopContractName},
                 {"build",EFLINK_BUILD_ID},{"game_version",adapterVersion},{"world_incarnation",worldIncarnation}},role==Role::Host?proto::kEveryone:proto::kHostId))lastHello=nowMs();
@@ -166,7 +144,7 @@ public:
                     try {candidate=applyWorldDelta(world,b.at("delta"));}catch(...) {baselineMissing=true;nativeHandoff.withdraw();++rejected;continue;}
                 }else candidate=b.at("world");
                 if(!validWorld(candidate,true)) {if(kind=="snapshot_delta") {baselineMissing=true;nativeHandoff.withdraw();}++rejected;continue;}
-                if(e!=epoch) {resetSharedObjects();presentations.clear();}
+                if(e!=epoch)resetSharedObjects();
                 epoch=e;revision=r;world=std::move(candidate);seenAt=nowMs();baselineMissing=false;++received;
             }else if(kind=="authority_baseline"||kind=="authority_delta"||kind=="authority_heartbeat") {
                 if(b.size()!=7||role!=Role::Client||packet.from!=proto::kHostId||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(proto::kHostId)||
@@ -199,18 +177,6 @@ public:
                 if(b.size()!=4||role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(packet.from)||!nativeAdapter||!nativeMembers.contains(packet.from)||
                    !nativeMemberPresent(s,packet.from)||
                    !authoritySeen||nowMs()-authoritySeen>1500||!nativeAuthority.resume(*nativeAdapter)||!nativeAuthority.submit(b.at("intent"),packet.from,*nativeAdapter,nowMs()))++rejected;
-            }else if(kind=="presentation") {
-                const auto owner=b.at("peer").get<std::uint16_t>();const auto* p=find(s,owner);
-                if(!ready()||!localSceneOperational()||!protocolCompatible(role==Role::Host?packet.from:proto::kHostId)||
-                   (role==Role::Host?packet.from!=owner:role!=Role::Client||packet.from!=proto::kHostId)||owner==s.localId||owner>=8192||!fresh(p)||
-                   b.at("epoch")!=epoch||b.at("map")!=world.at("map")||b.at("level")!=world.at("level")||
-                   p->info.mapId!=world.at("map").get<std::string>()||p->info.levelId!=world.at("level").get<std::string>()||!validPresentation(b)) {++rejected;continue;}
-                auto& prior=presentations[owner];
-                if(!prior.data.empty()&&prior.data.value("epoch",std::uint64_t{})==epoch&&b.at("seq").get<std::uint64_t>()<=prior.data.at("seq").get<std::uint64_t>()) {++rejected;continue;}
-                bool valid=true;for(const auto& m:b.at("members"))if(!validCharacterGrowth(m.at("growth"),m.at("model").get<std::string>())||
-                    (!m.at("appearance").is_null()&&!validCharacterAppearance(m.at("appearance"),m.at("model").get<std::string>())))valid=false;
-                if(!valid) {++rejected;continue;}
-                prior={b,nowMs()};++presentationReceived;if(role==Role::Host&&net.transmitPressure()<64u*1024)send(net,b);
             }else ++rejected;
         }catch(...) {++rejected;}
         updateNativeAuthority(net,s);
@@ -219,7 +185,7 @@ public:
         if(role!=Role::Host||!localSceneReady||!validWorld(value))return false;
         if(sceneResetPending||world.empty()||world.value("map",std::string{})!=value.at("map").get<std::string>()||world.value("level",std::string{})!=value.at("level").get<std::string>()) {
             if(epoch==UINT64_MAX)throw std::runtime_error("scene generation exhausted");
-            ++epoch;revision=0;presentations.clear();sentWorld=nullptr;lastBaseline=sentRevision=0;sceneResetPending=false;
+            ++epoch;revision=0;sentWorld=nullptr;lastBaseline=sentRevision=0;sceneResetPending=false;
             resetSharedObjects();nativeAuthority.reset({room,worldIncarnation,epoch},adapterVersion);
         }
         value["players"]=roomRoster(net.snapshot(),value);if(!validWorld(value,true))return false;
@@ -239,16 +205,6 @@ public:
         if(baseline) {lastBaseline=nowMs();++baselinesSent;}else ++deltasSent;return true;
     }
     void requestTeleport(Net&,std::uint16_t) {throw std::runtime_error("共享世界传送原生隔离与恢复适配未验收");}
-    bool publishPresentation(Net& net,Json value) {
-        const auto s=net.snapshot();const auto now=nowMs();
-        if(!ready()||!localSceneOperational()||now-lastPresentation<50)return false;
-        if(net.transmitPressure()>64u*1024){++presentationSkipped;return false;}
-        value.update(Json{{"kind","presentation"},{"version",1},{"peer",s.localId},{"epoch",epoch},
-            {"map",world.at("map")},{"level",world.at("level")},{"seq",++presentationSequence}});
-        if(!validPresentation(value))return false;
-        if(send(net,std::move(value),role==Role::Host?proto::kEveryone:proto::kHostId)){lastPresentation=now;return true;}
-        return false;
-    }
     bool observeNativeObjects(const std::string& kind,const std::vector<worldauthority::Observation>& values) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
         nativeAuthority.observe(kind,values);authoritySeen=nowMs();return true;
@@ -378,10 +334,6 @@ private:
         }else {nativeHandoff.withdraw();if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Restoring)nativeHandoff.restore();}
     }
 public:
-    Json presentation(std::uint16_t peer) const {
-        auto it=presentations.find(peer);if(it==presentations.end()||nowMs()-it->second.seen>500||it->second.data.value("epoch",std::uint64_t{})!=epoch)return Json{};
-        auto result=it->second.data;result["received"]=it->second.seen;return result;
-    }
     bool ready() const {return !sceneResetPending&&epoch&&!world.empty()&&nowMs()-seenAt<3000;}
     bool protocolCompatible(std::uint16_t peer) const {auto it=compatibility.find(peer);return it!=compatibility.end()&&it->second.compatible&&nowMs()-it->second.seen<=3500;}
     void setAdapterVersion(std::string version) {
@@ -426,8 +378,7 @@ public:
             {"map",world.value("map",std::string{})},{"level",world.value("level",std::string{})},{"entities",sharedObjects().size()},{"follow_host",followHost},{"combat",combat},
             {"appearance_profiles",0},{"appearances",Json::array()},{"appearances_received",0},
             {"transport",{{"baselines_sent",baselinesSent},{"deltas_sent",deltasSent},{"world_bytes",wireBytes},{"baseline_missing",baselineMissing},{"publish_blocked",publishBlocked},{"congestion_skipped",congestionSkipped}}},
-            {"presentation",{{"received",presentationReceived},{"raw_bytes",presentationRawBytes},{"wire_bytes",presentationWireBytes},{"compressed_frames",presentationPacked},
-                {"congestion_skipped",presentationSkipped},{"coalesced",presentationCoalesced.load()},{"peers",presentations.size()},{"read_only",true},{"native_skill_replay",false}}},
+            {"presentation",{{"source","unified_host_object_ledger"},{"parallel_relay_removed",true},{"native_skill_replay",false}}},
             {"player_casts",{{"accepted",0},{"active",Json::array()},{"legacy_removed",true},{"replay_enabled",false}}},
             {"hit_claims",{{"accepted",0},{"legacy_removed",true},{"legacy_packets_rejected",legacyRejected},{"native_verification_required",true}}},
             {"world_authority",{{"host",nativeAuthority.status()},{"observed",sharedObjects().size()},{"replica_revision",nativeReplica.version()},{"handoff",nativeHandoff.status()},

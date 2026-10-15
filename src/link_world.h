@@ -231,6 +231,20 @@ class World {
         if(!info) throw std::runtime_error(std::string("collection method unavailable: ")+name);
         BE_ResolvedMethodV1 method{};method.method_info=info;return api.call(method,object,args);
     }
+    // Native collection iterators can be boxed structs. This helper belongs to
+    // census traversal, independently of any effect/model presentation path.
+    void* genericValueCall(void* object,const char* name) {
+        if(!object)throw std::runtime_error("native iterator object unavailable");
+        auto klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(object);
+        auto* method=symbol<const void*(*)(const void*,const char*,int)>("il2cpp_class_get_method_from_name")(klass,name,0);
+        if(!method)throw std::runtime_error(std::string("generic iterator method unavailable: ")+name);
+        const auto shape=eflink::unity::Api::valueShape(klass);void* self=object;
+        if(shape.isValue) {
+            authority::requireNativeValueShape(shape);self=runtime->object_unbox(runtime->context,object);
+            if(!self)throw std::runtime_error("native iterator boxed value unavailable");
+        }
+        BE_ResolvedMethodV1 methodValue{};methodValue.method_info=method;return api.call(methodValue,self);
+    }
     static std::string operatorTemplate(const std::string& path) {
         return characterTemplate(path);
     }
@@ -361,7 +375,6 @@ private:
         mapHash=mapId.empty()?0:proto::fnv32(mapId);
     }
     #include "link_world_squad.h"
-    #include "link_world_presentation.h"
     #include "link_world_resources.h"
     #include "link_world_census.h"
     void sample(Net& net) {
@@ -815,7 +828,6 @@ public:
             try {replication(net,link);}catch(const std::exception& e) {replicationError=e.what();}
             perf.replicationMs=elapsedMs(started);
         }
-        updatePresentation(net,link);
         updateResources(net,link);
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
@@ -827,7 +839,6 @@ public:
     }
     // Game thread only.
     void clear() {
-        clearPresentation();
         clearResources();
         clearNativeCensus();
         personalObjectBindings.clear();guestRoomBindings.clear();
@@ -850,10 +861,8 @@ public:
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage","metadata_only"},{"lookup_ready",false},{"effects_replayed",false}}},
-            {"presentation",{{"local_members",sampledParty},{"local_effects",sampledEffects},{"active_effects",0},
-                {"native_combat",nativeCombatReadback},{"local_materials",sampledMaterials},{"native_materials",materialReadback},
-                {"party_error",partySamplingError},{"effect_error",effectSamplingError},{"material_error",materialError},
-                {"error",presentationError},{"native_skill_replay",false},{"full_sync_verified",false}}},
+            {"presentation",{{"source","unified_host_object_ledger"},{"parallel_relay_removed",true},
+                {"native_skill_replay",false},{"full_sync_verified",false}}},
             {"resources",{{"local",nativeResourceCensus},{"scans",resourceScans},{"unadapted_native_objects",resourceUnknown},
                 {"age_ms",lastResourceSuccess?nowMs()-lastResourceSuccess:0},{"error",resourceError},
                 {"native_operations_verified",false},{"replica_recovery_verified",false},{"full_sync_verified",false}}},

@@ -60,13 +60,14 @@ int run() {
     HostOptions options;options.port=48841;host.host(options);
     check(wait([&]{return host.currentRole()==Role::Host;}),"authority host starts");
     guest.join("127.0.0.1:48841","");check(wait([&]{return guest.currentRole()==Role::Client;}),"authority guest joins");
-    bool graphEnabled=false;
+    bool graphEnabled=false;std::string observedWeapon="wpn_fixture";unsigned observedWeaponState=1;
     auto tick=[&] {
         pose.timeMs=std::uint32_t(nowMs());host.setLocalState(pose);guest.setLocalState(pose);
         h.update(host);g.update(guest);h.publish(host,scene);
         if(h.ready()) {
             std::map<std::string,std::vector<Observation>> frame={
-                {"player",{{"guest-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},3},
+                {"player",{{"guest-character","player",{{"template","operator"},{"hp",100},{"max_hp",100},{"party_slot",0},
+                            {"controlled",true},{"weapon_template",observedWeapon},{"weapon_state",observedWeaponState}},3},
                            {"host-character","player",{{"template","operator"},{"hp",100},{"max_hp",100}},7}}},
                 {"mineral",{{"ore","mineral",{{"template","ore"},{"hp_ratio",ha.begins?9000:10000},{"max_hp_ratio",10000},{"collected",false}},4}}}};
             if(graphEnabled) {
@@ -91,6 +92,10 @@ int run() {
         else if(object.at("key")=="host-character")hostActor=ref;
         else if(object.at("kind")=="mineral")target=ref;
     }
+    observedWeapon="wpn_changed";observedWeaponState=2;
+    check(wait([&]{tick();for(const auto& object:g.sharedObjects())if(object.at("key")=="guest-character")
+              return object.at("ref")==actor.json()&&object.at("state").at("weapon_template")==observedWeapon&&object.at("state").at("weapon_state")==2;
+              return false;}),"host-observed equipment changes cross the canonical object delta instead of a guest presentation relay");
     check(!g.submitNativeIntent(guest,actor,target,"mine",1,1),"guest cannot submit before a host party grant");
     ha.certified=false;
     check(!h.grantNativeParty(host,2,9,{actor}),"unverified native adapter cannot open execution through transport");
