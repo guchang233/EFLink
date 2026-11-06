@@ -109,8 +109,9 @@ struct Ui {
     std::string toast;std::uint64_t toastAt=0;bool toastError=false;
     int page=0;bool open=false,closeRequested=false,initialized=false,leaveConfirm=false,kickPending=false;int kickId=-1;
     char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
-    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,squad=true,replay=true,outline=true,markers=true,follow=true,combat=true;
+    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,squad=true,replay=true,outline=true,markers=true,follow=true,combat=true,pvp=false,pvpRevive=true;float pvpScale=1.f;
     std::uint64_t lastChat=0,lastMapPrompt=0;
+    bool nameEdited=false; // the display name field was edited by the player
     // Chat on the HUD: recent lines stay for a while; Enter opens a one-line input.
     bool chatting=false,chatFocus=false,chatPrimed=false;char hudChat[1001]{};std::map<std::uint64_t,std::uint64_t> chatSeen;
     void say(std::string text,bool error) {toast=std::move(text);toastAt=now();toastError=error;}
@@ -120,12 +121,13 @@ struct Ui {
         initialized=true;copyText(name,sizeof name,str(state,"name"));
         const auto c=state.value("configuration",json::object());copyText(room,sizeof room,str(c,"room_name"));
         port=c.value("port",47615);limit=c.value("max_players",8);key=c.value("menu_key",kDefaultMenuKey);
-        remote=c.value("show_remote_players",true);squad=c.value("show_remote_squad",true);replay=c.value("replay_skills",true);outline=c.value("outline_teammates",true);markers=c.value("show_player_markers",true);
+        remote=c.value("show_remote_players",true);squad=c.value("show_remote_squad",true);replay=c.value("replay_skills",true);outline=c.value("outline_teammates",true);pvp=c.value("room_pvp",false);pvpScale=c.value("room_pvp_scale",1.f);pvpRevive=c.value("room_pvp_revive",true);markers=c.value("show_player_markers",true);
         follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);
     }
     void poll(bool menuOpen) {
         const auto t=now();
-        if(ready(statusCall)) {auto r=statusCall.get();if(r.contains("role")) {state=std::move(r);init();key=state.value("configuration",json::object()).value("menu_key",key);}}
+        if(ready(statusCall)) {auto r=statusCall.get();if(r.contains("role")) {state=std::move(r);init();key=state.value("configuration",json::object()).value("menu_key",key);
+            if(!nameEdited) copyText(name,sizeof name,str(state,"name"));}}
         else if(statusCall.valid()&&t-statusSent>5000) statusCall={}; // the game thread was busy (loading); ask again
         if(!statusCall.valid()&&t-statusSent>=(menuOpen?250u:500u)) {statusSent=t;statusCall=post({{"action","status"}});}
         if(ready(hudCall)) {auto r=hudCall.get();if(r.contains("markers")) hud=std::move(r);}
@@ -144,8 +146,10 @@ struct Ui {
     std::string role() const {return str(state,"role","offline");}
     bool online() const {const auto r=role();return r=="host"||r=="client";}
     void saveSettings() {
-        act({{"action","settings"},{"configuration",{{"player_name",name},{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},
-            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"outline_teammates",outline},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});
+        json patch={{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},
+            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"outline_teammates",outline},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}};
+        if(nameEdited) {patch["player_name"]=name;nameEdited=false;}
+        act({{"action","settings"},{"configuration",patch}});
         say("设置已保存",false);
     }
     // Display and co-op switches take effect immediately (and are saved).
@@ -265,7 +269,7 @@ struct Ui {
         const float line=ImGui::GetTextLineHeight(),width=240,x=size.x-width-20;float y=size.y*.3f;
         const auto accent=color::u32(color::accent),white=color::u32(color::text),dim=color::u32(color::dim),ink=color::u32(color::ink);
         auto roomName=str(state.value("room",json::object()),"name");if(roomName.empty()) roomName=role()=="host"?"我的房间":"房间";
-        const std::string head="EF LINK // "+roomName;
+        const std::string head="EF LINK // "+roomName+(state.value("pvp",json::object()).value("active",false)?"  // PVP":"");
         d->AddRectFilled({x,y+2},{x+3,y+line-2},accent);
         shadowText(d,{x+9,y},accent,head.c_str());
         if(role()=="client") {char rtt[32];std::snprintf(rtt,sizeof rtt,"%ums",state.value("rtt_ms",0u));shadowText(d,{x+width-ImGui::CalcTextSize(rtt).x,y},dim,rtt);}
@@ -329,10 +333,19 @@ struct Ui {
             label("房间密码（可留空）");ImGui::SetNextItemWidth(-1);ImGui::InputText("##hostpw",hostPassword,sizeof hostPassword,ImGuiInputTextFlags_Password);
             label("人数上限");ImGui::SetNextItemWidth(-1);ImGui::SliderInt("##limit",&limit,2,16);
             label("端口");ImGui::SetNextItemWidth(-1);ImGui::InputInt("##port",&port,0);port=(std::clamp)(port,1024,65535);
+            ImGui::Checkbox("允许 PVP（玩家之间可以互相锁定、攻击）",&pvp);
+            if(pvp) {
+                ImGui::Indent();
+                label("玩家之间的伤害倍率");ImGui::SetNextItemWidth(-1);ImGui::SliderFloat("##pvpscale",&pvpScale,.1f,5.f,"%.1f 倍");
+                int mode=pvpRevive?0:1;label("被击败时");
+                if(ImGui::RadioButton("回满生命",mode==0)) pvpRevive=true;
+                ImGui::SameLine();if(ImGui::RadioButton("真正倒下",mode==1)) pvpRevive=false;
+                ImGui::Unindent();
+            }
             ImGui::Dummy({0,4});
             if(accentButton("开放房间",{-1,0})) {
                 saveSettings();
-                act({{"action","host"},{"room_name",room},{"password",hostPassword},{"port",port},{"max_players",limit}});hostPassword[0]=0;
+                act({{"action","host"},{"room_name",room},{"password",hostPassword},{"port",port},{"max_players",limit},{"pvp",pvp},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive}});hostPassword[0]=0;
             }
             endCard();
             ImGui::EndGroup();ImGui::SameLine(0,14);
@@ -378,7 +391,26 @@ struct Ui {
         ImGui::SameLine();chip(r=="host"?"房主":r=="client"?"房客":"连接中",r=="host"?color::accent:color::ok);
         ImGui::SameLine();chip((std::to_string(state.value("peers",json::array()).size())+" / "+std::to_string(roomInfo.value("max_players",0))+" 人").c_str(),color::dim);
         if(r=="client") {ImGui::SameLine();chip((std::to_string(state.value("rtt_ms",0u))+" ms").c_str(),color::info);}
+        const auto pvpState=state.value("pvp",json::object());
+        if(pvpState.value("active",false)) {
+            ImGui::SameLine();chip("PVP",color::bad);
+            char rule[64];std::snprintf(rule,sizeof rule,"伤害 %.1f 倍 · %s",pvpState.value("scale",1.0),pvpState.value("revive",true)?"击败后回满":"会真正倒下");
+            ImGui::SameLine();ImGui::TextDisabled("%s",rule);
+        }
         if(r=="host") {
+            ImGui::Spacing();ImGui::SeparatorText("PVP");
+            bool roomPvp=pvpState.value("allowed",false);
+            if(ImGui::Checkbox("允许 PVP（玩家之间可以互相锁定、攻击）",&roomPvp)) act({{"action","room_pvp"},{"enabled",roomPvp}});
+            ImGui::BeginDisabled(!roomPvp);
+            label("玩家之间的伤害倍率");ImGui::SetNextItemWidth(260);
+            if(!ImGui::IsAnyItemActive()) pvpScale=float(pvpState.value("scale",1.0));
+            ImGui::SliderFloat("##roompvpscale",&pvpScale,.1f,5.f,"%.1f 倍");
+            if(ImGui::IsItemDeactivatedAfterEdit()) act({{"action","room_pvp"},{"enabled",roomPvp},{"scale",pvpScale}});
+            int mode=pvpState.value("revive",true)?0:1;
+            label("被击败时");
+            if(ImGui::RadioButton("回满生命（打到 1 点判负，3 秒无敌后回满）",mode==0)) act({{"action","room_pvp"},{"enabled",roomPvp},{"revive",true}});
+            if(ImGui::RadioButton("真正倒下（生命归零的干员按游戏规则倒下）",mode==1)) act({{"action","room_pvp"},{"enabled",roomPvp},{"revive",false}});
+            ImGui::EndDisabled();
             ImGui::Spacing();label("好友可通过以下地址加入：");
             for(const auto& a:state.value("addresses",json::array())) {
                 const auto endpoint=str(a,"ip")+":"+std::to_string(roomInfo.value("port",47615));
@@ -472,7 +504,7 @@ struct Ui {
     void pageSettings() {
         title("设置","名字与显示设置保存在本机。");
         beginCard("##player","玩家",fonts.title);
-        label("显示名称");ImGui::SetNextItemWidth(320);ImGui::InputText("##name",name,sizeof name);
+        label("显示名称（默认使用游戏昵称，修改后以你填写的为准）");ImGui::SetNextItemWidth(320);if(ImGui::InputText("##name",name,sizeof name)) nameEdited=true;
         const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
         label("菜单快捷键");ImGui::SetNextItemWidth(160);if(ImGui::Combo("##key",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
         endCard();

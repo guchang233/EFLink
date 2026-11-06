@@ -74,6 +74,7 @@ bool isCameraManager(void* instance) {
     } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
     return false;
 }
+std::string gameNickname;bool customName();std::string playerName();
 void __fastcall onTick(void* instance,float delta,void* info) {
     if(nextTick) nextTick(instance,delta,info);
     // Identical native bodies can be folded together; only CameraManager's tick counts.
@@ -85,6 +86,7 @@ void __fastcall onTick(void* instance,float delta,void* info) {
         return;
     }
     world.tick(api,net,session);
+    if(const auto& nick=world.nickname();!nick.empty()&&nick!=gameNickname) {gameNickname=nick;if(!customName()) net.setName(playerName());}
 }
 using CanvasTick=void(__fastcall*)(void*);
 CanvasTick nextCanvas=nullptr;BE_ResolvedMethodV1 canvasMethod{};
@@ -220,6 +222,9 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     if(!cleanupRequested)world.damageHookSeen();
     if(!cleanupRequested&&world.blocksActorEffect(ability,modifier))return 0;
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
+    if(auto pvp=cleanupRequested?std::optional<eflink::World::PvpHit>{}:world.beforePvpHit(net,ability,modifier)) {
+        const auto result=nextDamage(ability,modifier,info);world.afterPvpHit(net,*pvp);return result;
+    }
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
     if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
@@ -621,9 +626,17 @@ std::string defaultName() {
     std::snprintf(suffix,sizeof suffix,"%04X",unsigned(eflink::proto::fnv32(raw)&0xFFFF));
     return std::string("管理员-")+suffix;
 }
+// The display name is the game's own nickname unless the player chose one.
+// Older settings saved the generated default; any other saved name is a choice.
+bool customName() {
+    const auto name=configuration.value("player_name",std::string{});
+    // The generated default is never a choice (older builds saved it back).
+    if(name.empty()||name==defaultName()) return false;
+    return configuration.value("player_name_custom",true);
+}
 std::string playerName() {
-    auto name=configuration.value("player_name",std::string{});
-    return name.empty()?defaultName():name;
+    if(customName()) {auto name=configuration.value("player_name",std::string{});if(!name.empty()) return name;}
+    return gameNickname.empty()?defaultName():gameNickname;
 }
 void applyConfiguration(const json& value) {
     eflink::validateSettings(value);
@@ -635,6 +648,8 @@ void applyConfiguration(const json& value) {
     world.replaySkills=configuration.value("replay_skills",true);
     world.outlineTeammates=configuration.value("outline_teammates",true);
     world.testingInvincible=configuration.value("testing_invincible",false);
+    world.pvpScale=(std::clamp)(configuration.value("room_pvp_scale",1.0),0.1,5.0);
+    world.pvpRevive=configuration.value("room_pvp_revive",true);
     world.showMarkers=configuration.value("show_player_markers",true);
     session.followHost=configuration.value("follow_host_world",true);
     session.combat=configuration.value("sync_combat",true);
@@ -693,7 +708,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"pvp",world.pvpStatus(net)},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs}}}};
@@ -787,7 +802,22 @@ void reply(const char* request,BE_Result result,const json& body) {
 // One controller for native GUI, SDK control and optional Host diagnostic messages.
 json perform(const json& input) {
     const auto action=input.at("action").get<std::string>();bool save=false;
-    if(action=="host") net.host(hostOptions(input));
+    if(action=="host") {
+        const bool pvp=input.value("pvp",configuration.value("room_pvp",false));
+        const double scale=(std::clamp)(input.value("pvp_scale",configuration.value("room_pvp_scale",1.0)),0.1,5.0);
+        const bool revive=input.value("pvp_revive",configuration.value("room_pvp_revive",true));
+        {std::lock_guard lock(worldMutex);world.pvpAllowed=pvp;world.pvpScale=scale;world.pvpRevive=revive;}
+        auto changed=configuration;changed["room_pvp"]=pvp;changed["room_pvp_scale"]=scale;changed["room_pvp_revive"]=revive;applyConfiguration(changed);save=true;
+        net.host(hostOptions(input));
+    }
+    else if(action=="room_pvp") {
+        auto changed=configuration;
+        const bool pvp=input.value("enabled",configuration.value("room_pvp",false));changed["room_pvp"]=pvp;
+        if(input.contains("scale")) changed["room_pvp_scale"]=(std::clamp)(input.at("scale").get<double>(),0.1,5.0);
+        if(input.contains("revive")) changed["room_pvp_revive"]=input.at("revive").get<bool>();
+        applyConfiguration(changed);save=true;
+        std::lock_guard lock(worldMutex);world.pvpAllowed=pvp;
+    }
     else if(action=="join") {
         const auto address=input.at("address").get<std::string>();const auto password=input.value("password",std::string{});
         if(address.empty()||address.size()>256||password.size()>128) throw std::runtime_error("地址或密码无效");net.join(address,password);
@@ -820,9 +850,11 @@ json perform(const json& input) {
     else if(action=="refresh") net.refresh();
     else if(action=="chat") {auto text=input.at("text").get<std::string>();if(text.size()>1000) throw std::runtime_error("消息过长");net.chat(text);}
     else if(action=="kick") {if(net.currentRole()!=eflink::Role::Host) throw std::runtime_error("只有房主能移出玩家");net.kick(input.at("id").get<std::uint16_t>());}
-    else if(action=="set_name") {auto changed=configuration;changed["player_name"]=input.at("name");applyConfiguration(changed);save=true;}
+    else if(action=="set_name") {auto changed=configuration;changed["player_name"]=input.at("name");changed["player_name_custom"]=true;applyConfiguration(changed);save=true;}
     else if(action=="show_remote") {auto changed=configuration;changed["show_remote_players"]=input.at("enabled");applyConfiguration(changed);save=true;}
-    else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
+    else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);
+        // The menu sends player_name only when the player edited the field.
+        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
     else if(action=="save_server"||action=="remove_server") {
         auto address=input.at("address").get<std::string>();if(address.empty()||address.size()>256) throw std::runtime_error("请填写有效地址");
         auto servers=configuration.value("saved_servers",json::array());json updated=json::array();

@@ -71,6 +71,7 @@ class World {
         std::uint64_t id=0,epoch=0,retry=0;std::uint16_t peer=0;
         std::string model,templateId,error,weapon;int weaponState=-1,weaponHandle=0;
         bool outlined=false;std::uint64_t outlineAt=0;
+        int factionOriginal=-1;bool pvpFaction=false; // PVP: the stand-in is switched to the neutral faction
         void* entity=nullptr;void* info=nullptr;
         void* movement=nullptr;
         NativeIdentity identity;
@@ -869,9 +870,9 @@ class World {
         const bool current=settled.valid&&settled.key==mapId+"/"+levelId+"/"+hostDungeonId&&settled.pending.empty();
         if(!current) entities=nlohmann::json::array(); // the old level's monsters are gone; the new ones are not settled yet
         if(!settled.valid) return {{"map",mapId},{"level",levelId},{"dungeon",hostDungeonId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
-            {"loading",true},{"position",{position.x,position.y,position.z}},{"entities",entities}};
+            {"loading",true},{"position",{position.x,position.y,position.z}},{"entities",entities},{"pvp",pvpAllowed},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive}};
         return {{"map",settled.map},{"level",settled.level},{"dungeon",settled.dungeon},{"level_num",settled.levelNum},
-            {"loading",!current},{"position",{settled.position.x,settled.position.y,settled.position.z}},{"entities",entities}};
+            {"loading",!current},{"position",{settled.position.x,settled.position.y,settled.position.z}},{"entities",entities},{"pvp",pvpAllowed},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive}};
     }
     template<class T> void field(void* object,const char* type,const char* name,T value,const char* space="Beyond.Gameplay.Core") {
         auto klass=api.klass(type,"Gameplay.Beyond.dll",space);
@@ -1741,7 +1742,7 @@ private:
         if(nowMs()-lastEnemies>(nativeFeedAdapter&&guestRealm?250u:1000u)) {lastEnemies=nowMs();scanEnemies();
             for(auto& [key,s]:spawnedEnemies) if(!roomHost) {auto* created=spawnEntity(s);if(created&&!enemies.contains(key)) enemies[key]=trackEnemy(created);}}
         if(role==Role::Host) {
-            if(roomHost) {updateHostEnemies();applyRoomHits(link);applyEnemyStates(link);assignOwners();mirrorEnemyCasts(net,link);applyPlayerHits(link);}
+            if(roomHost) {updateHostEnemies();applyRoomHits(link);applyEnemyStates(link);assignOwners();mirrorEnemyCasts(net,link);applyPlayerHits(net,link);}
             for(const auto& command:link.takeCommands()) {
                 try {
                     const auto peer=command.at("from").get<std::uint16_t>();
@@ -1788,7 +1789,7 @@ private:
                 mirrorEnemyCasts(net,link);reportOwnedEnemies(net,link);
             }
             else for(auto& [key,e]:enemies) restoreEnemy(e);
-            applyPlayerHits(link);
+            applyPlayerHits(net,link);
             auto* levelLoader=staticObject("levelLoader");
             const bool loaded=snapshot.at("map")==mapId&&snapshot.at("level")==levelId&&
                 levelLoader&&info&&api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info)&&
@@ -1802,6 +1803,7 @@ private:
         } else if(role==Role::Client&&!link.ready()) {for(auto& [key,e]:enemies) restoreEnemy(e);}
         try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
         crash::mark("actors");updateActors(net,link);
+        crash::mark("pvp");try {updatePvp(net,link);}catch(const std::exception& e) {pvpError=e.what();}
         crash::mark("squad_actors");
         try {drainSquad();updateSquadActors(net,link);}catch(const std::exception& e) {squadError=e.what();}
         crash::mark("player_casts");mirrorPlayerCasts(net,link);crash::mark("replication");
@@ -2138,28 +2140,41 @@ private:
     // Teammates (every stand-in) get an accent outline and rim light through the
     // character shader's own properties. Re-applied periodically: material changes
     // (weapon swap, LOD) can reset them.
+    // Teammates (every stand-in) get the game's own outline effect: the render
+    // helper effect interactive objects use for their general outline, looked up
+    // the same way (InteractiveHintConfig: generalOutlineDefaultKey ->
+    // interactiveOutlineConfigs), played on the stand-in's model like the photo
+    // mode's character outline (BaseModelComponent.PlayRenderHelper).
+    std::string outlineFx;std::uint64_t outlineFxChecked=0;
+    const std::string& outlineEffect() {
+        if(!outlineFx.empty()||nowMs()-outlineFxChecked<5000)return outlineFx;
+        outlineFxChecked=nowMs();
+        try {
+            auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
+            auto* data=instance?readField<void*>(instance,"GameInstance","dataManager","Beyond.Gameplay"):nullptr;
+            auto* config=data?api.call(gm("DataManager","get_interactiveHintConfig","","Beyond.Gameplay.InteractiveHintConfig","Beyond.Gameplay"),data):nullptr;
+            if(!config)throw std::runtime_error("interactive hint config unavailable");
+            auto* key=readField<void*>(config,"InteractiveHintConfig","generalOutlineDefaultKey","Beyond.Gameplay");
+            auto* table=readField<void*>(config,"InteractiveHintConfig","interactiveOutlineConfigs","Beyond.Gameplay");
+            if(!key||!table)throw std::runtime_error("outline key or table missing");
+            void* name=nullptr;auto* found=collection(table,"TryGetValue",{key,&name});
+            if(!found||!*static_cast<bool*>(runtime->object_unbox(runtime->context,found))||!name)throw std::runtime_error("outline effect not configured for "+text(key));
+            outlineFx=text(name);outlineError.clear();
+        }catch(const std::exception& e) {outlineError=e.what();}
+        return outlineFx;
+    }
     void outlineStandIns() {
-        const auto now=nowMs();
+        auto play=gm("BaseModelComponent","PlayRenderHelper","System.String","System.Void","Beyond.Gameplay.View");
+        auto stop=gm("BaseModelComponent","StopRenderHelper","System.String","System.Void","Beyond.Gameplay.View");
         auto apply=[&](Actor& a) {
             if(!a.entity||!a.started||!currentActor(a))return;
-            if(!outlineTeammates) {if(a.outlined)a.id=0;return;} // respawned without the outline
-            if(a.outlined&&now-a.outlineAt<2000)return;
-            a.outlineAt=now;
+            if(!outlineTeammates&&!a.outlined)return;
+            const auto& fx=outlineEffect();if(fx.empty())return;
             try {
-                if(!outlineIds[0]) {
-                    const auto toId=m("Shader","PropertyToID","System.String","System.Int32");
-                    outlineIds[0]=api.value<int>(toId,nullptr,{api.string("_OutlineColor")});
-                    outlineIds[1]=api.value<int>(toId,nullptr,{api.string("_RimLightColor")});
-                }
-                auto* component=api.call(entityModel,a.entity);
-                auto* helper=component?api.call(gm("BaseModelComponent","get_entityRenderHelper","","Beyond.Gameplay.View.EntityRenderHelper","Beyond.Gameplay.View"),component):nullptr;
-                if(!helper)return;
-                const auto set=gm("EntityRenderHelper","SetVectorToAllMaterial","System.Int32|UnityEngine.Vector4|Beyond.Rendering.EntityVFXRendererMask|System.Boolean","System.Void","Beyond.Gameplay.View");
-                float outline[4]={1.f,.9f,0.f,1.f},rim[4]={1.f,.86f,.08f,1.f};int mask=-67108865;bool multiply=false; // AllWithoutAlphaQuad
-                api.call(set,helper,{&outlineIds[0],outline,&mask,&multiply});
-                api.call(set,helper,{&outlineIds[1],rim,&mask,&multiply});
-                if(!a.outlined)++outlinesApplied;
-                a.outlined=true;outlineError.clear();
+                auto* component=api.call(entityModel,a.entity);if(!component)return;
+                if(!outlineTeammates) {api.call(stop,component,{api.string(fx)});a.outlined=false;return;}
+                if(a.outlined)return;
+                api.call(play,component,{api.string(fx)});a.outlined=true;++outlinesApplied;
             }catch(const std::exception& e) {outlineError=e.what();}
         };
         for(auto& [peer,a]:actors)apply(a);
@@ -2344,6 +2359,7 @@ public:
             ++blockedGuestActions["private_enemy_target"];return false;
         }
         if(net.currentRole()==Role::Client) {
+            if(pvpActive(net))for(const auto& [peer,actor]:actors)if(actor.entity==entity&&actor.pvpFaction)return true;
             for(const auto& [key,enemy]:enemies)if(enemy.entity==entity&&roomEnemy(key)&&currentEnemy(enemy))return true;
             ++blockedGuestActions["private_object_target"];return false;
         }
@@ -3082,11 +3098,179 @@ public:
         }
     }
     // Guest: the host resolved an enemy hit against this player's actor.
-    void applyPlayerHits(Session& link) {
+    // ---- PVP (room option) ----
+    // Each player's own client computes the damage it deals to another player's
+    // stand-in natively (the stand-in carries that player's level, break stage and
+    // potential) and sends it to that player, whose client applies it to the real
+    // operator. A PVP defeat stops at 1 HP (no official death), with a short
+    // immunity, then full health.
+public:
+    bool pvpAllowed=false;  // host: room setting
+    double pvpScale=1.0;    // host: damage multiplier between players
+    bool pvpRevive=true;    // host: true = defeat at 1 HP, then full health; false = the operator really falls
+private:
+    std::pair<double,bool> pvpRules(Net& net) {
+        if(net.currentRole()==Role::Host)return {pvpScale,pvpRevive};
+        if(session&&session->ready()) {
+            const auto& w=session->snapshot();
+            return {(std::clamp)(w.value("pvp_scale",1.0),0.1,10.0),w.value("pvp_revive",true)};
+        }
+        return {1.0,true};
+    }
+    std::uint64_t pvpHitsSent=0,pvpHitsTaken=0,pvpHitsIgnored=0,pvpDefeats=0,pvpFactionSwitches=0,pvpRecoverAt=0,pvpImmuneUntil=0,lastVitals=0;
+    std::string pvpError,pvpLastDefeat;
+    std::map<std::uint16_t,std::pair<double,double>> vitals; // peer -> real hp, max hp
+    bool pvpActive(Net& net) {
+        const auto role=net.currentRole();
+        if(role==Role::Host)return pvpAllowed;
+        return role==Role::Client&&session&&session->ready()&&session->snapshot().value("pvp",false);
+    }
+    void updatePvp(Net& net,Session& link) {
+        const auto role=net.currentRole();
+        link.pvp=role==Role::Host&&pvpAllowed;
+        const bool active=(role==Role::Host||role==Role::Client)&&pvpActive(net);
+        for(auto& v:link.takeVitals())vitals[v.at("origin").get<std::uint16_t>()]={v.at("hp").get<double>(),v.at("max").get<double>()};
+        const auto setFaction=gm("Entity","OverrideFaction","Beyond.Gameplay.Core.FactionIndex");
+        for(auto& [peer,a]:actors) {
+            if(!a.entity||!a.started||!currentActor(a))continue;
+            if(active!=a.pvpFaction) {
+                // Neutral is hostile to players (Good) and to monsters (Bad) alike:
+                // this player can lock and hit the stand-in, monsters still attack it.
+                // The battle manager decides lock-on candidates when an entity is
+                // registered (hostile factions only), so register again after it.
+                auto* battle=staticObject("battle");
+                if(active) {
+                    a.factionOriginal=api.value<int>(gm("Entity","get_factionIndex","","Beyond.Gameplay.Core.FactionIndex"),a.entity);int neutral=4;api.call(setFaction,a.entity,{&neutral});
+                    if(battle)api.call(gm("BattleManager","RegisterEntity","Beyond.Gameplay.Core.Entity"),battle,{a.entity});
+                } else {
+                    if(battle)api.call(gm("BattleManager","UnRegisterEntity","Beyond.Gameplay.Core.Entity"),battle,{a.entity});
+                    int original=a.factionOriginal>0?a.factionOriginal:2;api.call(setFaction,a.entity,{&original});
+                }
+                a.pvpFaction=active;++pvpFactionSwitches;
+            }
+            // The stand-in's health bar shows that player's real health.
+            if(active)if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.second>0)
+                if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),a.entity)) {
+                    const double max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
+                    const double hp=(std::clamp)(v->second.first/v->second.second*max,1.,max),now=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+                    if(std::isfinite(max)&&max>0&&std::abs(now-hp)>.5) {bool skip=true;double value=hp;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&value,&skip});}
+                }
+        }
+        if(!active) {vitals.clear();pvpRecoverAt=pvpImmuneUntil=0;return;}
+        if(!usable(character))return;
+        auto* own=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);if(!own)return;
+        if(pvpRecoverAt&&nowMs()>=pvpRecoverAt) {
+            pvpRecoverAt=0;double max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),own);
+            if(std::isfinite(max)&&max>0)setHealth(own,max,true);
+        }
+        if(nowMs()-lastVitals>=250) {
+            lastVitals=nowMs();
+            link.sendVitals(net,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),own),api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),own));
+        }
+    }
+    std::string peerName(Net& net,std::uint16_t id) {
+        for(const auto& p:net.snapshot().peers)if(p.id==id&&p.hasInfo)return p.info.name;
+        return "#"+std::to_string(id);
+    }
+    // SetHpDirectly only writes the value (no health events: the HUD bar does not
+    // move and zero health is not a death). SetHpInternal is the game's own setter
+    // that raises them; its Nullable<Modifier> argument is passed empty.
+    void setHealth(void* ability,double hp,bool recovery) {
+        try {
+            std::uint8_t flag[2]={std::uint8_t(recovery),std::uint8_t(recovery)},no[2]={0,0};
+            invokeDefaults(ability,"SetHpInternal",4,{{0,&hp},{1,flag},{3,no}});
+        }catch(const std::exception& e) {
+            pvpError=std::string("SetHpInternal: ")+e.what();
+            bool skip=true;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
+        }
+    }
+    void applyPvpHit(Net& net,void* ability,double amount,const std::string& key) {
+        if(!pvpActive(net)||testingInvincible||nowMs()<pvpImmuneUntil||!std::isfinite(amount)||amount<=0) {++pvpHitsIgnored;return;}
+        const auto [scale,revive]=pvpRules(net);amount*=scale;
+        const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+        if(before<=0)return;
+        std::uint16_t attacker=0;try {attacker=std::uint16_t(std::stoul(key.substr(4)));}catch(...) {}
+        ++pvpHitsTaken;
+        if(revive) {
+            double hp=(std::max)(1.,before-amount);
+            setHealth(ability,hp,false);
+            if(hp<=1&&before>1) {
+                ++pvpDefeats;pvpImmuneUntil=nowMs()+3000;pvpRecoverAt=nowMs()+3000;
+                pvpLastDefeat=peerName(net,attacker);net.chat("［PVP］"+pvpLastDefeat+" 击败了 "+peerName(net,net.snapshot().localId));
+            }
+            return;
+        }
+        // No revive: the operator falls through the game's own death path.
+        double hp=(std::max)(0.,before-amount);
+        setHealth(ability,hp,false);
+        if(hp<=0) {
+            if(!api.value<bool>(gm("Entity","get_markDie","","System.Boolean"),character))api.call(gm("AbilitySystem","OnHpZero"),ability);
+            ++pvpDefeats;pvpLastDefeat=peerName(net,attacker);net.chat("［PVP］"+pvpLastDefeat+" 击倒了 "+peerName(net,net.snapshot().localId));
+        }
+    }
+public:
+    struct PvpHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::uint16_t peer=0;double full=0,shown=0;};
+    // This player's own operator (controlled or squad) damages another player's
+    // stand-in: the stand-in is filled first so it never dies here, the native
+    // loss is measured afterwards and sent to that player.
+    std::optional<PvpHit> beforePvpHit(Net& net,void* ability,void* modifier) {
+        try {
+            if(!ability||!modifier||!session||!session->ready()||!character||actors.empty()||!pvpActive(net))return {};
+            if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier))return {};
+            auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
+            const Actor* standIn=nullptr;std::uint16_t peer=0;
+            for(const auto& [p,a]:actors)if(a.entity==target&&a.started&&a.pvpFaction&&currentActor(a)) {standIn=&a;peer=p;break;}
+            if(!standIn)return {};
+            auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
+            auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
+            bool own=sourceEntity&&sourceEntity==character;
+            for(const auto& m:localMembers)if(m.entity&&m.entity==sourceEntity)own=true;
+            if(!own)return {};
+            PvpHit hit{ability,target,standIn->identity,peer};
+            hit.shown=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+            hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
+            if(!std::isfinite(hit.shown)||!std::isfinite(hit.full)||hit.full<=0)return {};
+            bool skip=true;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hit.full,&skip});
+            return hit;
+        }catch(const std::exception& e) {pvpError=e.what();return {};}
+    }
+    void afterPvpHit(Net& net,const PvpHit& hit) {
+        try {
+            if(!currentEntity(hit.target,hit.identity))return;
+            const double hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),hit.ability);
+            const double amount=hit.full-hp;
+            // Show the hit at once; the player's own reported health corrects it.
+            double shown=(std::max)(1.,hit.shown-(std::max)(0.,amount));bool skip=true;
+            api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),hit.ability,{&shown,&skip});
+            if(amount>0&&session&&session->sendPlayerHit(net,hit.peer,amount,"pvp:"+std::to_string(net.snapshot().localId)))++pvpHitsSent;
+        }catch(const std::exception& e) {pvpError=e.what();}
+    }
+    std::string gameNickname;std::uint64_t lastNickname=0;
+    const std::string& nickname() {
+        if(nowMs()-lastNickname<2000||!runtime)return gameNickname;
+        lastNickname=nowMs();
+        try {
+            auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
+            auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
+            auto* info=player?readField<void*>(player,"GamePlayer","playerInfoSystem","Beyond.Gameplay"):nullptr;
+            auto name=info?text(api.call(gm("PlayerInfoSystem","get_playerName","","System.String","Beyond.Gameplay"),info)):std::string{};
+            if(!name.empty()&&name.size()<=64)gameNickname=name;
+        }catch(...) {}
+        return gameNickname;
+    }
+    nlohmann::json pvpStatus(Net& net) {
+        const auto [scale,revive]=pvpRules(net);
+        return {{"allowed",pvpAllowed},{"active",pvpActive(net)},{"scale",scale},{"revive",revive},{"hits_sent",pvpHitsSent},{"hits_taken",pvpHitsTaken},{"hits_ignored",pvpHitsIgnored},
+                {"defeats",pvpDefeats},{"last_defeat_by",pvpLastDefeat},{"faction_switches",pvpFactionSwitches},{"error",pvpError}};
+    }
+public:
+    void applyPlayerHits(Net& net,Session& link) {
         for(const auto& hit:link.takePlayerHits()) {
             try {
                 if(!usable(character))continue;
                 auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);if(!ability)continue;
+                const auto key=hit.value("key",std::string{});
+                if(key.rfind("pvp:",0)==0) {applyPvpHit(net,ability,hit.at("amount").get<double>(),key);continue;}
                 // Health floor of 1: this is the player's real account operator,
                 // and room enemies are not part of the official server's world.
                 double hp=(std::max)(1.,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)-hit.at("amount").get<double>());bool skip=true;
@@ -3846,7 +4030,7 @@ public:
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
-                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
+                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_effect",outlineFx},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
                     {"player_cast_error",playerCastError},{"last_player_cast",lastPlayerCast},{"actor_effects_blocked",actorEffectsBlocked},
                     {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"weapon_states_applied",weaponStatesApplied},{"weapon_state_error",weaponStateError},{"cooldowns_reset",cooldownsReset},{"squad",squadStatus()},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},

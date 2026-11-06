@@ -55,7 +55,7 @@ class Session {
     std::map<std::uint16_t,Json> growthRequests;
     // Hit results. Like an official co-op world, each player's own client resolves
     // its attacks; the host bounds them and owns the enemy's HP and death.
-    std::deque<Json> hits,playerHits,enemyCasts,enemyStates,playerCasts;std::map<std::uint16_t,std::pair<std::uint64_t,int>> castBudgets;std::map<std::uint16_t,std::uint64_t> hitSequences;
+    std::deque<Json> hits,playerHits,enemyCasts,enemyStates,playerCasts,vitals;std::map<std::uint16_t,std::pair<std::uint64_t,int>> vitalBudgets;std::map<std::uint16_t,std::pair<std::uint64_t,int>> castBudgets;std::map<std::uint16_t,std::uint64_t> hitSequences;
     std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> hitBudgets;std::uint64_t hitSequence=0,hitsAccepted=0;
     std::uint64_t lastGrowthPublish=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
@@ -97,6 +97,7 @@ class Session {
     }
 public:
     bool followHost=true,combat=true;
+    bool pvp=false; // host: the room allows players to hurt each other (set by the game adapter)
     void receive(std::uint16_t from,const void* data,std::size_t size) {
         if(!data||!size||size>proto::kMaxReliableData) return;
         auto parsed=Json::parse(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size,nullptr,false);
@@ -109,7 +110,7 @@ public:
         const auto s=net.snapshot();
         if(s.roomId!=room||s.role!=role) {
             room=s.roomId;role=s.role;epoch=revision=seenAt=lastPublish=commandSequence=0;world=Json::object();
-            hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();hitSequences.clear();hitBudgets.clear();hitSequence=0;
+            hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();hitSequences.clear();hitBudgets.clear();hitSequence=0;vitals.clear();
             sequences.clear();attackBudgets.clear();locations.clear();lastLocation=0;commands.clear();teleport=Json::object();actorTeleports.clear();error.clear();
             entries.clear();replica={};entryToken=lastEntryReport=lastEntryAck=0;admitted=false;entryBlockers=Json::array();
             realm.reset(room);
@@ -228,7 +229,11 @@ public:
                     // An enemy simulated on that guest hit another player's stand-in
                     // there. The host applies it to its own operator or relays it.
                     const double amount=b.at("amount").get<double>();const auto target=b.at("target").get<std::uint16_t>();
-                    const auto key=b.value("key",std::string{}).substr(0,128);
+                    auto key=b.value("key",std::string{}).substr(0,128);
+                    if(key.rfind("pvp:",0)==0) {
+                        if(!pvp) {++rejected;continue;}
+                        key="pvp:"+std::to_string(packet.from); // never trust the claimed attacker
+                    }
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||target==packet.from||!find(s,target)) {++rejected;continue;}
                     auto& budget=hitBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
                     if(budget.second>=40) {++rejected;continue;}
@@ -252,6 +257,16 @@ public:
                     ++budget.second;
                     if(role==Role::Host) send(net,{{"kind","player_cast"},{"epoch",epoch},{"origin",origin},{"slot",slot},{"skill",skill},{"target",target}});
                     playerCasts.push_back({{"origin",origin},{"slot",slot},{"skill",skill},{"target",target}});
+                } else if(kind=="vitals"&&(role==Role::Client?packet.from==proto::kHostId:role==Role::Host&&find(s,packet.from)!=nullptr)) {
+                    // A player's own health (PVP: shown on their stand-in elsewhere).
+                    const auto origin=role==Role::Host?packet.from:b.at("origin").get<std::uint16_t>();
+                    const double hp=b.at("hp").get<double>(),max=b.at("max").get<double>();
+                    if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(hp)||!std::isfinite(max)||max<=0||max>1e9||hp<0||hp>max*1.01) {++rejected;continue;}
+                    auto& budget=vitalBudgets[origin];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
+                    if(budget.second>=10) {++rejected;continue;}
+                    ++budget.second;
+                    if(role==Role::Host) send(net,{{"kind","vitals"},{"epoch",epoch},{"origin",origin},{"hp",hp},{"max",max}});
+                    if(vitals.size()<64) vitals.push_back({{"origin",origin},{"hp",hp},{"max",max}});
                 } else if(kind=="enemy_state"&&role==Role::Host&&canAct(packet.from)) {
                     // Movement of enemies whose AI runs on that guest (ownership is
                     // assigned and checked by the host's game adapter).
@@ -320,6 +335,14 @@ public:
         return false;
     }
     std::deque<Json> takePlayerCasts() {std::deque<Json> out;out.swap(playerCasts);return out;}
+    bool sendVitals(Net& net,double hp,double max) {
+        if(!ready()||!std::isfinite(hp)||!std::isfinite(max)||max<=0) return false;
+        Json body{{"kind","vitals"},{"epoch",epoch},{"origin",net.snapshot().localId},{"hp",hp},{"max",max}};
+        if(role==Role::Host) return send(net,std::move(body));
+        if(role==Role::Client) return send(net,std::move(body),proto::kHostId);
+        return false;
+    }
+    std::deque<Json> takeVitals() {std::deque<Json> out;out.swap(vitals);return out;}
     // Guest: report the room enemies whose AI this player runs.
     bool sendEnemyStates(Net& net,const Json& states) {
         if(role!=Role::Client||!canAct(net.snapshot().localId)||!states.is_array()||states.empty()||states.size()>64) return false;
