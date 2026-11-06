@@ -186,6 +186,18 @@ void* __fastcall onTransformEffect(void* ret,void* self,void* name,void* target,
     if(info==transformEffectMethod.method_info&&!cleanupRequested) {std::lock_guard lock(worldMutex);world.observeTransformEffect(name,target);}
     return result;
 }
+// GameAction.TeleportToPosition(reason, levelId, position, rotation, ui, options,
+// callback, hubNodeId): observed only, to compare the map screen's own calls with ours.
+struct HookV3 {float x,y,z;};
+using TeleportCall=void(__fastcall*)(std::uint64_t,void*,void*,void*,std::uint64_t,std::uint64_t,void*,std::uint64_t,void*);
+TeleportCall nextTeleport=nullptr;BE_ResolvedMethodV1 teleportMethod{};bool teleportHooked=false;
+void __fastcall onTeleport(std::uint64_t reason,void* level,void* position,void* rotation,std::uint64_t ui,std::uint64_t options,void* callback,std::uint64_t node,void* info) {
+    if(info==teleportMethod.method_info&&!cleanupRequested) {
+        std::lock_guard lock(worldMutex);
+        world.logTeleport(int(reason),level,static_cast<const eflink::unity::V3*>(position),static_cast<const eflink::unity::V3*>(rotation),int(ui),int(options),std::uint32_t(node),"TeleportToPosition");
+    }
+    nextTeleport(reason,level,position,rotation,ui,options,callback,node,info);
+}
 // Windows x64: TargetHandleView is exactly one pointer-sized value; the
 // Nullable<CastSkillOptions> value (> 8 bytes) is passed indirectly. Validate
 // the target view layout from runtime metadata before installing this hook.
@@ -577,6 +589,11 @@ BE_Result installHook() {
         if(api->resolve_method(api->context,&transformEffect,&transformEffectMethod)==BE_Result_Ok&&transformEffectMethod.method_pointer) {
             std::uint64_t effectHandle=0;transformEffectHooked=host.hooks->create(host.hooks->context,kId,transformEffectMethod.method_pointer,reinterpret_cast<void*>(onTransformEffect),reinterpret_cast<void**>(&nextTransformEffect),&effectHandle)==BE_Result_Ok;
         }
+        BE_MethodDescriptorV1 teleport{"Gameplay.Beyond.dll","Beyond.Gameplay.Actions","GameAction","TeleportToPosition",
+            "Beyond.GEnums.C2STeleportReason|System.String|UnityEngine.Vector3|UnityEngine.Vector3|Beyond.Gameplay.TeleportUIType|Beyond.Gameplay.TeleportOptions|System.Action|System.UInt32","System.Void",8};
+        if(api->resolve_method(api->context,&teleport,&teleportMethod)==BE_Result_Ok&&teleportMethod.method_pointer) {
+            std::uint64_t teleportHandle=0;teleportHooked=host.hooks->create(host.hooks->context,kId,teleportMethod.method_pointer,reinterpret_cast<void*>(onTeleport),reinterpret_cast<void**>(&nextTeleport),&teleportHandle)==BE_Result_Ok;
+        }
         BE_MethodDescriptorV1 weaponModel{"Gameplay.Beyond.dll","Beyond.Gameplay","WeaponUtil","TryGetWeaponModelPathByCharInstId",nullptr,"System.Boolean",3};
         if(api->resolve_method(api->context,&weaponModel,&weaponModelMethod)==BE_Result_Ok&&weaponModelMethod.method_pointer) {
             std::uint64_t weaponHandle=0;weaponModelHooked=host.hooks->create(host.hooks->context,kId,weaponModelMethod.method_pointer,reinterpret_cast<void*>(onWeaponModel),reinterpret_cast<void**>(&nextWeaponModel),&weaponHandle)==BE_Result_Ok;
@@ -617,6 +634,7 @@ void applyConfiguration(const json& value) {
     world.showSquad=configuration.value("show_remote_squad",true);
     world.replaySkills=configuration.value("replay_skills",true);
     world.outlineTeammates=configuration.value("outline_teammates",true);
+    world.testingInvincible=configuration.value("testing_invincible",false);
     world.showMarkers=configuration.value("show_player_markers",true);
     session.followHost=configuration.value("follow_host_world",true);
     session.combat=configuration.value("sync_combat",true);
@@ -675,7 +693,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs}}}};
@@ -790,7 +808,7 @@ json perform(const json& input) {
         if(net.currentRole()!=eflink::Role::Offline)net.leave();
         std::lock_guard lock(worldMutex);world.requestEmergencyHome();
     }
-    else if(action=="testing_invincible") {std::lock_guard lock(worldMutex);world.testingInvincible=input.at("enabled").get<bool>();}
+    else if(action=="testing_invincible") {auto changed=configuration;changed["testing_invincible"]=input.at("enabled").get<bool>();applyConfiguration(changed);save=true;}
     else if(action=="feed_option") {std::lock_guard lock(worldMutex);world.setFeedOption(input);}
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
@@ -883,7 +901,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
+        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;teleportHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     eflink::crash::uninstall();

@@ -111,6 +111,8 @@ struct Ui {
     char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
     int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,squad=true,replay=true,outline=true,markers=true,follow=true,combat=true;
     std::uint64_t lastChat=0,lastMapPrompt=0;
+    // Chat on the HUD: recent lines stay for a while; Enter opens a one-line input.
+    bool chatting=false,chatFocus=false,chatPrimed=false;char hudChat[1001]{};std::map<std::uint64_t,std::uint64_t> chatSeen;
     void say(std::string text,bool error) {toast=std::move(text);toastAt=now();toastError=error;}
     void act(json input) {const auto a=str(input,"action");actions.push_back({post(input),a,now()});}
     void init() {
@@ -199,6 +201,7 @@ struct Ui {
             drawRoster(size,distances);
             ImGui::PopFont();
         }
+        if(online()) drawChat(size);else chatting=false;
         if(!toast.empty()&&now()-toastAt<4000&&!open) {
             ImGui::PushFont(fonts.body);const auto ts=ImGui::CalcTextSize(toast.c_str());
             const ImVec2 p{size.x*.5f-ts.x*.5f-16,size.y-140};
@@ -213,6 +216,47 @@ struct Ui {
             d->AddRect(p,{p.x+ts.x+32,p.y+ts.y+18},color::u32(color::accent,.8f),6);
             d->AddText({p.x+16,p.y+9},color::u32(color::accent),text.c_str());ImGui::PopFont();
         }
+    }
+    void drawChat(ImVec2 size) {
+        const auto lines=state.value("chat",json::array());const auto t=now();
+        if(!chatPrimed) {for(const auto& l:lines) chatSeen[l.value("serial",std::uint64_t(0))]=0;chatPrimed=true;}
+        for(const auto& l:lines) {const auto s=l.value("serial",std::uint64_t(0));if(!chatSeen.contains(s)) chatSeen[s]=t;}
+        std::vector<const json*> show;
+        for(auto it=lines.rbegin();it!=lines.rend()&&show.size()<(chatting?10u:6u);++it) {
+            const auto seen=chatSeen[it->value("serial",std::uint64_t(0))];
+            if(chatting||(seen&&t-seen<12000)) show.push_back(&*it);
+        }
+        ImGui::PushFont(fonts.note);
+        auto* d=ImGui::GetBackgroundDrawList();
+        const float line=ImGui::GetTextLineHeight()+4,left=24,width=(std::min)(560.f,size.x*.42f),bottom=size.y*.78f;
+        float y=bottom-line*float(show.size());
+        if(chatting&&!show.empty()) d->AddRectFilled({left-8,y-6},{left+width,bottom+2},IM_COL32(0,0,0,110),2);
+        for(auto it=show.rbegin();it!=show.rend();++it,y+=line) {
+            const auto& l=**it;const auto seen=chatSeen[l.value("serial",std::uint64_t(0))];
+            const float alpha=chatting?1.f:(std::clamp)(float(12000-(t-seen))/2000.f,0.f,1.f);
+            d->PushClipRect({left-8,y-2},{left+width,y+line},true);
+            if(l.value("system",false)) shadowText(d,{left,y},color::u32(color::dim,alpha),("· "+str(l,"text")).c_str());
+            else {
+                const auto who=str(l,"name")+"：";shadowText(d,{left,y},color::u32(color::accent,alpha),who.c_str());
+                shadowText(d,{left+ImGui::CalcTextSize(who.c_str()).x,y},color::u32(color::text,alpha),str(l,"text").c_str());
+            }
+            d->PopClipRect();
+        }
+        if(chatting) {
+            ImGui::SetNextWindowPos({left-8,bottom+6});ImGui::SetNextWindowSize({width+8,0});
+            ImGui::SetNextWindowBgAlpha(.75f);
+            if(ImGui::Begin("##hudchat",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove)) {
+                if(chatFocus) {ImGui::SetKeyboardFocusHere();chatFocus=false;}
+                ImGui::SetNextItemWidth(-1);
+                if(ImGui::InputTextWithHint("##hudchatinput","输入消息，Enter 发送，Esc 取消",hudChat,sizeof hudChat,ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    if(*hudChat) act({{"action","chat"},{"text",hudChat}});
+                    hudChat[0]=0;chatting=false;
+                }
+                if(ImGui::IsKeyPressed(ImGuiKey_Escape)) {hudChat[0]=0;chatting=false;}
+            }
+            ImGui::End();
+        }
+        ImGui::PopFont();
     }
     // Member list at the right edge: id tile, name, distance. No coordinates.
     void drawRoster(ImVec2 size,const std::map<int,float>& distances) {
@@ -453,7 +497,7 @@ struct Ui {
         const auto teleport=state.value("game",json::object()).value("world_replication",json::object()).value("official_teleport",json::object());
         if(teleport.contains("error")) ImGui::TextColored(color::bad,"官方传送失败：%s",str(teleport,"error").c_str());
         bool invincible=state.value("testing_invincible",false);
-        if(ImGui::Checkbox("测试：本机角色无敌（不保存）",&invincible)) act({{"action","testing_invincible"},{"enabled",invincible}});
+        if(ImGui::Checkbox("测试：本机角色无敌（会保存，重启后保持）",&invincible)) act({{"action","testing_invincible"},{"enabled",invincible}});
         endCard();
     }
     void pageDiagnostics() {
@@ -658,7 +702,7 @@ void Gui::runOverlay(json) {
         Ui ui;ui.fonts=loadFonts(scale);applyTheme(scale);
         ImGui_ImplWin32_Init(surface.window);ImGui_ImplDX11_Init(surface.device.Get(),surface.context.Get());
         ui.post=[this](const json& input){return post(input);};
-        overlayReady=true;bool keyDown=false;
+        overlayReady=true;bool keyDown=false,enterDown=false;
         while(!stopping&&IsWindow(game)) {
             MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
             const bool minimized=IsIconic(game)||!IsWindowVisible(game);
@@ -669,11 +713,17 @@ void Gui::runOverlay(json) {
             keyDown=down;
             if(openRequested.exchange(false)) ui.open=true;
             if(ui.closeRequested) {ui.open=false;ui.closeRequested=false;}
-            if(minimized||!focused) ui.open=false;
+            // Enter in the game (menu closed, in a room) opens the HUD chat input.
+            const bool enter=(GetAsyncKeyState(VK_RETURN)&0x8000)!=0;
+            if(enter&&!enterDown&&foreground==game&&!ui.open&&!ui.chatting&&ui.online()) {ui.chatting=true;ui.chatFocus=true;}
+            enterDown=enter;
+            if(ui.open) ui.chatting=false;
+            if(minimized||!focused) {ui.open=false;ui.chatting=false;}
+            const bool wantInput=ui.open||ui.chatting;
             const bool wasInteractive=surface.interactive;
-            surface.setInteractive(ui.open);
-            if(ui.open&&!wasInteractive) SetForegroundWindow(surface.window);
-            if(!ui.open&&wasInteractive&&GetForegroundWindow()==surface.window) SetForegroundWindow(game);
+            surface.setInteractive(wantInput);
+            if(wantInput&&!wasInteractive) SetForegroundWindow(surface.window);
+            if(!wantInput&&wasInteractive&&GetForegroundWindow()==surface.window) SetForegroundWindow(game);
             menuVisible=ui.open;
             if(minimized) {surface.show(false);ui.poll(false);std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
             RECT area{};GetClientRect(game,&area);POINT at{0,0};ClientToScreen(game,&at);
@@ -681,13 +731,13 @@ void Gui::runOverlay(json) {
                 client=area;origin=at;SetWindowPos(surface.window,nullptr,origin.x,origin.y,client.right,client.bottom,SWP_NOZORDER|SWP_NOACTIVATE);
             }
             surface.resize(unsigned(client.right),unsigned(client.bottom));surface.show(true);
-            ui.poll(ui.open);
+            ui.poll(ui.open||ui.chatting);
             ImGui_ImplDX11_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
             const ImVec2 size{float(surface.width),float(surface.height)};
             ui.drawHud(size);
             if(ui.open) ui.drawMenu(size);
             ImGui::Render();const float clear[4]{0,0,0,0};surface.render(clear);++overlayFrames;
-            if(!ui.open) std::this_thread::sleep_for(std::chrono::milliseconds(8)); // the HUD needs no more than ~60 fps
+            if(!ui.open&&!ui.chatting) std::this_thread::sleep_for(std::chrono::milliseconds(8)); // the HUD needs no more than ~60 fps
         }
         overlayReady=false;menuVisible=false;
         surface.destroy();ImGui::DestroyContext(context);

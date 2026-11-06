@@ -557,14 +557,49 @@ class World {
             e.battleTargetDetached=true;collection(list,"Remove",{e.entity});
         }
     }
+    // Zeroed storage for a value-type parameter, sized from the exact closed
+    // parameter type and owned here. Never a boxed object on the managed heap:
+    // a boxed Nullable<T> or generic struct is not a valid heap object for
+    // Unity's liveness scan (asset unloads crashed in il2cpp_class_get_fields).
+    std::vector<std::uint8_t> valueArg(BE_ResolvedMethodV1 method,unsigned index) {
+        auto* type=symbol<const void*(*)(const void*,unsigned)>("il2cpp_method_get_param")(method.method_info,index);
+        auto* klass=type?symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(type):nullptr;unsigned align=0;
+        const int bytes=klass?symbol<int(*)(const void*,unsigned*)>("il2cpp_class_value_size")(klass,&align):0;
+        if(!klass||!symbol<bool(*)(const void*)>("il2cpp_class_is_valuetype")(klass)||bytes<=0||bytes>4096)throw std::runtime_error("value parameter ABI unavailable");
+        return std::vector<std::uint8_t>(std::size_t(bytes)+16,std::uint8_t(0));
+    }
+    int valueFieldOffset(const void* klass,const char* name) {
+        auto* f=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass,name);
+        return f?int(symbol<std::size_t(*)(const void*)>("il2cpp_field_get_offset")(f))-int(2*sizeof(void*)):-1;
+    }
+    // Nullable<CastSkillOptions> for a replayed cast: the player could cast it, so
+    // distance/angle to a (possibly empty) target and a still-running previous
+    // skill must not refuse it here. Offsets come from the runtime by field name.
+    std::uint64_t castOptionsSet=0;
+    std::vector<std::uint8_t> castOptionsArg(BE_ResolvedMethodV1 castMethod) {
+        auto out=valueArg(castMethod,3);
+        try {
+            auto* type=symbol<const void*(*)(const void*,unsigned)>("il2cpp_method_get_param")(castMethod.method_info,3);
+            auto* nullable=symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(type);
+            auto fieldOf=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name");
+            int has=valueFieldOffset(nullable,"has_value");if(has<0)has=valueFieldOffset(nullable,"hasValue");
+            auto* valueField=fieldOf(nullable,"value");const int value=valueFieldOffset(nullable,"value");
+            auto* inner=valueField?symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(symbol<const void*(*)(const void*)>("il2cpp_field_get_type")(valueField)):nullptr;
+            if(has<0||value<0||!inner)return out;
+            const int a=valueFieldOffset(inner,"ignoreDistance"),b=valueFieldOffset(inner,"ignoreAngle"),c=valueFieldOffset(inner,"forceInterruptCurSkill");
+            if(a<0||b<0||c<0||std::size_t(value+(std::max)({a,b,c}))>=out.size()||std::size_t(has)>=out.size())return out;
+            out[std::size_t(has)]=1;out[std::size_t(value+a)]=1;out[std::size_t(value+b)]=1;out[std::size_t(value+c)]=1;++castOptionsSet;
+        }catch(...) {std::fill(out.begin(),out.end(),std::uint8_t(0));}
+        return out;
+    }
     void clearPrivateBattleTarget(void* battle) {
         auto* target=api.call(gm("BattleManager","get_mainTarget","","Beyond.Gameplay.Core.AbilitySystem"),battle);
         auto* entity=target?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),target):nullptr;
         if(auto it=privateEnemies.find(entity);it!=privateEnemies.end()&&currentEnemy(it->second)) {
             api.call(gm("BattleManager","ForceResetLockTarget"),battle);
             auto method=gm("BattleManager","SetMainTarget","Beyond.ObjectPtr<Beyond.Gameplay.Core.AbilitySystem>|System.Boolean");
-            auto* empty=api.parameterValue(method,0);eflink::unity::Api::TemporaryRoot emptyRoot(runtime,empty);
-            bool manual=false;api.call(method,battle,{runtime->object_unbox(runtime->context,empty),&manual});
+            auto emptyArg=valueArg(method,0);
+            bool manual=false;api.call(method,battle,{emptyArg.data(),&manual});
             ++blockedGuestActions["private_target_cache"];
         }
     }
@@ -1422,10 +1457,10 @@ class World {
         bool no=false;
         const bool can=api.value<bool>(gm("AbilitySystem","CanCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Boolean|System.Boolean|System.Boolean","System.Boolean"),caster,{api.string(id),viewRaw,&no,&no,&no});
         auto cast=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(cast,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
+        auto optionsArg=castOptionsArg(cast);
         auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
         eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);
-        const bool accepted=can&&api.value<bool>(cast,caster,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});
+        const bool accepted=can&&api.value<bool>(cast,caster,{api.string(id),viewRaw,nullptr,optionsArg.data(),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});
         if(accepted){++nativeCasts;actor->second.casting=true;}else ++nativeCastRejected;
         lastNativeCast={{"peer",peer},{"actor",actor->second.id},{"key",key},{"skill",id},{"diagnostic",diagnostic},
             {"native_can_cast",can},{"native_accepted",accepted},{"target_hp_before",before},{"issued",nowMs()}};
@@ -1602,11 +1637,11 @@ class World {
             auto* more=invoke(moveNext,enumerator);if(!more||!*static_cast<bool*>(runtime->object_unbox(runtime->context,more)))break;
             auto* mark=invoke(current,enumerator);
             if(!mark||classOf(mark)!="Beyond.Gameplay.FacMarkInstRuntimeData")continue;
-            // Game 1.6.3 renamed isTpRelated to isTravelRelated.
-            bool travelHub=false;
-            try {travelHub=readField<bool>(mark,"FacMarkInstRuntimeData","isTravelRelated","Beyond.Gameplay");}
-            catch(...) {travelHub=readField<bool>(mark,"FacMarkInstRuntimeData","isTpRelated","Beyond.Gameplay");}
-            if(!travelHub)continue;
+            // Teleport hubs carry MarkInstRuntimeData.isTpRelated (moved to the base
+            // class in game 1.6.3). FacMarkInstRuntimeData.isTravelRelated is a different,
+            // new flag (travel-line network nodes); teleporting to those is rejected by
+            // the server as invalid input.
+            if(!readField<bool>(mark,"MarkInstRuntimeData","isTpRelated","Beyond.Gameplay"))continue;
             HubTarget hub;hub.node=readField<std::uint32_t>(mark,"FacMarkInstRuntimeData","nodeId","Beyond.Gameplay");if(!hub.node)continue;
             hub.level=text(readField<void*>(mark,"MarkInstRuntimeData","levelId","Beyond.Gameplay"));
             hub.inst=text(readField<void*>(mark,"MarkInstRuntimeData","instId","Beyond.Gameplay"));
@@ -1976,7 +2011,7 @@ private:
         // a snapshot pair on a LAN, without the fixed 100 ms that felt laggy.
         std::int64_t interval=33;
         if(states.size()>=2) interval=(unwrap(states.back().state.timeMs)-unwrap(states.front().state.timeMs))/std::int64_t(states.size()-1);
-        const std::int64_t delay=(std::clamp)(interval*2+10,std::int64_t(50),std::int64_t(150));
+        const std::int64_t delay=(std::clamp)(interval*3/2+5,std::int64_t(35),std::int64_t(150));
         const std::int64_t target=std::int64_t(nowMs())-delay-offset;
         const proto::PlayerState* from=&states.front().state;const proto::PlayerState* to=from;float t=0;
         for(std::size_t i=0;i+1<states.size();++i) {
@@ -2045,6 +2080,17 @@ public:
     // operator's skill with the same skill replayed on a stand-in.
     std::map<std::string,std::uint64_t> fxLocal,fxStandIn;
     std::deque<std::string> replayLog;
+    std::deque<nlohmann::json> teleportCalls;
+public:
+    void logTeleport(int reason,void* level,const V3* position,const V3* rotation,int ui,int options,std::uint32_t node,const char* api_) {
+        try {
+            nlohmann::json e={{"api",api_},{"mine",ownOfficialAction},{"reason",reason},{"level",level?text(level):std::string{}},{"ui",ui},{"options",options},{"node",node},{"at",nowMs()}};
+            if(position)e["position"]={position->x,position->y,position->z};
+            if(rotation)e["rotation"]={rotation->x,rotation->y,rotation->z};
+            teleportCalls.push_back(std::move(e));while(teleportCalls.size()>12)teleportCalls.pop_front();
+        }catch(...) {}
+    }
+public:
     void countEffect(std::map<std::string,std::uint64_t>& names,const std::string& name) {
         if(name.empty())return;
         if(names.size()<96||names.contains(name))++names[name];
@@ -2544,12 +2590,12 @@ public:
             if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});}
         }
         auto castMethod=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(castMethod,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
+        auto optionsArg=castOptionsArg(castMethod);
         auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
         eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);bool no=false;
         replayingCast=true;
         bool accepted=false;
-        try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});}
+        try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,optionsArg.data(),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});}
         catch(...) {replayingCast=false;throw;}
         replayingCast=false;
         if(accepted) {
@@ -2652,6 +2698,52 @@ public:
             if(session->sendPlayerCast(net,slot,skill,enemyKeyOfTarget(targetHandle))) {++playerCastsSent;lastPlayerCast=std::to_string(slot)+":"+skill;}
         }catch(const std::exception& e){playerCastError=e.what();}
     }
+    // Calls an instance method by name and parameter count; parameters not provided
+    // get zeroed storage for value types and null for references (no type strings
+    // needed for nullable/enum parameters the metadata reader cannot name).
+    void* invokeDefaults(void* self,const char* name,int count,std::map<int,void*> provided={}) {
+        auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(self);
+        auto* method=symbol<const void*(*)(const void*,const char*,int)>("il2cpp_class_get_method_from_name")(klass,name,count);
+        if(!method)throw std::runtime_error(std::string("method unavailable: ")+name);
+        auto paramType=symbol<const void*(*)(const void*,unsigned)>("il2cpp_method_get_param");
+        auto classFromType=symbol<const void*(*)(const void*)>("il2cpp_class_from_type");
+        auto isValue=symbol<bool(*)(const void*)>("il2cpp_class_is_valuetype");
+        auto valueSize=symbol<int(*)(const void*,unsigned*)>("il2cpp_class_value_size");
+        std::vector<std::vector<std::uint8_t>> storage;std::vector<void*> args;
+        for(int i=0;i<count;++i) {
+            if(auto it=provided.find(i);it!=provided.end()) {args.push_back(it->second);continue;}
+            const auto* cls=classFromType(paramType(method,unsigned(i)));
+            if(cls&&isValue(cls)) {unsigned align=0;storage.emplace_back(std::size_t((std::max)(16,valueSize(cls,&align))),std::uint8_t(0));args.push_back(storage.back().data());}
+            else args.push_back(nullptr);
+        }
+        void* exception=nullptr;
+        auto* result=runtime->runtime_invoke(runtime->context,method,self,args.empty()?nullptr:args.data(),&exception);
+        if(exception)throw std::runtime_error(std::string("managed exception in ")+name);
+        return result;
+    }
+    std::uint64_t forcedInterrupts=0;
+    std::string skillIdOf(void* skill) {try {return skill?text(api.call(gm("Skill","get_skillId","","System.String"),skill)):std::string{};}catch(...) {return {};}}
+    // Why the game refuses this cast on the stand-in: each check skipped in turn.
+    std::string refusalReason(void* ability,const std::string& id,void* viewRaw) {
+        try {
+            auto can=[&](bool skipAngle,bool skipDistance,bool skipInterrupt) {
+                // bool or Nullable<bool>: {1,1} reads as true for both, {0,0} as false/null.
+                std::uint8_t a[2]={std::uint8_t(skipAngle),std::uint8_t(skipAngle)},d[2]={std::uint8_t(skipDistance),std::uint8_t(skipDistance)},
+                             i[2]={std::uint8_t(skipInterrupt),std::uint8_t(skipInterrupt)};
+                auto* r=invokeDefaults(ability,"CanCastSkill",5,{{0,api.string(id)},{1,viewRaw},{2,a},{3,d},{4,i}});
+                return r&&*static_cast<bool*>(runtime->object_unbox(runtime->context,r));
+            };
+            auto* curSkill=api.call(gm("AbilitySystem","get_curSkill","","Beyond.Gameplay.Core.Skill"),ability);
+            const bool inSkill=api.value<bool>(gm("AbilitySystem","get_inSkill","","System.Boolean"),ability);
+            std::string out="cur="+skillIdOf(curSkill)+(inSkill?" inSkill":"");
+            if(can(false,false,false))out+=" checks:pass";
+            else if(can(false,false,true))out+=" checks:interrupt";
+            else if(can(true,true,false))out+=" checks:target";
+            else if(can(true,true,true))out+=" checks:interrupt+target";
+            else out+=" checks:other";
+            return out;
+        }catch(const std::exception& e) {return std::string("diag:")+e.what();}
+    }
     bool replayPlayerCast(std::uint16_t peer,int slot,const std::string& id,const std::string& key) {
         Actor* standIn=nullptr;
         if(slot==0) {if(auto actor=actors.find(peer);actor!=actors.end())standIn=&actor->second;}
@@ -2690,17 +2782,25 @@ public:
                 ++cooldownsReset;
             }
         }catch(...) {}
+        // The player has started this skill, so whatever the stand-in still plays from
+        // the previous one is over on the player's side: end it if it would block.
+        try {
+            if(auto* current=api.call(gm("AbilitySystem","get_curSkill","","Beyond.Gameplay.Core.Skill"),ability)) {
+                const bool interruptible=api.value<bool>(gm("AbilitySystem","CheckCanInterruptCurSkill","Beyond.Gameplay.Core.Skill","System.Boolean"),ability,{skill});
+                if(!interruptible||current==skill) {invokeDefaults(current,"Interrupt",2);++forcedInterrupts;}
+            }
+        }catch(const std::exception& e) {playerCastError=std::string("interrupt: ")+e.what();}
         // A stand-in has no energy economy of its own; an ultimate the player could
         // cast must be castable here too.
         float sp=api.value<float>(gm("AbilitySystem","get_maxUltimateSp","","System.Single"),ability);
         if(std::isfinite(sp)&&sp>0)api.call(gm("AbilitySystem","set_ultimateSp","System.Single"),ability,{&sp});
         auto castMethod=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(castMethod,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
+        auto optionsArg=castOptionsArg(castMethod);
         auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
         eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);bool skipCost=true;
         crash::mark("replay",std::to_string(peer)+"/"+std::to_string(slot)+" "+id);
         replayingCast=true;bool accepted=false;
-        try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&skipCost});}
+        try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,optionsArg.data(),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&skipCost});}
         catch(...) {replayingCast=false;crash::mark("idle");throw;}
         replayingCast=false;
         if(!accepted) {
@@ -2715,9 +2815,10 @@ public:
             accepted=anySkillCasting(ability);
         }
         crash::mark("idle");
-        if(!accepted)throw std::runtime_error("stand-in refused skill "+id);
+        if(!accepted) {lastRefusal=id+" "+refusalReason(ability,id,viewRaw);throw std::runtime_error("stand-in refused skill "+id);}
         return true;
     }
+    std::string lastRefusal;
     void mirrorPlayerCasts(Net& net,Session& link) {
         const auto local=net.snapshot().localId;const auto now=nowMs();
         auto pending=std::move(heldCasts);heldCasts.clear();
@@ -2741,7 +2842,7 @@ public:
             }catch(const std::exception& ex) {
                 ++playerCastsRejected;playerCastError=ex.what();
                 std::string reason=ex.what();
-                replayLog.push_back("slot "+std::to_string(slot)+" "+reason);while(replayLog.size()>24)replayLog.pop_front();
+                replayLog.push_back("slot "+std::to_string(slot)+" "+(reason.rfind("stand-in refused skill ",0)==0&&!lastRefusal.empty()?"refused "+lastRefusal:reason));lastRefusal.clear();while(replayLog.size()>24)replayLog.pop_front();
                 if(reason.rfind("stand-in refused skill ",0)==0) {
                     if(refusedSkills.size()<48||refusedSkills.contains(reason.substr(23)))++refusedSkills[reason.substr(23)];
                     reason="refused";
@@ -2955,7 +3056,9 @@ public:
                 auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity);if(!ability)continue;
                 const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
                 double hp=before-hit.at("amount").get<double>();bool skip=true;
-                if(hp<=0&&api.value<bool>(gm("AbilitySystem","get_isUndeadable","","System.Boolean"),ability))hp=1;
+                // The owner's client already killed it; keeping it at 1 HP left an
+                // unkillable empty-health monster on the host (dungeon waves).
+                if(hp<=0&&ownerOf(key)!=hit.at("from").get<std::uint16_t>()&&api.value<bool>(gm("AbilitySystem","get_isUndeadable","","System.Boolean"),ability))hp=1;
                 if(hp<0)hp=0;
                 api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
                 // Zero health goes through the native death path (OnHpZero, _Die,
@@ -3317,11 +3420,11 @@ public:
         eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* viewRaw=runtime->object_unbox(runtime->context,view);
         if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});}
         auto castMethod=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
-        auto* options=api.parameterValue(castMethod,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
+        auto optionsArg=castOptionsArg(castMethod);
         auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
         eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);bool no=false;
         const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),target);
-        const bool accepted=api.value<bool>(castMethod,caster,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});
+        const bool accepted=api.value<bool>(castMethod,caster,{api.string(id),viewRaw,nullptr,optionsArg.data(),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&no});
         return {{"skill",id},{"key",key},{"distance",std::sqrt(best)},{"accepted",accepted},{"target_hp_before",before}};
     }
     // Development only: move this player within the current level (test setup).
@@ -3743,7 +3846,7 @@ public:
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
-                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
+                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
                     {"player_cast_error",playerCastError},{"last_player_cast",lastPlayerCast},{"actor_effects_blocked",actorEffectsBlocked},
                     {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"weapon_states_applied",weaponStatesApplied},{"weapon_state_error",weaponStateError},{"cooldowns_reset",cooldownsReset},{"squad",squadStatus()},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
