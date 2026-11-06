@@ -69,7 +69,8 @@ class World {
     std::map<std::uint16_t,Avatar> avatars;
     struct Actor {
         std::uint64_t id=0,epoch=0,retry=0;std::uint16_t peer=0;
-        std::string model,templateId,error,weapon;
+        std::string model,templateId,error,weapon;int weaponState=-1,weaponHandle=0;
+        bool outlined=false;std::uint64_t outlineAt=0;
         void* entity=nullptr;void* info=nullptr;
         void* movement=nullptr;
         NativeIdentity identity;
@@ -145,8 +146,12 @@ class World {
     std::uint64_t nativeDeaths=0;
     std::uint64_t guestHitsSent=0,roomHitsApplied=0,playerHitsSent=0,playerHitsTaken=0,enemyCastsSent=0,enemyCastsMirrored=0,enemyCastsRejected=0;
     // Remote player presentation (weapon model, replayed skill casts).
+    struct StandInNotReady:std::runtime_error {using std::runtime_error::runtime_error;};
+    std::deque<std::pair<nlohmann::json,std::uint64_t>> heldCasts; // casts waiting briefly for their stand-in
+    std::map<std::string,std::uint64_t> castRejects,refusedSkills;std::uint64_t playerCastsHeld=0,playerCastsHidden=0;
+    std::set<std::uint16_t> hiddenActors; // peers whose native stand-in model is hidden by the display setting
     std::uint64_t playerCastsSent=0,playerCastsMirrored=0,playerCastsRejected=0,actorEffectsBlocked=0,weaponLookups=0,lastWeaponCheck=0;
-    std::string localWeapon,playerCastError,lastPlayerCast;
+    std::string localWeapon,playerCastError,lastPlayerCast,weaponStateError;std::uint64_t weaponStatesApplied=0,cooldownsReset=0;
     bool guestGatesReady=false,guestRestrictionsActive=false;std::string guestGateError;
     std::map<std::string,std::uint64_t> blockedGuestActions;
     std::uint64_t damageHookCalls=0,guestHitCandidates=0,guestZeroDamage=0,guestHitSendFailed=0,guestDeathsBlocked=0;
@@ -774,10 +779,38 @@ class World {
         lastDiagnosedEnemy=it->first;if(currentEnemy(it->second))diagnoseAI(it->first,it->second.entity);
     }
 #endif
+    // The host's location as guests see it. While the host loads or teleports the
+    // previous location stays published; a new map/position is published only after
+    // the load finished, the world started and the host stood there for a moment.
+    // Otherwise guests are offered (and sent to) the pre-teleport position.
+    struct SettledLocation {std::string key,map,level,dungeon;int levelNum=0;V3 position{};std::string pending;std::uint64_t since=0;bool valid=false;} settled;
+    bool levelLoading() {
+        auto* levelLoader=staticObject("levelLoader");
+        return levelLoader&&api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader);
+    }
     nlohmann::json captureWorld() {
         auto* info=staticObject("worldInfo");auto* levelLoader=staticObject("levelLoader");
         if(!info||!character) return nlohmann::json::object();
         auto position=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
+        {
+            const bool loading=levelLoader&&api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader);
+            const bool started=api.value<bool>(gm("WorldInfo","get_isStarted","","System.Boolean"),info);
+            const int levelNum=api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info);
+            const auto key=mapId+"/"+levelId+"/"+hostDungeonId;
+            auto adopt=[&] {settled.key=key;settled.map=mapId;settled.level=levelId;settled.dungeon=hostDungeonId;settled.levelNum=levelNum;settled.position=position;settled.valid=true;};
+            if(loading||!started) {settled.pending.clear();}
+            else if(!settled.valid) adopt();
+            else if(key==settled.key) {
+                // Same level: a jump (same-map load, official teleport) settles first too.
+                const auto& p=settled.position;const float d=(position.x-p.x)*(position.x-p.x)+(position.z-p.z)*(position.z-p.z);
+                if(d<400.f) {adopt();settled.pending.clear();}
+                else {if(settled.pending!=key+"#jump") {settled.pending=key+"#jump";settled.since=nowMs();}
+                      if(nowMs()-settled.since>=1500) {adopt();settled.pending.clear();}}
+            } else {
+                if(settled.pending!=key) {settled.pending=key;settled.since=nowMs();}
+                if(nowMs()-settled.since>=1500) {adopt();settled.pending.clear();}
+            }
+        }
         nlohmann::json entities=nlohmann::json::array();
         for(const auto& [key,e]:enemies) {
             if(!currentEnemy(e))continue;
@@ -798,9 +831,12 @@ class World {
             auto item=seed;item["owner"]=ownerOf(key);entities.push_back(std::move(item));
         }
         overworldScene();
-        return {{"map",mapId},{"level",levelId},{"dungeon",hostDungeonId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
-            {"loading",levelLoader&&api.value<bool>(gm("GameLevelLoader","get_isLoading","","System.Boolean"),levelLoader)},
-            {"position",{position.x,position.y,position.z}},{"entities",entities}};
+        const bool current=settled.valid&&settled.key==mapId+"/"+levelId+"/"+hostDungeonId&&settled.pending.empty();
+        if(!current) entities=nlohmann::json::array(); // the old level's monsters are gone; the new ones are not settled yet
+        if(!settled.valid) return {{"map",mapId},{"level",levelId},{"dungeon",hostDungeonId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
+            {"loading",true},{"position",{position.x,position.y,position.z}},{"entities",entities}};
+        return {{"map",settled.map},{"level",settled.level},{"dungeon",settled.dungeon},{"level_num",settled.levelNum},
+            {"loading",!current},{"position",{settled.position.x,settled.position.y,settled.position.z}},{"entities",entities}};
     }
     template<class T> void field(void* object,const char* type,const char* name,T value,const char* space="Beyond.Gameplay.Core") {
         auto klass=api.klass(type,"Gameplay.Beyond.dll",space);
@@ -1236,6 +1272,7 @@ class World {
         api.call(gm("Entity","TryStart"),actor.entity);
     }
     void updateActors(Net& net,Session& link) {
+        if(levelLoading()) {if(!actors.empty()||!remoteMembers.empty())dropActors();return;}
         const auto view=net.snapshot();
         if((view.role!=Role::Host&&view.role!=Role::Client)||!link.ready()||!character) {if(!actors.empty())dropActors();return;}
         const auto& snapshot=link.snapshot();
@@ -1830,6 +1867,7 @@ private:
         state.flags=proto::StateValid;
         if(api.value<bool>(entityAlive,entity)) state.flags|=proto::StateAlive;
         if(api.value<bool>(entityCinematic,entity)) state.flags|=proto::StateCinematic;
+        state.flags|=std::uint8_t((weaponStateOf(entity)&7)<<4);
         auto* transform=api.call(getTransform,go);
         const auto position=api.value<V3>(getPosition,transform);const auto rotation=api.value<Q>(getRotation,transform);
         state.position[0]=position.x;state.position[1]=position.y;state.position[2]=position.z;
@@ -1934,7 +1972,12 @@ private:
         auto unwrap=[latestTime](std::uint32_t time){return std::int64_t(latestTime)+std::int32_t(time-latestTime);};
         std::int64_t offset=INT64_MAX;
         for(const auto& s:states) offset=(std::min)(offset,std::int64_t(s.receivedMs)-unwrap(s.state.timeMs));
-        const std::int64_t target=std::int64_t(nowMs())-100-offset;
+        // Draw about two sender intervals in the past (50..150 ms): enough to always have
+        // a snapshot pair on a LAN, without the fixed 100 ms that felt laggy.
+        std::int64_t interval=33;
+        if(states.size()>=2) interval=(unwrap(states.back().state.timeMs)-unwrap(states.front().state.timeMs))/std::int64_t(states.size()-1);
+        const std::int64_t delay=(std::clamp)(interval*2+10,std::int64_t(50),std::int64_t(150));
+        const std::int64_t target=std::int64_t(nowMs())-delay-offset;
         const proto::PlayerState* from=&states.front().state;const proto::PlayerState* to=from;float t=0;
         for(std::size_t i=0;i+1<states.size();++i) {
             const auto& s0=states[i].state;const auto& s1=states[i+1].state;
@@ -1977,12 +2020,116 @@ private:
         auto* component=api.call(entityModel,actor->second.entity);
         return component&&api.call(modelGo,component)==avatar.object;
     }
+    void setActorModelActive(std::uint16_t peer,bool active) {
+        try {
+            auto it=actors.find(peer);if(it==actors.end()||!it->second.entity||!it->second.started||!currentActor(it->second))return;
+            auto* component=api.call(entityModel,it->second.entity);auto* object=component?api.call(modelGo,component):nullptr;
+            if(object&&alive(object))api.call(setActive,object,{&active});
+        }catch(...) {}
+    }
+    bool isStandInEntity(void* entity) const {
+        if(!entity)return false;
+        for(const auto& [peer,a]:actors)if(a.entity==entity&&a.started)return true;
+        for(const auto& [key,member]:remoteMembers)if(member.actor.entity==entity&&member.actor.started)return true;
+        return false;
+    }
+public:
+    // Battle effects from a character other than the controlled one get the
+    // reduced "guard" treatment (guard target layer and LOD: no weapon trails,
+    // ground glows, muzzle flashes, ...). The check compares the effect's LOD source
+    // with the controlled character, so a stand-in's effect gets the controlled
+    // character as its LOD source and is classified again: full presentation. Only
+    // that effect object changes; the player controller is never touched.
+    std::uint64_t standInEffects=0,effectsSourceHidden=0,effectsHidden=0;
+    // Which effects each side produces, by creation path, to compare a local
+    // operator's skill with the same skill replayed on a stand-in.
+    std::map<std::string,std::uint64_t> fxLocal,fxStandIn;
+    std::deque<std::string> replayLog;
+    void countEffect(std::map<std::string,std::uint64_t>& names,const std::string& name) {
+        if(name.empty())return;
+        if(names.size()<96||names.contains(name))++names[name];
+    }
+    std::string effectNameOf(void* effect) {
+        try {return text(api.call(gm("EffectInstance","get_effectName","","System.String","Beyond.Gameplay"),effect));}catch(...) {return {};}
+    }
+    // Animator-state effects (_InnerCreateEffectOnTransform): attribute by the
+    // transform they follow.
+    void observeTransformEffect(void* nameString,void* target) {
+        if(!target||!character||!runtime)return;
+        try {
+            const auto isChild=m("Transform","IsChildOf","UnityEngine.Transform","System.Boolean");
+            auto rootOfEntity=[&](void* entity)->void* {
+                auto* component=entity?api.call(entityModel,entity):nullptr;auto* object=component?api.call(modelGo,component):nullptr;
+                return object?api.call(getTransform,object):nullptr;
+            };
+            const auto name="anim:"+text(nameString);
+            if(auto* own=rootOfEntity(character);own&&api.value<bool>(isChild,target,{own})) {countEffect(fxLocal,name);return;}
+            for(auto& [peer,a]:actors)if(a.started)if(auto* t=rootOfEntity(a.entity);t&&api.value<bool>(isChild,target,{t})) {countEffect(fxStandIn,name);return;}
+            for(auto& [key,mm]:remoteMembers)if(mm.actor.started)if(auto* t=rootOfEntity(mm.actor.entity);t&&api.value<bool>(isChild,target,{t})) {countEffect(fxStandIn,name);return;}
+        }catch(...) {}
+    }
+    void* mainForStandInEffect(void* effect) {
+        if(!effect||!runtime||(actors.empty()&&remoteMembers.empty()))return nullptr;
+        try {
+            auto* source=api.call(gm("BattleNormalEffect","get_source","","Beyond.Gameplay.Core.Entity","Beyond.Gameplay"),effect);
+            if(source&&source==character)countEffect(fxLocal,"battle:"+effectNameOf(effect));
+            if(!isStandInEntity(source))return nullptr;
+            ++standInEffects;countEffect(fxStandIn,"battle:"+effectNameOf(effect));
+            auto* controller=api.call(gm("GameInstance","get_playerController","","Beyond.Gameplay.Core.PlayerController","Beyond.Gameplay"));
+            auto* main=controller?readField<void*>(controller,"PlayerController","mainCharacter"):nullptr;
+            return main&&main!=source?main:nullptr;
+        }catch(const std::exception& e) {effectPromoteError=e.what();return nullptr;}
+    }
+    void promoteEffect(void* effect,void* main) {
+        try {
+            api.call(gm("BattleNormalEffect","SetLodSource","Beyond.Gameplay.Core.Entity","System.Void","Beyond.Gameplay"),effect,{main});
+            ++effectsPromoted;
+            if(!readField<bool>(effect,"EffectInstance","m_sourceVisible","Beyond.Gameplay"))++effectsSourceHidden;
+            if(!readField<bool>(effect,"EffectInstance","m_visible","Beyond.Gameplay"))++effectsHidden;
+        }catch(const std::exception& e) {effectPromoteError=e.what();}
+    }
+private:
+    // Teammates (every stand-in) get an accent outline and rim light through the
+    // character shader's own properties. Re-applied periodically: material changes
+    // (weapon swap, LOD) can reset them.
+    void outlineStandIns() {
+        const auto now=nowMs();
+        auto apply=[&](Actor& a) {
+            if(!a.entity||!a.started||!currentActor(a))return;
+            if(!outlineTeammates) {if(a.outlined)a.id=0;return;} // respawned without the outline
+            if(a.outlined&&now-a.outlineAt<2000)return;
+            a.outlineAt=now;
+            try {
+                if(!outlineIds[0]) {
+                    const auto toId=m("Shader","PropertyToID","System.String","System.Int32");
+                    outlineIds[0]=api.value<int>(toId,nullptr,{api.string("_OutlineColor")});
+                    outlineIds[1]=api.value<int>(toId,nullptr,{api.string("_RimLightColor")});
+                }
+                auto* component=api.call(entityModel,a.entity);
+                auto* helper=component?api.call(gm("BaseModelComponent","get_entityRenderHelper","","Beyond.Gameplay.View.EntityRenderHelper","Beyond.Gameplay.View"),component):nullptr;
+                if(!helper)return;
+                const auto set=gm("EntityRenderHelper","SetVectorToAllMaterial","System.Int32|UnityEngine.Vector4|Beyond.Rendering.EntityVFXRendererMask|System.Boolean","System.Void","Beyond.Gameplay.View");
+                float outline[4]={1.f,.9f,0.f,1.f},rim[4]={1.f,.86f,.08f,1.f};int mask=-67108865;bool multiply=false; // AllWithoutAlphaQuad
+                api.call(set,helper,{&outlineIds[0],outline,&mask,&multiply});
+                api.call(set,helper,{&outlineIds[1],rim,&mask,&multiply});
+                if(!a.outlined)++outlinesApplied;
+                a.outlined=true;outlineError.clear();
+            }catch(const std::exception& e) {outlineError=e.what();}
+        };
+        for(auto& [peer,a]:actors)apply(a);
+        for(auto& [key,member]:remoteMembers)apply(member.actor);
+    }
     void updateRemotes(const Snapshot& view,bool allowed) {
         const auto now=nowMs();
         std::set<std::uint16_t> present;
         for(const auto& peer:view.peers) {
             if(peer.local||!peer.hasInfo) continue;
             present.insert(peer.id);
+            // The native stand-in exists regardless (combat needs it); the display
+            // setting only hides its model. The game may re-enable the model, so this
+            // is enforced every frame.
+            if(!allowed) {setActorModelActive(peer.id,false);hiddenActors.insert(peer.id);}
+            else if(hiddenActors.erase(peer.id))setActorModelActive(peer.id,true);
             auto& a=avatars[peer.id];a.id=peer.id;a.name=peer.info.name;
             const bool fresh=!peer.states.empty()&&now-peer.states.back().receivedMs<3000;
             const auto* latest=fresh?&peer.states.back().state:nullptr;
@@ -2005,7 +2152,8 @@ private:
                 Actor* owned=a.native&&actor!=actors.end()&&actor->second.started?&actor->second:nullptr;
                 // The player's own sampled pose always drives the stand-in, also while a
                 // replayed skill plays its effects and weapon on it.
-                pose(a,peer,owned);}
+                pose(a,peer,owned);
+                if(owned)applyWeaponState(*owned,peer.states.back().state.flags);}
             catch(const std::exception& e) {a.error=e.what();destroyAvatar(a);a.retryAt=now+5000;}
         }
         for(auto it=avatars.begin();it!=avatars.end();) {
@@ -2425,6 +2573,32 @@ public:
         auto result=text(path);
         return result.size()<=512?result:std::string{};
     }
+    // Weapon visibility follows the player's own WeaponComponent state (InFight,
+    // Idle, Hide, ...). A stand-in's body comes from network bones, not from its
+    // animator, so its own state machine never shows the weapon; the player's state
+    // is applied at the highest priority (Perform) instead.
+    int weaponStateOf(void* entity) {
+        try {
+            auto* weapon=api.call(gm("Entity","get_weaponCom","","Beyond.Gameplay.View.WeaponComponent"),entity);
+            return weapon?api.value<int>(gm("WeaponComponent","get_weaponState","","Beyond.Gameplay.View.WeaponComponent.WeaponState","Beyond.Gameplay.View"),weapon):0;
+        }catch(const std::exception& e) {weaponStateError=e.what();return 0;}
+    }
+    void applyWeaponState(Actor& actor,std::uint8_t flags) {
+        const int state=(flags>>4)&7;
+        if(!actor.entity||!actor.started||state==actor.weaponState||state>5)return;
+        try {
+            auto* weapon=api.call(gm("Entity","get_weaponCom","","Beyond.Gameplay.View.WeaponComponent"),actor.entity);
+            if(!weapon)return;
+            int perform=6;bool keep=false,immediate=false,force=true;
+            if(actor.weaponHandle)api.call(gm("WeaponComponent","DisablePriority","Beyond.Gameplay.View.WeaponComponent.WeaponStatePriority|System.Int32|System.Boolean|System.Boolean","System.Void","Beyond.Gameplay.View"),weapon,{&perform,&actor.weaponHandle,&keep,&immediate});
+            actor.weaponHandle=0;
+            if(state!=0) {
+                int value=state;
+                actor.weaponHandle=api.value<int>(gm("WeaponComponent","SetWeaponState","Beyond.Gameplay.View.WeaponComponent.WeaponState|Beyond.Gameplay.View.WeaponComponent.WeaponStatePriority|System.Boolean","System.Int32","Beyond.Gameplay.View"),weapon,{&value,&perform,&force});
+            }
+            actor.weaponState=state;++weaponStatesApplied;
+        }catch(const std::exception& e) {weaponStateError=e.what();actor.weaponState=state;}
+    }
     // A stand-in's char instance ID is not in this account's character bag, so the
     // game finds no weapon for it; the lookup hook answers with the player's own.
     void* actorWeaponString(std::uint64_t charInstId) {
@@ -2482,7 +2656,7 @@ public:
         Actor* standIn=nullptr;
         if(slot==0) {if(auto actor=actors.find(peer);actor!=actors.end())standIn=&actor->second;}
         else if(auto member=remoteMembers.find({peer,slot-1});member!=remoteMembers.end())standIn=&member->second.actor;
-        if(!standIn||!standIn->entity||!standIn->started||!currentActor(*standIn))throw std::runtime_error("stand-in not ready");
+        if(!standIn||!standIn->entity||!standIn->started||!currentActor(*standIn))throw StandInNotReady("stand-in not ready");
         auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),standIn->entity);
         if(!ability)throw std::runtime_error("stand-in has no ability system");
         void* skill=nullptr;
@@ -2490,12 +2664,32 @@ public:
         if(!skill)throw std::runtime_error("stand-in lacks skill "+id);
         auto* view=runtime->object_new(runtime->context,api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
         eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* viewRaw=runtime->object_unbox(runtime->context,view);
+        bool targeted=false;
         if(auto e=enemies.find(key);!key.empty()&&e!=enemies.end()&&currentEnemy(e->second)) {
             if(auto* targetAbility=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity)) {
                 float limit=120.f;auto* handle=api.call(gm("Skill","GetDefaultTarget","Beyond.Gameplay.Core.AbilitySystem|System.Single","Beyond.Gameplay.Core.TargetHandle"),skill,{targetAbility,&limit});
-                if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});}
+                if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});targeted=true;}
             }
         }
+        if(!targeted) {
+            // A swing into empty air: the game passes the shared empty target, not a
+            // null one (which casts refuse).
+            auto klass=api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
+            if(auto* field=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,"EMPTY_VIEW")) {
+                void* empty=nullptr;symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field,&empty);
+                if(empty)std::memcpy(viewRaw,&empty,sizeof empty);
+            }
+        }
+        // The player could cast it, so the stand-in can too: its cooldowns (other gear,
+        // other timing) must not refuse a replay.
+        try {
+            const auto remaining=gm("Skill","get_cdRemainingTime","","System.Single");
+            if(api.value<float>(remaining,skill)>0) {
+                float ready=1.f;api.call(gm("Skill","SetCdProgress","System.Single","System.Void"),skill,{&ready});
+                if(api.value<float>(remaining,skill)>0) {ready=0.f;api.call(gm("Skill","SetCdProgress","System.Single","System.Void"),skill,{&ready});}
+                ++cooldownsReset;
+            }
+        }catch(...) {}
         // A stand-in has no energy economy of its own; an ultimate the player could
         // cast must be castable here too.
         float sp=api.value<float>(gm("AbilitySystem","get_maxUltimateSp","","System.Single"),ability);
@@ -2525,13 +2719,38 @@ public:
         return true;
     }
     void mirrorPlayerCasts(Net& net,Session& link) {
-        const auto local=net.snapshot().localId;
-        for(const auto& cast:link.takePlayerCasts()) {
+        const auto local=net.snapshot().localId;const auto now=nowMs();
+        auto pending=std::move(heldCasts);heldCasts.clear();
+        for(auto& cast:link.takePlayerCasts())pending.emplace_back(std::move(cast),now);
+        for(auto& [cast,at]:pending) {
+            int slot=0;
             try {
-                const auto origin=cast.at("origin").get<std::uint16_t>();
+                const auto origin=cast.at("origin").get<std::uint16_t>();slot=cast.value("slot",0);
                 if(origin==local||!replaySkills)continue;
-                if(replayPlayerCast(origin,cast.value("slot",0),cast.at("skill").get<std::string>(),cast.value("target",std::string{})))++playerCastsMirrored;
-            }catch(const std::exception& ex){++playerCastsRejected;playerCastError=ex.what();}
+                // Hidden players (display settings) play nothing here.
+                if(!showRemote||(slot>0&&!showSquad)) {++playerCastsHidden;continue;}
+                if(replayPlayerCast(origin,slot,cast.at("skill").get<std::string>(),cast.value("target",std::string{}))) {
+                    ++playerCastsMirrored;replayLog.push_back(std::to_string(origin)+"/"+std::to_string(slot)+" "+cast.at("skill").get<std::string>()+" ok");
+                    while(replayLog.size()>24)replayLog.pop_front();
+                }
+            }catch(const StandInNotReady& ex) {
+                // The stand-in is being (re)created, e.g. after an operator switch: keep
+                // the cast briefly instead of losing its effects.
+                if(now-at<700&&heldCasts.size()<32) {heldCasts.emplace_back(std::move(cast),at);++playerCastsHeld;continue;}
+                ++playerCastsRejected;playerCastError=ex.what();++castRejects["slot "+std::to_string(slot)+": not ready"];
+            }catch(const std::exception& ex) {
+                ++playerCastsRejected;playerCastError=ex.what();
+                std::string reason=ex.what();
+                replayLog.push_back("slot "+std::to_string(slot)+" "+reason);while(replayLog.size()>24)replayLog.pop_front();
+                if(reason.rfind("stand-in refused skill ",0)==0) {
+                    if(refusedSkills.size()<48||refusedSkills.contains(reason.substr(23)))++refusedSkills[reason.substr(23)];
+                    reason="refused";
+                } else if(reason.rfind("stand-in lacks skill ",0)==0) {
+                    if(refusedSkills.size()<48||refusedSkills.contains("lacks "+reason.substr(21)))++refusedSkills["lacks "+reason.substr(21)];
+                    reason="lacks skill";
+                }
+                if(castRejects.size()<32||castRejects.contains("slot "+std::to_string(slot)+": "+reason))++castRejects["slot "+std::to_string(slot)+": "+reason];
+            }
         }
     }
     void mirrorEnemyCasts(Net& net,Session& link) {
@@ -3148,7 +3367,8 @@ public:
     // from their own sampled skeleton, with their weapon and replayed skills
     // (combo skills are cast by these members). Presentation only: stand-ins
     // neither affect anyone nor can be hurt.
-    bool showSquad=true,replaySkills=true;
+    bool showSquad=true,replaySkills=true,outlineTeammates=true;
+    int outlineIds[2]{};std::uint64_t outlinesApplied=0,effectsPromoted=0;std::string outlineError,effectPromoteError;
     struct LocalMember {
         void* entity=nullptr;void* go=nullptr;std::uint32_t goRoot=0;
         std::vector<Bone> bones;std::vector<std::string> names;std::uint16_t skeleton=0;
@@ -3207,6 +3427,7 @@ public:
             proto::PlayerState state;state.timeMs=std::uint32_t(now);state.mapHash=mapHash;state.sequence=++squadSequence;state.skeleton=m.skeleton;
             state.flags=proto::StateValid;
             if(api.value<bool>(entityAlive,entity))state.flags|=proto::StateAlive;
+            state.flags|=std::uint8_t((weaponStateOf(entity)&7)<<4);
             auto* transform=api.call(getTransform,go);
             const auto position=api.value<V3>(getPosition,transform);const auto rotation=api.value<Q>(getRotation,transform);
             state.position[0]=position.x;state.position[1]=position.y;state.position[2]=position.z;
@@ -3292,7 +3513,7 @@ public:
     }
     void updateSquadActors(Net& net,Session& link) {
         const auto view=net.snapshot();
-        const bool active=(view.role==Role::Host||view.role==Role::Client)&&link.ready()&&character&&showSquad&&showRemote&&!mapId.empty();
+        const bool active=(view.role==Role::Host||view.role==Role::Client)&&link.ready()&&character&&showSquad&&showRemote&&!mapId.empty()&&!levelLoading();
         int levelNumber=0;
         if(auto* info=staticObject("worldInfo"))levelNumber=api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info);
         for(auto it=remoteMembers.begin();it!=remoteMembers.end();) {
@@ -3341,7 +3562,7 @@ public:
                 }
                 a.skeleton=0xFFFF;
             }
-            try {pose(a,m.view,&actor);}catch(const std::exception& e) {squadError=e.what();a=Avatar{};}
+            try {pose(a,m.view,&actor);applyWeaponState(actor,m.view.states.back().state.flags);}catch(const std::exception& e) {squadError=e.what();a=Avatar{};}
         }
     }
     nlohmann::json squadStatus() const {
@@ -3454,7 +3675,7 @@ public:
         else if(!showMarkers) markers=nlohmann::json::array();
         const auto remotesStart=std::chrono::steady_clock::now();
         try {
-            if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) {crash::mark("remotes");updateRemotes(net.snapshot(),showRemote);crash::mark("squad_pose");poseSquad();crash::mark("world_tick");}
+            if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) {crash::mark("remotes");updateRemotes(net.snapshot(),showRemote);crash::mark("squad_pose");poseSquad();crash::mark("outline");outlineStandIns();crash::mark("world_tick");}
             else {if(!avatars.empty()) clear();if(!remoteMembers.empty()) {for(auto& [key,member]:remoteMembers)dropMember(member);remoteMembers.clear();}}
         } catch(const std::exception& e) {localError=e.what();}
         try {if((net.currentRole()==Role::Host&&roomHost)||(net.currentRole()==Role::Client&&guestRealm))updateEnemyMotion();}
@@ -3522,9 +3743,9 @@ public:
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
-                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},
+                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
                     {"player_cast_error",playerCastError},{"last_player_cast",lastPlayerCast},{"actor_effects_blocked",actorEffectsBlocked},
-                    {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"squad",squadStatus()},
+                    {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"weapon_states_applied",weaponStatesApplied},{"weapon_state_error",weaponStateError},{"cooldowns_reset",cooldownsReset},{"squad",squadStatus()},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
                     {"owned_here",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second==localPeer;})},
                     {"owned_by_others",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second!=localPeer;})},

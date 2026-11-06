@@ -158,6 +158,34 @@ bool __fastcall onWeaponModel(std::uint64_t scope,std::uint64_t charInstId,void*
     }
     return nextWeaponModel(scope,charInstId,path,info);
 }
+// BattleNormalEffect._RefreshGuardLodAlpha(Nullable<bool>): decides whether a battle
+// effect is shown in full (controlled character) or reduced (guard). Stand-in
+// effects are promoted to full; see World::promoteEffect.
+using GuardLod=void(__fastcall*)(void*,std::uint64_t,void*);
+GuardLod nextGuardLod=nullptr;BE_ResolvedMethodV1 guardLodMethod{};bool guardLodHooked=false;
+void __fastcall onGuardLod(void* effect,std::uint64_t dynamicChange,void* info) {
+    if(!nextGuardLod)return;
+    static thread_local int depth=0;
+    if(depth||(info&&info!=guardLodMethod.method_info)||cleanupRequested) {nextGuardLod(effect,dynamicChange,info);return;}
+    std::lock_guard lock(worldMutex);
+    void* main=world.mainForStandInEffect(effect);
+    nextGuardLod(effect,dynamicChange,info);
+    if(main) {
+        // SetLodSource classifies the effect again (through this hook, passed straight on).
+        struct Depth {Depth(){++depth;} ~Depth(){--depth;}} guard;
+        world.promoteEffect(effect,main);
+    }
+}
+// EffectManager._InnerCreateEffectOnTransform: animator-state effects. Returns a
+// 16-byte ObjectPtr through a hidden buffer (rcx), then this, name, target, ...;
+// every argument is forwarded unchanged and only observed afterwards.
+using TransformEffect=void*(__fastcall*)(void*,void*,void*,void*,std::uint64_t,void*,void*,void*,void*);
+TransformEffect nextTransformEffect=nullptr;BE_ResolvedMethodV1 transformEffectMethod{};bool transformEffectHooked=false;
+void* __fastcall onTransformEffect(void* ret,void* self,void* name,void* target,std::uint64_t followRot,void* offset,void* followScale,void* timeScale,void* info) {
+    auto* result=nextTransformEffect(ret,self,name,target,followRot,offset,followScale,timeScale,info);
+    if(info==transformEffectMethod.method_info&&!cleanupRequested) {std::lock_guard lock(worldMutex);world.observeTransformEffect(name,target);}
+    return result;
+}
 // Windows x64: TargetHandleView is exactly one pointer-sized value; the
 // Nullable<CastSkillOptions> value (> 8 bytes) is passed indirectly. Validate
 // the target view layout from runtime metadata before installing this hook.
@@ -541,6 +569,14 @@ BE_Result installHook() {
         if(api->resolve_method(api->context,&enableFind,&enableEnemyFindMethod)==BE_Result_Ok&&enableEnemyFindMethod.method_pointer) {
             std::uint64_t enableHandle=0;enableEnemyFindHooked=host.hooks->create(host.hooks->context,kId,enableEnemyFindMethod.method_pointer,reinterpret_cast<void*>(onEnableEnemyFind),reinterpret_cast<void**>(&nextEnableEnemyFind),&enableHandle)==BE_Result_Ok;
         }
+        BE_MethodDescriptorV1 guardLod{"Gameplay.Beyond.dll","Beyond.Gameplay","BattleNormalEffect","_RefreshGuardLodAlpha",nullptr,"System.Void",1};
+        if(api->resolve_method(api->context,&guardLod,&guardLodMethod)==BE_Result_Ok&&guardLodMethod.method_pointer) {
+            std::uint64_t guardHandle=0;guardLodHooked=host.hooks->create(host.hooks->context,kId,guardLodMethod.method_pointer,reinterpret_cast<void*>(onGuardLod),reinterpret_cast<void**>(&nextGuardLod),&guardHandle)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 transformEffect{"Gameplay.Beyond.dll","Beyond.Gameplay","EffectManager","_InnerCreateEffectOnTransform",nullptr,nullptr,6};
+        if(api->resolve_method(api->context,&transformEffect,&transformEffectMethod)==BE_Result_Ok&&transformEffectMethod.method_pointer) {
+            std::uint64_t effectHandle=0;transformEffectHooked=host.hooks->create(host.hooks->context,kId,transformEffectMethod.method_pointer,reinterpret_cast<void*>(onTransformEffect),reinterpret_cast<void**>(&nextTransformEffect),&effectHandle)==BE_Result_Ok;
+        }
         BE_MethodDescriptorV1 weaponModel{"Gameplay.Beyond.dll","Beyond.Gameplay","WeaponUtil","TryGetWeaponModelPathByCharInstId",nullptr,"System.Boolean",3};
         if(api->resolve_method(api->context,&weaponModel,&weaponModelMethod)==BE_Result_Ok&&weaponModelMethod.method_pointer) {
             std::uint64_t weaponHandle=0;weaponModelHooked=host.hooks->create(host.hooks->context,kId,weaponModelMethod.method_pointer,reinterpret_cast<void*>(onWeaponModel),reinterpret_cast<void**>(&nextWeaponModel),&weaponHandle)==BE_Result_Ok;
@@ -580,6 +616,7 @@ void applyConfiguration(const json& value) {
     world.showRemote=configuration.value("show_remote_players",true);
     world.showSquad=configuration.value("show_remote_squad",true);
     world.replaySkills=configuration.value("replay_skills",true);
+    world.outlineTeammates=configuration.value("outline_teammates",true);
     world.showMarkers=configuration.value("show_player_markers",true);
     session.followHost=configuration.value("follow_host_world",true);
     session.combat=configuration.value("sync_combat",true);
@@ -638,7 +675,7 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs}}}};
@@ -767,7 +804,7 @@ json perform(const json& input) {
     else if(action=="kick") {if(net.currentRole()!=eflink::Role::Host) throw std::runtime_error("只有房主能移出玩家");net.kick(input.at("id").get<std::uint16_t>());}
     else if(action=="set_name") {auto changed=configuration;changed["player_name"]=input.at("name");applyConfiguration(changed);save=true;}
     else if(action=="show_remote") {auto changed=configuration;changed["show_remote_players"]=input.at("enabled");applyConfiguration(changed);save=true;}
-    else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","show_player_markers","follow_host_world","sync_combat"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
+    else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
     else if(action=="save_server"||action=="remove_server") {
         auto address=input.at("address").get<std::string>();if(address.empty()||address.size()>256) throw std::runtime_error("请填写有效地址");
         auto servers=configuration.value("saved_servers",json::array());json updated=json::array();
@@ -846,7 +883,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
+        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     eflink::crash::uninstall();

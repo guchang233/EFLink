@@ -109,7 +109,7 @@ struct Ui {
     std::string toast;std::uint64_t toastAt=0;bool toastError=false;
     int page=0;bool open=false,closeRequested=false,initialized=false,leaveConfirm=false,kickPending=false;int kickId=-1;
     char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
-    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,squad=true,replay=true,markers=true,follow=true,combat=true;
+    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,squad=true,replay=true,outline=true,markers=true,follow=true,combat=true;
     std::uint64_t lastChat=0,lastMapPrompt=0;
     void say(std::string text,bool error) {toast=std::move(text);toastAt=now();toastError=error;}
     void act(json input) {const auto a=str(input,"action");actions.push_back({post(input),a,now()});}
@@ -118,7 +118,7 @@ struct Ui {
         initialized=true;copyText(name,sizeof name,str(state,"name"));
         const auto c=state.value("configuration",json::object());copyText(room,sizeof room,str(c,"room_name"));
         port=c.value("port",47615);limit=c.value("max_players",8);key=c.value("menu_key",kDefaultMenuKey);
-        remote=c.value("show_remote_players",true);squad=c.value("show_remote_squad",true);replay=c.value("replay_skills",true);markers=c.value("show_player_markers",true);
+        remote=c.value("show_remote_players",true);squad=c.value("show_remote_squad",true);replay=c.value("replay_skills",true);outline=c.value("outline_teammates",true);markers=c.value("show_player_markers",true);
         follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);
     }
     void poll(bool menuOpen) {
@@ -143,48 +143,62 @@ struct Ui {
     bool online() const {const auto r=role();return r=="host"||r=="client";}
     void saveSettings() {
         act({{"action","settings"},{"configuration",{{"player_name",name},{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},
-            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});
+            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"outline_teammates",outline},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});
         say("设置已保存",false);
+    }
+    // Display and co-op switches take effect immediately (and are saved).
+    void applySwitches() {
+        act({{"action","settings"},{"configuration",{{"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"outline_teammates",outline},
+            {"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});
     }
     void join() {if(*address) act({{"action","join"},{"address",address},{"password",joinPassword}});else say("请输入房主地址",true);}
 
     // ---- HUD ----
+    static void shadowText(ImDrawList* d,ImVec2 at,ImU32 tint,const char* text) {
+        d->AddText({at.x+1,at.y+1},IM_COL32(0,0,0,170),text);d->AddText(at,tint,text);
+    }
+    // Endfield-style markers: a small accent diamond over each other player with
+    // "02 name 23m" above it; an accent arrow at the screen edge when off-screen.
     void drawHud(ImVec2 size) {
         auto* d=ImGui::GetBackgroundDrawList();
         const bool tags=online()&&state.value("configuration",json::object()).value("show_player_markers",true);
         if(tags) {
             ImGui::PushFont(fonts.note);
+            const auto accent=color::u32(color::accent),white=color::u32(color::text),ink=color::u32(color::ink);
+            std::map<int,float> distances;
             for(const auto& m:hud.value("markers",json::array())) {
-                if(m.value("other_map",false)) continue;
+                if(m.value("other_map",false)||m.value("self",false)) continue;
+                const int id=m.value("id",0);const float dist=m.value("distance",0.f);distances[id]=dist;
                 float x=m.value("x",.5f)*size.x,y=m.value("y",.5f)*size.y;
                 if(!std::isfinite(x)||!std::isfinite(y)) continue;
-                const bool self=m.value("self",false),host=m.value("host",false);
-                bool off=m.value("behind",false)||x<24||y<24||x>size.x-24||y>size.y-24;
-                if(self&&off) continue;
-                if(off) {
-                    float dx=x-size.x*.5f,dy=y-size.y*.5f;if(m.value("behind",false)) {dx=-dx;dy=-dy;}
+                const bool behind=m.value("behind",false);
+                char idText[8];std::snprintf(idText,sizeof idText,"%02d",id);
+                char distText[24];std::snprintf(distText,sizeof distText,"%.0fm",dist);
+                if(behind||x<40||y<40||x>size.x-40||y>size.y-40) {
+                    float dx=x-size.x*.5f,dy=y-size.y*.5f;if(behind) {dx=-dx;dy=-dy;}
                     if(std::abs(dx)+std::abs(dy)<.001f) dy=-1;
-                    const float k=1.f/(std::max)(std::abs(dx)/(std::max)(1.f,size.x*.5f-60),std::abs(dy)/(std::max)(1.f,size.y*.5f-60));
-                    x=size.x*.5f+dx*k;y=size.y*.5f+dy*k;
+                    const float len=std::sqrt(dx*dx+dy*dy),ux=dx/len,uy=dy/len;
+                    const float k=1.f/(std::max)(std::abs(dx)/(std::max)(1.f,size.x*.5f-44),std::abs(dy)/(std::max)(1.f,size.y*.5f-44));
+                    const float ex=size.x*.5f+dx*k,ey=size.y*.5f+dy*k;
+                    d->AddTriangleFilled({ex+ux*9,ey+uy*9},{ex-uy*7-ux*5,ey+ux*7-uy*5},{ex+uy*7-ux*5,ey-ux*7-uy*5},accent);
+                    char label[48];std::snprintf(label,sizeof label,"%s %s",idText,distText);
+                    const auto ts=ImGui::CalcTextSize(label);
+                    shadowText(d,{ex-ux*24-ts.x*.5f,ey-uy*24-ts.y*.5f},white,label);
+                    continue;
                 }
-                char head[160];std::snprintf(head,sizeof head,"#%d  %s",m.value("id",0),str(m,"name").c_str());
-                char tail[64];
-                if(self) std::snprintf(tail,sizeof tail,"你");
-                else std::snprintf(tail,sizeof tail,"%.0f m",m.value("distance",0.f));
-                const auto hs=ImGui::CalcTextSize(head),ts=ImGui::CalcTextSize(tail);
-                const float w=hs.x+ts.x+30,h=hs.y+10;
-                const float left=(std::clamp)(x-w*.5f,6.f,(std::max)(6.f,size.x-w-6)),top=(std::clamp)(y-h-10,6.f,(std::max)(6.f,size.y-h-6));
-                const auto tint=self?color::info:host?color::accent:color::ok;
-                d->AddRectFilled({left,top},{left+w,top+h},color::u32(color::base,.82f),4);
-                d->AddRectFilled({left,top},{left+3,top+h},color::u32(tint),4,ImDrawFlags_RoundCornersLeft);
-                d->AddText({left+10,top+5},color::u32(color::text),head);
-                d->AddText({left+w-ts.x-9,top+5},color::u32(tint),tail);
-                if(off) d->AddCircleFilled({x,y},5,color::u32(tint));
-                else d->AddTriangleFilled({x-5,top+h},{x+5,top+h},{x,top+h+6},color::u32(color::base,.82f));
+                const float r=4.5f;const ImVec2 c{x,y-4};
+                d->AddQuadFilled({c.x,c.y-r},{c.x+r,c.y},{c.x,c.y+r},{c.x-r,c.y},accent);
+                const auto who=str(m,"name");
+                const auto is=ImGui::CalcTextSize(idText),ns=ImGui::CalcTextSize(who.c_str()),ds=ImGui::CalcTextSize(distText);
+                const float w=is.x+6+8+ns.x+8+ds.x,left=x-w*.5f,top=c.y-r-8-is.y;
+                d->AddRectFilled({left,top-1},{left+is.x+6,top+is.y+1},accent);
+                d->AddText({left+3,top},ink,idText);
+                shadowText(d,{left+is.x+14,top},white,who.c_str());
+                shadowText(d,{left+is.x+14+ns.x+8,top},accent,distText);
             }
+            drawRoster(size,distances);
             ImGui::PopFont();
         }
-        if(online()&&tags) drawRoster(size);
         if(!toast.empty()&&now()-toastAt<4000&&!open) {
             ImGui::PushFont(fonts.body);const auto ts=ImGui::CalcTextSize(toast.c_str());
             const ImVec2 p{size.x*.5f-ts.x*.5f-16,size.y-140};
@@ -200,30 +214,32 @@ struct Ui {
             d->AddText({p.x+16,p.y+9},color::u32(color::accent),text.c_str());ImGui::PopFont();
         }
     }
-    void drawRoster(ImVec2 size) {
+    // Member list at the right edge: id tile, name, distance. No coordinates.
+    void drawRoster(ImVec2 size,const std::map<int,float>& distances) {
         auto* d=ImGui::GetBackgroundDrawList();
         const auto peers=state.value("peers",json::array());
-        ImGui::PushFont(fonts.note);
-        const float line=ImGui::GetTextLineHeight(),width=330;
-        const float height=34+peers.size()*(line*2+12);
-        const ImVec2 p{size.x-width-18,size.y*.24f};
-        d->AddRectFilled(p,{p.x+width,p.y+height},color::u32(color::base,.72f),6);
-        d->AddRectFilled(p,{p.x+width,p.y+3},color::u32(color::accent),6,ImDrawFlags_RoundCornersTop);
-        auto roomName=str(state.value("room",json::object()),"name");if(roomName.empty()) roomName="房间";
-        char head[160];std::snprintf(head,sizeof head,"EF LINK  ·  %s  ·  %s",role()=="host"?"房主":"房客",roomName.c_str());
-        d->AddText({p.x+12,p.y+10},color::u32(color::accent),head);
-        if(role()=="client") {char rtt[32];std::snprintf(rtt,sizeof rtt,"%u ms",state.value("rtt_ms",0u));d->AddText({p.x+width-ImGui::CalcTextSize(rtt).x-12,p.y+10},color::u32(color::dim),rtt);}
-        float y=p.y+34;
+        const float line=ImGui::GetTextLineHeight(),width=240,x=size.x-width-20;float y=size.y*.3f;
+        const auto accent=color::u32(color::accent),white=color::u32(color::text),dim=color::u32(color::dim),ink=color::u32(color::ink);
+        auto roomName=str(state.value("room",json::object()),"name");if(roomName.empty()) roomName=role()=="host"?"我的房间":"房间";
+        const std::string head="EF LINK // "+roomName;
+        d->AddRectFilled({x,y+2},{x+3,y+line-2},accent);
+        shadowText(d,{x+9,y},accent,head.c_str());
+        if(role()=="client") {char rtt[32];std::snprintf(rtt,sizeof rtt,"%ums",state.value("rtt_ms",0u));shadowText(d,{x+width-ImGui::CalcTextSize(rtt).x,y},dim,rtt);}
+        y+=line+5;d->AddLine({x,y},{x+width,y},color::u32(color::accent,.4f));y+=6;
         for(const auto& peer:peers) {
-            const bool self=peer.value("local",false),host=peer.value("host",false),valid=peer.value("valid",false);
-            char who[160];std::snprintf(who,sizeof who,"#%d  %s%s%s",peer.value("id",0),str(peer,"name").c_str(),host?"  [房主]":"",self?"  [你]":"");
-            d->AddCircleFilled({p.x+14,y+line*.5f},3.5f,color::u32(!valid?color::faint:self?color::info:host?color::accent:color::ok));
-            d->AddText({p.x+24,y},color::u32(color::text),who);
-            std::string where=valid?formatPosition(peer.value("position",json::array()))+"   "+str(peer,"level",str(peer,"map","")):"等待角色状态";
-            d->AddText({p.x+24,y+line+2},color::u32(color::dim),where.c_str());
-            y+=line*2+12;
+            const int id=peer.value("id",0);const bool self=peer.value("local",false),host=peer.value("host",false),valid=peer.value("valid",false);
+            char idText[8];std::snprintf(idText,sizeof idText,"%02d",id);const auto is=ImGui::CalcTextSize(idText);
+            d->AddRectFilled({x,y},{x+is.x+6,y+line},!valid?color::u32(color::faint):self?white:accent);
+            d->AddText({x+3,y},ink,idText);
+            std::string who=str(peer,"name");if(host) who+="  房主";
+            shadowText(d,{x+is.x+14,y},valid?white:dim,who.c_str());
+            char right[24];
+            if(self) std::snprintf(right,sizeof right,"你");
+            else if(auto it=distances.find(id);it!=distances.end()) std::snprintf(right,sizeof right,"%.0fm",it->second);
+            else std::snprintf(right,sizeof right,"—");
+            shadowText(d,{x+width-ImGui::CalcTextSize(right).x,y},self?dim:accent,right);
+            y+=line+6;
         }
-        ImGui::PopFont();
     }
 
     // ---- menu ----
@@ -417,15 +433,18 @@ struct Ui {
         label("菜单快捷键");ImGui::SetNextItemWidth(160);if(ImGui::Combo("##key",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
         endCard();
         beginCard("##display","显示",fonts.title);
-        ImGui::Checkbox("显示其他玩家的角色",&remote);
-        ImGui::BeginDisabled(!remote);ImGui::Checkbox("同时显示其他玩家队伍中的另外三名干员",&squad);
-        ImGui::Checkbox("在其他玩家的角色上重放技能动作、武器与特效",&replay);ImGui::EndDisabled();
-        ImGui::Checkbox("显示玩家名牌与房间成员面板（编号、坐标、距离）",&markers);
+        bool changed=ImGui::Checkbox("显示其他玩家的角色",&remote);
+        ImGui::BeginDisabled(!remote);changed|=ImGui::Checkbox("同时显示其他玩家队伍中的另外三名干员",&squad);
+        changed|=ImGui::Checkbox("在其他玩家的角色上重放技能动作、武器与特效",&replay);
+        changed|=ImGui::Checkbox("给其他玩家的角色加上黄色描边",&outline);ImGui::EndDisabled();
+        changed|=ImGui::Checkbox("显示玩家标记与成员列表（编号、名字、距离）",&markers);
         endCard();
         beginCard("##coop","联机",fonts.title);
-        ImGui::Checkbox("作为房客时跟随房主的地图",&follow);
-        ImGui::Checkbox("同步战斗（共同攻击房主世界的敌人）",&combat);
+        changed|=ImGui::Checkbox("作为房客时跟随房主的地图",&follow);
+        changed|=ImGui::Checkbox("同步战斗（共同攻击房主世界的敌人）",&combat);
         endCard();
+        if(changed) applySwitches();
+        label("勾选项立即生效；名称、快捷键等需点击保存。");
         if(accentButton("保存设置",{0,0})) saveSettings();
         ImGui::Dummy({0,8});
         beginCard("##tools","工具",fonts.title);
