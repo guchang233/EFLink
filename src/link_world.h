@@ -1,7 +1,9 @@
 #pragma once
 // EF Link game side. Everything here runs on the game thread (CameraManager.TailLateTick):
 // it creates independent native room actors and samples local operator presentation.
+#include <array>
 #include "link_net.h"
+#include "link_crash.h"
 #include "link_session.h"
 #include "unity_bridge.h"
 #include "link_native_identity.h"
@@ -25,13 +27,15 @@ inline constexpr bool legacyReplicaAdapterAvailable=false;
 // its own account monsters leave view natively instead of being hidden.
 inline constexpr bool nativeFeedAdapter=true;
 inline constexpr bool roomAdapterAvailable=legacyReplicaAdapterAvailable||nativeFeedAdapter;
+// Squad member poses (unreliable) and descriptions (reliable) of every player.
+inline const std::uint32_t squadChannel=proto::fnv32("eflink.squad.v1");
 class World {
     using V3=eflink::unity::V3;using Q=eflink::unity::Quaternion;
     eflink::unity::Api api;
     const BE_HostApiV1* runtime=nullptr;
     HMODULE assembly=nullptr;
     bool resolved=false;
-    BE_ResolvedMethodV1 mainCharacter{},entityAlive{},entityCinematic{},entityModel{},modelGo{},modelPath{},
+    BE_ResolvedMethodV1 mainCharacter{},utilMainCharacter{},instanceMainCharacter{},entityAlive{},entityCinematic{},entityModel{},modelGo{},modelPath{},
         getTransform{},getPosition{},getRotation{},setPosition{},setRotation{},getLocalRotation{},setLocalRotation{},
         getLocalPosition{},setLocalPosition{},isAlive{},objectName{},setActive{},destroy{},
         childrenOf{},mapIdText{},levelIdText{},instantiate{},handleGet{},pathHash{},behaviourEnabled{},colliderEnabled{};
@@ -65,12 +69,12 @@ class World {
     std::map<std::uint16_t,Avatar> avatars;
     struct Actor {
         std::uint64_t id=0,epoch=0,retry=0;std::uint16_t peer=0;
-        std::string model,templateId,error;
+        std::string model,templateId,error,weapon;
         void* entity=nullptr;void* info=nullptr;
         void* movement=nullptr;
         NativeIdentity identity;
         std::uint32_t entityRoot=0,infoRoot=0;
-        bool registered=false,inited=false,started=false,aiPaused=false,bound=false,hpInitialized=false,casting=false,abilityTicking=false;
+        bool registered=false,inited=false,started=false,aiPaused=false,bound=false,hpInitialized=false,casting=false,abilityTicking=false,squad=false;
         double hp=0,maxHp=0;std::size_t skillCount=0;
         std::map<std::string,Realm::SkillRule> catalog;
         std::uint64_t teleports=0;
@@ -140,6 +144,9 @@ class World {
     nlohmann::json nativeHits=nlohmann::json::array();
     std::uint64_t nativeDeaths=0;
     std::uint64_t guestHitsSent=0,roomHitsApplied=0,playerHitsSent=0,playerHitsTaken=0,enemyCastsSent=0,enemyCastsMirrored=0,enemyCastsRejected=0;
+    // Remote player presentation (weapon model, replayed skill casts).
+    std::uint64_t playerCastsSent=0,playerCastsMirrored=0,playerCastsRejected=0,actorEffectsBlocked=0,weaponLookups=0,lastWeaponCheck=0;
+    std::string localWeapon,playerCastError,lastPlayerCast;
     bool guestGatesReady=false,guestRestrictionsActive=false;std::string guestGateError;
     std::map<std::string,std::uint64_t> blockedGuestActions;
     std::uint64_t damageHookCalls=0,guestHitCandidates=0,guestZeroDamage=0,guestHitSendFailed=0,guestDeathsBlocked=0;
@@ -275,6 +282,10 @@ class World {
         resolveRetryAt=nowMs()+5000;
         constexpr const char* G="Gameplay.Beyond.dll";
         mainCharacter=m("PlayerController","GetMainCharacter","","Beyond.Gameplay.Core.Entity",G,"Beyond.Gameplay.Core");
+        // Game 1.6.3: PlayerController.GetMainCharacter returns null in the open world;
+        // these static accessors exist in its metadata (checked 2026-11-06).
+        try {utilMainCharacter=m("GameUtil","get_mainCharacter","","Beyond.Gameplay.Core.Entity",G,"Beyond.Gameplay");}catch(...) {utilMainCharacter={};}
+        try {instanceMainCharacter=m("GameInstance","get_mainCharPtr","","Beyond.Gameplay.Core.Entity",G,"Beyond.Gameplay");}catch(...) {instanceMainCharacter={};}
         entityAlive=m("Entity","get_alive","","System.Boolean",G,"Beyond.Gameplay.Core");
         entityCinematic=m("Entity","get_inCinematic","","System.Boolean",G,"Beyond.Gameplay.Core");
         entityModel=m("Entity","get_modelCom","","Beyond.Gameplay.View.ModelComponent",G,"Beyond.Gameplay.Core");
@@ -333,6 +344,18 @@ class World {
 
     BE_ResolvedMethodV1 gm(const char* type,const char* name,const char* params="",const char* returns="System.Void",const char* space="Beyond.Gameplay.Core") {
         return m(type,name,params,returns,"Gameplay.Beyond.dll",space);
+    }
+    // The controlled character: the first accessor that returns a live entity.
+    std::string mainCharacterSource;
+    void* mainEntity() {
+        const std::pair<const BE_ResolvedMethodV1*,const char*> sources[]={{&mainCharacter,"PlayerController.GetMainCharacter"},
+            {&utilMainCharacter,"GameUtil.get_mainCharacter"},{&instanceMainCharacter,"GameInstance.get_mainCharPtr"}};
+        for(const auto& [method,name]:sources) {
+            if(!method->method_info&&!method->method_pointer)continue;
+            void* entity=nullptr;try {entity=api.call(*method);}catch(...) {entity=nullptr;}
+            if(entity&&usable(entity)) {mainCharacterSource=name;return entity;}
+        }
+        mainCharacterSource.clear();return nullptr;
     }
     void* staticObject(const char* field) {
         auto klass=api.klass("GameWorld","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
@@ -1046,7 +1069,7 @@ class World {
         return infoGrowth(api.call(gm("CharacterRootComponent","get_replicatedCharInfo","","Beyond.Gameplay.CharInfo"),root),localModel);
     }
     void destroyActor(Actor& actor) {
-        if(session)session->unbindPlayer(actor.peer);
+        if(session&&!actor.squad)session->unbindPlayer(actor.peer);
         if(actor.entity) {
             try {if(currentActor(actor))api.call(gm("Entity","Release"),actor.entity);}catch(...) {}
         }
@@ -1057,7 +1080,7 @@ class World {
         actor.inited=false;actor.waiting=nlohmann::json::array();
         actor.catalog.clear();actor.skillCount=0;
     }
-    void dropActors() {for(auto& [peer,actor]:actors)destroyActor(actor);actors.clear();actorTravelGrants.clear();}
+    void dropActors() {for(auto& [peer,actor]:actors)destroyActor(actor);actors.clear();actorTravelGrants.clear();for(auto& [key,member]:remoteMembers)dropMember(member);}
     std::map<std::string,Realm::SkillRule> skillCatalog(void* ability) {
         std::map<std::string,Realm::SkillRule> catalog;
         auto* list=api.call(gm("AbilitySystem","get_skills","","System.Collections.Generic.List<Beyond.Gameplay.Core.Skill>"),ability);
@@ -1229,8 +1252,9 @@ class World {
             const auto id=link.playerEntity(peer.id);if(!id)continue;
             present.insert(peer.id);auto& actor=actors[peer.id];
             auto growth=link.requestedGrowth(peer.id);
-            if(actor.id!=id||actor.model!=peer.info.modelPath||actor.epoch!=link.generation()||actor.growth!=growth) {
+            if(actor.id!=id||actor.model!=peer.info.modelPath||actor.epoch!=link.generation()||actor.growth!=growth||actor.weapon!=peer.info.weaponModel) {
                 destroyActor(actor);actor=Actor{};actor.id=id;actor.peer=peer.id;actor.epoch=link.generation();actor.model=peer.info.modelPath;
+                actor.weapon=peer.info.weaponModel;
                 actor.growth=std::move(growth);
             }
             auto& pose=peer.states.back().state;V3 position{pose.position[0],pose.position[1],pose.position[2]};
@@ -1541,7 +1565,11 @@ class World {
             auto* more=invoke(moveNext,enumerator);if(!more||!*static_cast<bool*>(runtime->object_unbox(runtime->context,more)))break;
             auto* mark=invoke(current,enumerator);
             if(!mark||classOf(mark)!="Beyond.Gameplay.FacMarkInstRuntimeData")continue;
-            if(!readField<bool>(mark,"FacMarkInstRuntimeData","isTpRelated","Beyond.Gameplay"))continue;
+            // Game 1.6.3 renamed isTpRelated to isTravelRelated.
+            bool travelHub=false;
+            try {travelHub=readField<bool>(mark,"FacMarkInstRuntimeData","isTravelRelated","Beyond.Gameplay");}
+            catch(...) {travelHub=readField<bool>(mark,"FacMarkInstRuntimeData","isTpRelated","Beyond.Gameplay");}
+            if(!travelHub)continue;
             HubTarget hub;hub.node=readField<std::uint32_t>(mark,"FacMarkInstRuntimeData","nodeId","Beyond.Gameplay");if(!hub.node)continue;
             hub.level=text(readField<void*>(mark,"MarkInstRuntimeData","levelId","Beyond.Gameplay"));
             hub.inst=text(readField<void*>(mark,"MarkInstRuntimeData","instId","Beyond.Gameplay"));
@@ -1701,7 +1729,10 @@ private:
             link.reportEntry(net,{loaded,loaded&&link.combat&&missingEnemies==0,loaded&&guestRealm&&guestGatesReady&&privateTargetIsolationReady,players});
         } else if(role==Role::Client&&!link.ready()) {for(auto& [key,e]:enemies) restoreEnemy(e);}
         try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
-        updateActors(net,link);
+        crash::mark("actors");updateActors(net,link);
+        crash::mark("squad_actors");
+        try {drainSquad();updateSquadActors(net,link);}catch(const std::exception& e) {squadError=e.what();}
+        crash::mark("player_casts");mirrorPlayerCasts(net,link);crash::mark("replication");
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         if(diagnosticCast) {
             auto command=std::move(*diagnosticCast);diagnosticCast.reset();
@@ -1719,6 +1750,14 @@ private:
         int width=api.value<int>(m("Screen","get_width","","System.Int32")),height=api.value<int>(m("Screen","get_height","","System.Int32"));
         if(width<=0||height<=0) return;
         auto own=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
+        {
+            // This player's own name tag, like everyone else's.
+            std::string localName;for(const auto& p:view.peers)if(p.local)localName=p.info.name;
+            V3 head{own.x,own.y+2.f,own.z};
+            auto screen=api.value<V3>(m("Camera","WorldToScreenPoint","UnityEngine.Vector3","UnityEngine.Vector3"),camera,{&head});
+            markers.push_back({{"id",view.localId},{"name",localName},{"self",true},{"host",view.role==Role::Host},{"other_map",false},
+                {"x",screen.x/width},{"y",1.f-screen.y/height},{"behind",screen.z<0},{"distance",0.f},{"position",{own.x,own.y,own.z}}});
+        }
         for(const auto& p:view.peers) {
             if(p.local||!p.hasInfo||p.states.empty()||nowMs()-p.states.back().receivedMs>3000||!(p.states.back().state.flags&proto::StateValid)) continue;
             const auto& st=p.states.back().state;
@@ -1728,7 +1767,8 @@ private:
             float dx=position.x-own.x,dy=position.y-own.y,dz=position.z-own.z;position.y+=2.f;
             auto screen=api.value<V3>(m("Camera","WorldToScreenPoint","UnityEngine.Vector3","UnityEngine.Vector3"),camera,{&position});
             markers.push_back({{"id",p.id},{"name",p.info.name},{"host",p.host},{"other_map",false},
-                {"x",screen.x/width},{"y",1.f-screen.y/height},{"behind",screen.z<0},{"distance",std::sqrt(dx*dx+dy*dy+dz*dz)}});
+                {"x",screen.x/width},{"y",1.f-screen.y/height},{"behind",screen.z<0},{"distance",std::sqrt(dx*dx+dy*dy+dz*dz)},
+                {"position",{position.x,position.y-2.f,position.z}}});
         }
     }
 
@@ -1759,7 +1799,7 @@ private:
     void sample(Net& net) {
         const auto now=nowMs();
         if(now-lastMap>1000) {lastMap=now;readMap();}
-        auto* entity=api.call(mainCharacter);
+        auto* entity=mainEntity();
         proto::PlayerState state;state.timeMs=std::uint32_t(now);state.mapHash=mapHash;
         void* go=nullptr;
         if(entity) {
@@ -1800,9 +1840,13 @@ private:
             for(float v:{q.x,q.y,q.z,q.w}) state.bones.push_back(proto::quantize(v));
             if(i==0) {const auto hips=api.value<V3>(getLocalPosition,bones[i].transform);state.rootOffset[0]=hips.x;state.rootOffset[1]=hips.y;state.rootOffset[2]=hips.z;}
         }
-        proto::PlayerInfo info;info.modelPath=localModel;info.mapId=mapId;info.levelId=levelId;info.skeleton=skeleton;info.bones=boneNames;
+        if(now-lastWeaponCheck>=2000) {lastWeaponCheck=now;try {localWeapon=weaponModelOf(entity);}catch(...) {}}
+        proto::PlayerInfo info;info.modelPath=localModel;info.mapId=mapId;info.levelId=levelId;info.skeleton=skeleton;info.bones=boneNames;info.weaponModel=localWeapon;
         net.setLocalInfo(std::move(info));
         net.setLocalState(std::move(state));++samples;
+        crash::mark("squad_sample");
+        try {sampleSquad(net,now);}catch(const std::exception& e) {squadError=e.what();}
+        crash::mark("world_tick");
     }
 
     // ---- remote players ----
@@ -1959,9 +2003,9 @@ private:
             }
             try {show(a,true);auto actor=actors.find(peer.id);
                 Actor* owned=a.native&&actor!=actors.end()&&actor->second.started?&actor->second:nullptr;
-                // While the host executes an admitted guest's native skill, its own
-                // root motion and animation drive that actor until the cast ends.
-                if(!(view.role==Role::Host&&owned&&owned->casting))pose(a,peer,owned);}
+                // The player's own sampled pose always drives the stand-in, also while a
+                // replayed skill plays its effects and weapon on it.
+                pose(a,peer,owned);}
             catch(const std::exception& e) {a.error=e.what();destroyAvatar(a);a.retryAt=now+5000;}
         }
         for(auto it=avatars.begin();it!=avatars.end();) {
@@ -2365,6 +2409,130 @@ public:
             e->second.lastCastCheck=0;e->second.mirroredCasting=true;
         }
         return accepted;
+    }
+    // ---- remote player presentation ----
+    // The equipped weapon's model path, from the same lookup the game's
+    // WeaponComponent uses for this character.
+    std::string weaponModelOf(void* entity) {
+        auto* root=api.call(gm("Entity","get_rootCom","","Beyond.Gameplay.Core.RootComponent"),entity);
+        if(!root||classOf(root)!="Beyond.Gameplay.Core.CharacterRootComponent")return {};
+        auto* info=api.call(gm("CharacterRootComponent","get_replicatedCharInfo","","Beyond.Gameplay.CharInfo"),root);
+        if(!info)return {};
+        auto instId=readField<std::uint64_t>(info,"CharInfo","instId","Beyond.Gameplay");
+        int scope=api.value<int>(gm("GameInstance","get_curScope","","Beyond.GEnums.ScopeName","Beyond.Gameplay"));
+        void* path=nullptr;
+        if(!api.value<bool>(gm("WeaponUtil","TryGetWeaponModelPathByCharInstId","Beyond.Gameplay.Scope|System.UInt64|System.String&","System.Boolean","Beyond.Gameplay"),nullptr,{&scope,&instId,&path}))return {};
+        auto result=text(path);
+        return result.size()<=512?result:std::string{};
+    }
+    // A stand-in's char instance ID is not in this account's character bag, so the
+    // game finds no weapon for it; the lookup hook answers with the player's own.
+    void* actorWeaponString(std::uint64_t charInstId) {
+        for(const auto& [peer,actor]:actors)if(actor.id==charInstId&&!actor.weapon.empty()) {++weaponLookups;return api.string(actor.weapon);}
+        for(const auto& [key,member]:remoteMembers)if(member.actor.id==charInstId&&!member.actor.weapon.empty()) {++weaponLookups;return api.string(member.actor.weapon);}
+        return nullptr;
+    }
+    // Stand-ins replay skills for their animation, weapon and effects only: what
+    // they would apply to anyone else (damage, buffs, heals) is discarded.
+    bool blocksActorEffect(void* ability,void* modifier) {
+        if(!modifier||(actors.empty()&&remoteMembers.empty()))return false;
+        try {
+            auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
+            auto* entity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
+            if(!entity)return false;
+            auto* target=ability?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability):nullptr;
+            for(const auto& [peer,actor]:actors)if(actor.entity==entity) {
+                if(target==entity)return false;
+                ++actorEffectsBlocked;return true;
+            }
+            for(const auto& [key,member]:remoteMembers) {
+                if(!member.actor.entity)continue;
+                // A squad stand-in neither affects others nor is hurt by anyone.
+                if(member.actor.entity==entity&&target!=entity) {++actorEffectsBlocked;return true;}
+                if(member.actor.entity==target&&entity!=target) {++actorEffectsBlocked;return true;}
+            }
+        }catch(...) {}
+        return false;
+    }
+    std::string enemyKeyOfTarget(void* targetHandle) {
+        if(!targetHandle)return {};
+        auto* view=runtime->object_new(runtime->context,api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
+        eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* raw=runtime->object_unbox(runtime->context,view);
+        api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),raw,{targetHandle});
+        auto* first=api.call(gm("TargetHandleView","get_firstTarget","","Beyond.Gameplay.Core.AbilitySystem"),raw);
+        auto* entity=first?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),first):nullptr;
+        if(!entity)return {};
+        for(const auto& [id,e]:enemies)if(e.entity==entity&&currentEnemy(e)&&roomEnemy(id))return id;
+        return {};
+    }
+    // This player's operator began a native skill: the others replay it on their
+    // stand-in of this player (presentation; hits are reported separately).
+    void observePlayerCast(Net& net,void* ability,void* skillString,void* targetHandle) {
+        try {
+            if(replayingCast||!session||!session->ready()||!ability||!character)return;
+            const auto role=net.currentRole();if(role!=Role::Host&&role!=Role::Client)return;
+            auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
+            int slot=-1;if(entity==character)slot=0;else for(int i=0;i<4;++i)if(localMembers[i].entity==entity)slot=i+1;
+            if(slot<0)return;
+            const auto skill=text(skillString);if(skill.empty()||skill.size()>128)return;
+            if(session->sendPlayerCast(net,slot,skill,enemyKeyOfTarget(targetHandle))) {++playerCastsSent;lastPlayerCast=std::to_string(slot)+":"+skill;}
+        }catch(const std::exception& e){playerCastError=e.what();}
+    }
+    bool replayPlayerCast(std::uint16_t peer,int slot,const std::string& id,const std::string& key) {
+        Actor* standIn=nullptr;
+        if(slot==0) {if(auto actor=actors.find(peer);actor!=actors.end())standIn=&actor->second;}
+        else if(auto member=remoteMembers.find({peer,slot-1});member!=remoteMembers.end())standIn=&member->second.actor;
+        if(!standIn||!standIn->entity||!standIn->started||!currentActor(*standIn))throw std::runtime_error("stand-in not ready");
+        auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),standIn->entity);
+        if(!ability)throw std::runtime_error("stand-in has no ability system");
+        void* skill=nullptr;
+        api.value<bool>(gm("AbilitySystem","TryGetSkill","System.String|Beyond.Gameplay.Core.Skill&","System.Boolean"),ability,{api.string(id),&skill});
+        if(!skill)throw std::runtime_error("stand-in lacks skill "+id);
+        auto* view=runtime->object_new(runtime->context,api.klass("TargetHandleView","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
+        eflink::unity::Api::TemporaryRoot viewRoot(runtime,view);auto* viewRaw=runtime->object_unbox(runtime->context,view);
+        if(auto e=enemies.find(key);!key.empty()&&e!=enemies.end()&&currentEnemy(e->second)) {
+            if(auto* targetAbility=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity)) {
+                float limit=120.f;auto* handle=api.call(gm("Skill","GetDefaultTarget","Beyond.Gameplay.Core.AbilitySystem|System.Single","Beyond.Gameplay.Core.TargetHandle"),skill,{targetAbility,&limit});
+                if(handle) {eflink::unity::Api::TemporaryRoot handleRoot(runtime,handle);api.call(gm("TargetHandleView",".ctor","Beyond.Gameplay.Core.TargetHandle"),viewRaw,{handle});}
+            }
+        }
+        // A stand-in has no energy economy of its own; an ultimate the player could
+        // cast must be castable here too.
+        float sp=api.value<float>(gm("AbilitySystem","get_maxUltimateSp","","System.Single"),ability);
+        if(std::isfinite(sp)&&sp>0)api.call(gm("AbilitySystem","set_ultimateSp","System.Single"),ability,{&sp});
+        auto castMethod=gm("AbilitySystem","TryCastSkill","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Action<Beyond.Gameplay.Core.Skill.FinishType,System.Int32>|System.Nullable<Beyond.Gameplay.Core.Skill.CastSkillOptions>|System.Action<Beyond.Gameplay.Core.Skill>|System.Action<Beyond.Gameplay.Core.Skill>|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Boolean");
+        auto* options=api.parameterValue(castMethod,3);eflink::unity::Api::TemporaryRoot optionsRoot(runtime,options);
+        auto* info=runtime->object_new(runtime->context,api.klass("Skill/SkillCastInfo","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
+        eflink::unity::Api::TemporaryRoot infoRoot(runtime,info);bool skipCost=true;
+        crash::mark("replay",std::to_string(peer)+"/"+std::to_string(slot)+" "+id);
+        replayingCast=true;bool accepted=false;
+        try {accepted=api.value<bool>(castMethod,ability,{api.string(id),viewRaw,nullptr,runtime->object_unbox(runtime->context,options),nullptr,nullptr,runtime->object_unbox(runtime->context,info),&skipCost});}
+        catch(...) {replayingCast=false;crash::mark("idle");throw;}
+        replayingCast=false;
+        if(!accepted) {
+            // A later segment of a combo (attack2..4) is refused outside its chain: start
+            // it the way the game switches skills mid-action.
+            crash::mark("replay_forced",id);
+            auto during=gm("AbilitySystem","TryCastSkillDuringAction","System.String|Beyond.Gameplay.Core.TargetHandleView|System.Boolean|Beyond.Gameplay.Core.Skill.SkillCastInfo&|System.Boolean","System.Void");
+            bool force=true;replayingCast=true;
+            try {api.call(during,ability,{api.string(id),viewRaw,&skipCost,runtime->object_unbox(runtime->context,info),&force});}
+            catch(...) {replayingCast=false;crash::mark("idle");throw;}
+            replayingCast=false;
+            accepted=anySkillCasting(ability);
+        }
+        crash::mark("idle");
+        if(!accepted)throw std::runtime_error("stand-in refused skill "+id);
+        return true;
+    }
+    void mirrorPlayerCasts(Net& net,Session& link) {
+        const auto local=net.snapshot().localId;
+        for(const auto& cast:link.takePlayerCasts()) {
+            try {
+                const auto origin=cast.at("origin").get<std::uint16_t>();
+                if(origin==local||!replaySkills)continue;
+                if(replayPlayerCast(origin,cast.value("slot",0),cast.at("skill").get<std::string>(),cast.value("target",std::string{})))++playerCastsMirrored;
+            }catch(const std::exception& ex){++playerCastsRejected;playerCastError=ex.what();}
+        }
     }
     void mirrorEnemyCasts(Net& net,Session& link) {
         for(const auto& cast:link.takeEnemyCasts()) {
@@ -2975,6 +3143,216 @@ public:
     }
 #endif
     bool showRemote=true,showMarkers=true;
+    // ---- squad members: the operators a player does not currently control ----
+    // Each player's other squad members are drawn as native stand-ins too, posed
+    // from their own sampled skeleton, with their weapon and replayed skills
+    // (combo skills are cast by these members). Presentation only: stand-ins
+    // neither affect anyone nor can be hurt.
+    bool showSquad=true,replaySkills=true;
+    struct LocalMember {
+        void* entity=nullptr;void* go=nullptr;std::uint32_t goRoot=0;
+        std::vector<Bone> bones;std::vector<std::string> names;std::uint16_t skeleton=0;
+        std::string model,weapon;nlohmann::json growth;
+    };
+    std::array<LocalMember,4> localMembers;
+    std::uint32_t squadSequence=0;std::uint16_t squadSkeletons=0;std::uint64_t lastSquadInfo=0;
+    std::array<std::string,4> squadInfoSent;
+    struct RemoteMember {std::string model,weapon;nlohmann::json growth;bool present=false;PeerView view;Avatar avatar;Actor actor;};
+    std::map<std::pair<std::uint16_t,int>,RemoteMember> remoteMembers;
+    std::mutex squadInboxMutex;std::deque<std::pair<std::uint16_t,std::vector<unsigned char>>> squadInbox;
+    std::uint64_t squadPosesSent=0,squadPosesIn=0,squadInfosIn=0,squadRejected=0;std::string squadError;
+    // Network thread: only queues; parsed on the game thread.
+    void receiveSquad(std::uint16_t from,const unsigned char* data,std::size_t size) {
+        if(!data||!size||size>64*1024)return;
+        std::lock_guard lock(squadInboxMutex);if(squadInbox.size()>=512)return;
+        squadInbox.emplace_back(from,std::vector<unsigned char>(data,data+size));
+    }
+    void* squadManager() {
+        auto* player=api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"));
+        return player?readField<void*>(player,"GamePlayer","squadManager","Beyond.Gameplay"):nullptr;
+    }
+    void dropLocalMember(LocalMember& m) {
+        for(auto& bone:m.bones)release(bone.root);
+        release(m.goRoot);m=LocalMember{};
+    }
+    void sampleSquad(Net& net,std::uint64_t now) {
+        void* manager=nullptr;try {manager=squadManager();}catch(...) {manager=nullptr;}
+        bool changed=false;
+        for(int slot=0;slot<4;++slot) {
+            auto& m=localMembers[slot];
+            void* entity=nullptr;
+            if(manager)try {entity=api.call(gm("SquadManager","GetMemberBySlot","System.Int32","Beyond.Gameplay.Core.Entity"),manager,{&slot});}catch(...) {entity=nullptr;}
+            if(entity&&(entity==character||!usable(entity)||api.value<bool>(gm("Entity","get_isHide","","System.Boolean"),entity)))entity=nullptr;
+            void* component=entity?api.call(entityModel,entity):nullptr;
+            void* go=component?api.call(modelGo,component):nullptr;
+            if(go&&!alive(go))go=nullptr;
+            if(!go) {if(m.entity) {dropLocalMember(m);changed=true;}continue;}
+            if(entity!=m.entity||go!=m.go) {
+                dropLocalMember(m);m.entity=entity;m.go=go;m.goRoot=rootOf(go);m.model=text(api.call(modelPath,component));
+                for(auto* transform:components(go,"Transform")) {
+                    auto name=text(api.call(objectName,transform));
+                    if(name.rfind("Bip001",0)!=0||name.ends_with("Nub"))continue;
+                    m.bones.push_back({transform,rootOf(transform)});m.names.push_back(name);
+                    if(m.bones.size()>=proto::kMaxBones)break;
+                }
+                m.skeleton=++squadSkeletons;
+                try {m.weapon=weaponModelOf(entity);}catch(...) {m.weapon.clear();}
+                try {
+                    auto* root=api.call(gm("Entity","get_rootCom","","Beyond.Gameplay.Core.RootComponent"),entity);
+                    if(root&&classOf(root)=="Beyond.Gameplay.Core.CharacterRootComponent")
+                        m.growth=infoGrowth(api.call(gm("CharacterRootComponent","get_replicatedCharInfo","","Beyond.Gameplay.CharInfo"),root),m.model);
+                }catch(...) {m.growth=nullptr;}
+                changed=true;
+            }
+            proto::PlayerState state;state.timeMs=std::uint32_t(now);state.mapHash=mapHash;state.sequence=++squadSequence;state.skeleton=m.skeleton;
+            state.flags=proto::StateValid;
+            if(api.value<bool>(entityAlive,entity))state.flags|=proto::StateAlive;
+            auto* transform=api.call(getTransform,go);
+            const auto position=api.value<V3>(getPosition,transform);const auto rotation=api.value<Q>(getRotation,transform);
+            state.position[0]=position.x;state.position[1]=position.y;state.position[2]=position.z;
+            state.rotation[0]=rotation.x;state.rotation[1]=rotation.y;state.rotation[2]=rotation.z;state.rotation[3]=rotation.w;
+            state.bones.reserve(m.bones.size()*4);
+            for(std::size_t i=0;i<m.bones.size();++i) {
+                const auto q=api.value<Q>(getLocalRotation,m.bones[i].transform);
+                for(float v:{q.x,q.y,q.z,q.w})state.bones.push_back(proto::quantize(v));
+                if(i==0) {const auto hips=api.value<V3>(getLocalPosition,m.bones[i].transform);state.rootOffset[0]=hips.x;state.rootOffset[1]=hips.y;state.rootOffset[2]=hips.z;}
+            }
+            proto::Writer w;w.u8(1).u8(std::uint8_t(slot));proto::write(w,state);
+            if(w.bytes.size()<=proto::kMaxUnreliableData&&net.sendData(squadChannel,proto::kEveryone,w.bytes.data(),w.bytes.size(),false))++squadPosesSent;
+        }
+        // Descriptions travel reliably when they change, and every few seconds for late joiners.
+        const bool periodic=now-lastSquadInfo>=3000;
+        if(!changed&&!periodic)return;
+        if(periodic)lastSquadInfo=now;
+        for(int slot=0;slot<4;++slot) {
+            const auto& m=localMembers[slot];
+            nlohmann::json info{{"slot",slot},{"present",m.entity!=nullptr}};
+            if(m.entity)info.update({{"model",m.model},{"weapon",m.weapon},{"growth",m.growth},{"skeleton",m.skeleton},{"bones",m.names}});
+            auto text=info.dump();
+            if(!periodic&&text==squadInfoSent[slot])continue;
+            proto::Writer w;w.u8(2);w.bytes.insert(w.bytes.end(),text.begin(),text.end());
+            if(net.sendData(squadChannel,proto::kEveryone,w.bytes.data(),w.bytes.size(),true))squadInfoSent[slot]=std::move(text);
+        }
+    }
+    void drainSquad() {
+        std::deque<std::pair<std::uint16_t,std::vector<unsigned char>>> pending;
+        {std::lock_guard lock(squadInboxMutex);pending.swap(squadInbox);}
+        for(auto& [from,bytes]:pending) {
+            try {
+                proto::Reader r(bytes.data(),bytes.size());const auto kind=r.u8();
+                if(kind==1) {
+                    const int slot=r.u8();if(slot>3) {++squadRejected;continue;}
+                    auto state=proto::readPlayerState(r);state.id=from;
+                    auto& states=remoteMembers[{from,slot}].view.states;
+                    if(!states.empty()&&std::int32_t(state.sequence-states.back().state.sequence)<=0)continue;
+                    states.push_back({std::move(state),nowMs()});while(states.size()>8)states.pop_front();
+                    ++squadPosesIn;
+                } else if(kind==2) {
+                    auto info=nlohmann::json::parse(bytes.begin()+1,bytes.end());
+                    const int slot=info.at("slot").get<int>();if(slot<0||slot>3) {++squadRejected;continue;}
+                    auto& m=remoteMembers[{from,slot}];
+                    if(!info.at("present").get<bool>()) {m.present=false;continue;}
+                    const auto memberModel=info.at("model").get<std::string>(),weapon=info.value("weapon",std::string{});
+                    const auto& names=info.at("bones");
+                    if(memberModel.size()>512||memberModel.find("chr_")==std::string::npos||memberModel.find("..")!=std::string::npos||weapon.size()>512||
+                       !names.is_array()||names.size()>proto::kMaxBones) {++squadRejected;continue;}
+                    std::vector<std::string> boneList;
+                    for(const auto& name:names) {auto value=name.get<std::string>();if(value.size()>96)throw std::runtime_error("bone name");boneList.push_back(std::move(value));}
+                    auto growth=info.value("growth",nlohmann::json());
+                    if(!growth.is_null()&&!validCharacterGrowth(growth,memberModel))growth=nullptr;
+                    m.present=true;m.model=memberModel;m.weapon=weapon;m.growth=std::move(growth);
+                    m.view.id=from;m.view.hasInfo=true;m.view.info.modelPath=memberModel;m.view.info.bones=std::move(boneList);
+                    m.view.info.skeleton=info.at("skeleton").get<std::uint16_t>();
+                    ++squadInfosIn;
+                } else ++squadRejected;
+            }catch(...) {++squadRejected;}
+        }
+    }
+    void dropMember(RemoteMember& m) {destroyActor(m.actor);m.actor.entity=nullptr;m.avatar=Avatar{};}
+    // Start a created stand-in and keep it inert (no AI, full health).
+    bool prepareStandIn(Actor& actor) {
+        actor.inited=api.value<bool>(gm("Entity","get_hasInited","","System.Boolean"),actor.entity);
+        if(actor.inited&&!actor.started)api.call(gm("Entity","TryStart"),actor.entity);
+        actor.started=api.value<bool>(gm("Entity","get_hasStarted","","System.Boolean"),actor.entity);
+        if(!actor.started)return false;
+        auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),actor.entity);
+        actor.movement=api.call(gm("Entity","get_movementComponent","","Beyond.Gameplay.Core.MovementComponent"),actor.entity);
+        if(!ability||!actor.movement)return false;
+        if(!actor.hpInitialized) {
+            actor.maxHp=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
+            if(!std::isfinite(actor.maxHp)||actor.maxHp<=0)return false;
+            bool skip=true;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&actor.maxHp,&skip});
+            actor.hp=actor.maxHp;actor.hpInitialized=true;
+        }
+        if(!actor.aiPaused) {
+            auto* ai=api.call(gm("Entity","get_charAICom","","Beyond.Gameplay.AI.CharacterAIComponent"),actor.entity);
+            if(ai)api.call(gm("TickComponent","PauseTick"),ai);actor.aiPaused=true;
+        }
+        return true;
+    }
+    void updateSquadActors(Net& net,Session& link) {
+        const auto view=net.snapshot();
+        const bool active=(view.role==Role::Host||view.role==Role::Client)&&link.ready()&&character&&showSquad&&showRemote&&!mapId.empty();
+        int levelNumber=0;
+        if(auto* info=staticObject("worldInfo"))levelNumber=api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info);
+        for(auto it=remoteMembers.begin();it!=remoteMembers.end();) {
+            auto& [key,m]=*it;const auto peer=key.first;const int slot=key.second;
+            const PeerView* p=nullptr;for(const auto& x:view.peers)if(x.id==peer&&!x.local)p=&x;
+            if(!p) {dropMember(m);it=remoteMembers.erase(it);continue;}
+            const bool fresh=!m.view.states.empty()&&nowMs()-m.view.states.back().receivedMs<3000;
+            const bool wanted=active&&p->hasInfo&&p->info.mapId==mapId&&p->info.levelId==levelId&&m.present&&fresh&&
+                (m.view.states.back().state.flags&proto::StateValid)&&m.view.states.back().state.mapHash==mapHash&&
+                m.view.states.back().state.skeleton==m.view.info.skeleton;
+            if(!wanted) {if(m.actor.entity)dropMember(m);++it;continue;}
+            auto& actor=m.actor;
+            const std::uint64_t id=(0xEFull<<56)|(0x5Aull<<48)|((link.generation()&0xFFFFFF)<<16)|(std::uint64_t(peer&0xFF)<<8)|std::uint64_t(slot);
+            if(actor.id!=id||actor.model!=m.model||actor.weapon!=m.weapon||actor.growth!=m.growth) {
+                dropMember(m);actor=Actor{};actor.id=id;actor.peer=peer;actor.epoch=link.generation();actor.model=m.model;
+                actor.weapon=m.weapon;actor.growth=m.growth;actor.squad=true;
+            }
+            try {
+                if(!actor.entity) {
+                    if(nowMs()<actor.retry) {++it;continue;}
+                    actor.retry=nowMs()+15000;
+                    const auto& s=m.view.states.back().state;
+                    crash::mark("squad_create",actor.model);
+                    createActor(actor,{s.position[0],s.position[1],s.position[2]},levelNumber);
+                }
+                if(!currentActor(actor))throw std::runtime_error("队伍成员替身已被释放");
+                if(prepareStandIn(actor))actor.error.clear();
+            }catch(const std::exception& e) {
+                auto error=std::string(e.what());dropMember(m);actor.error=error;actor.retry=nowMs()+15000;squadError=error;
+            }
+            ++it;
+        }
+    }
+    // Every frame: each started stand-in follows its member's sampled pose.
+    void poseSquad() {
+        for(auto& [key,m]:remoteMembers) {
+            auto& a=m.avatar;auto& actor=m.actor;
+            if(!actor.entity||!actor.started||m.view.states.empty()||!currentActor(actor)) {a=Avatar{};continue;}
+            auto* component=api.call(entityModel,actor.entity);auto* object=component?api.call(modelGo,component):nullptr;
+            if(!object||!alive(object))continue;
+            if(a.object!=object) {
+                a=Avatar{};a.id=key.first;a.native=true;a.object=object;a.transform=api.call(getTransform,object);a.visible=true;
+                for(auto* transform:components(object,"Transform")) {
+                    auto name=text(api.call(objectName,transform));
+                    if(name.rfind("Bip001",0)==0)a.byName.emplace(name,transform);
+                }
+                a.skeleton=0xFFFF;
+            }
+            try {pose(a,m.view,&actor);}catch(const std::exception& e) {squadError=e.what();a=Avatar{};}
+        }
+    }
+    nlohmann::json squadStatus() const {
+        auto members=nlohmann::json::array();
+        for(const auto& [key,m]:remoteMembers)members.push_back({{"peer",key.first},{"slot",key.second},{"present",m.present},{"model",m.model},
+            {"weapon",!m.weapon.empty()},{"spawned",m.actor.entity!=nullptr},{"started",m.actor.started},{"poses",m.avatar.poses},{"error",m.actor.error}});
+        auto local=nlohmann::json::array();
+        for(int i=0;i<4;++i)local.push_back({{"slot",i},{"present",localMembers[i].entity!=nullptr},{"model",localMembers[i].model},{"bones",localMembers[i].bones.size()},{"weapon",!localMembers[i].weapon.empty()}});
+        return {{"show",showSquad},{"local",local},{"remote",members},{"poses_sent",squadPosesSent},{"poses_in",squadPosesIn},
+            {"infos_in",squadInfosIn},{"rejected",squadRejected},{"error",squadError}};
+    }
     // Called only from the game's native damage detour, under the world mutex.
     // Enemy modifiers are stopped on guests; host enemy state is the source of truth.
     bool captureDamage(Net& net,void* ability,void* modifier) {
@@ -3051,6 +3429,7 @@ public:
     }
     // Called on the game thread every frame.
     void tick(const BE_HostApiV1* host,Net& net,Session& link) {
+        crash::mark("world_tick");
         runtime=host;api.bind(host);assembly=GetModuleHandleW(L"GameAssembly.dll");
         const auto frameStart=std::chrono::steady_clock::now();
         try {
@@ -3066,15 +3445,17 @@ public:
         if(nowMs()-lastReplication>=50) {
             lastReplication=nowMs();
             const auto started=std::chrono::steady_clock::now();
+            crash::mark("replication");
             try {replication(net,link);}catch(const std::exception& e) {replicationError=e.what();}
+            crash::mark("world_tick");
             perf.replicationMs=elapsedMs(started);
         }
         if(showMarkers&&nowMs()-lastProjection>=50) {lastProjection=nowMs();try {projectPeers(net.snapshot());}catch(const std::exception& e) {replicationError=e.what();markers=nlohmann::json::array();}}
         else if(!showMarkers) markers=nlohmann::json::array();
         const auto remotesStart=std::chrono::steady_clock::now();
         try {
-            if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) updateRemotes(net.snapshot(),showRemote);
-            else if(!avatars.empty()) clear();
+            if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) {crash::mark("remotes");updateRemotes(net.snapshot(),showRemote);crash::mark("squad_pose");poseSquad();crash::mark("world_tick");}
+            else {if(!avatars.empty()) clear();if(!remoteMembers.empty()) {for(auto& [key,member]:remoteMembers)dropMember(member);remoteMembers.clear();}}
         } catch(const std::exception& e) {localError=e.what();}
         try {if((net.currentRole()==Role::Host&&roomHost)||(net.currentRole()==Role::Client&&guestRealm))updateEnemyMotion();}
         catch(const std::exception& e) {replicationError=e.what();}
@@ -3141,6 +3522,9 @@ public:
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
+                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},
+                    {"player_cast_error",playerCastError},{"last_player_cast",lastPlayerCast},{"actor_effects_blocked",actorEffectsBlocked},
+                    {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"squad",squadStatus()},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
                     {"owned_here",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second==localPeer;})},
                     {"owned_by_others",std::count_if(owners.begin(),owners.end(),[&](const auto& o){return o.second!=localPeer;})},

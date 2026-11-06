@@ -139,3 +139,7 @@ namespace ImGui
     void MyFunction(const char* name, MyMatrix44* mtx);
 }
 */
+
+// EF Link: the game-thread HUD and the menu window thread each own an ImGui context.
+struct ImGuiContext;extern thread_local ImGuiContext* EFLinkImGuiContext;
+#define GImGui EFLinkImGuiContext

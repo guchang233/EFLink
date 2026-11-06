@@ -1,32 +1,46 @@
+// EF Link interface: transparent DirectComposition overlay over the game window.
+// HUD (name tags, room roster) is always drawn; the menu key turns the overlay
+// interactive and shows the menu. Requests are executed on the game thread.
 #include "link_version.h"
 #include "link_gui.h"
 #include "link_settings.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dcomp.h>
 #include <wrl/client.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <algorithm>
+#include <string>
+#include <vector>
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
-#include "link_native_gui.h"
-#include "link_input_ownership.h"
-#include <commctrl.h>
-#include <mutex>
-#include <tuple>
 
 using Microsoft::WRL::ComPtr;
 using nlohmann::json;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND,UINT,WPARAM,LPARAM);
+thread_local ImGuiContext* EFLinkImGuiContext=nullptr;
+
 namespace eflink {
 namespace {
+std::uint64_t now() {return GetTickCount64();}
+template<class T> bool ready(const std::future<T>& f) {return f.valid()&&f.wait_for(std::chrono::seconds(0))==std::future_status::ready;}
+std::string str(const json& j,const char* key,const std::string& fallback={}) {
+    auto it=j.find(key);return it!=j.end()&&it->is_string()?it->get<std::string>():fallback;
+}
+void copyText(char* dst,std::size_t capacity,const std::string& text) {strncpy_s(dst,capacity,text.c_str(),_TRUNCATE);}
+
+// ---- game window ----
 HWND findGame() {
     HWND result=nullptr;
     EnumWindows([](HWND w,LPARAM arg)->BOOL {
-        DWORD pid=0;GetWindowThreadProcessId(w,&pid);
-        wchar_t klass[64]{};GetClassNameW(w,klass,64);
+        DWORD pid=0;GetWindowThreadProcessId(w,&pid);wchar_t klass[64]{};GetClassNameW(w,klass,64);
         if(pid==GetCurrentProcessId()&&IsWindowVisible(w)&&wcscmp(klass,L"UnityWndClass")==0&&GetWindow(w,GW_OWNER)==nullptr) {
             *reinterpret_cast<HWND*>(arg)=w;return FALSE;
         }
@@ -34,37 +48,517 @@ HWND findGame() {
     },reinterpret_cast<LPARAM>(&result));
     return result;
 }
-struct Renderer {
-    HWND window=nullptr;bool closing=false,toggle=false,interactive=true;unsigned width=0,height=0;
-    ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
-    ComPtr<IDXGISwapChain> swap;ComPtr<ID3D11RenderTargetView> target;
+
+// ---- look ----
+namespace color {
+constexpr ImVec4 base{.047f,.055f,.063f,.97f},panel{.071f,.082f,.094f,1},card{.094f,.106f,.122f,1},cardHover{.118f,.133f,.153f,1};
+constexpr ImVec4 line{.176f,.196f,.22f,1},text{.91f,.93f,.94f,1},dim{.55f,.59f,.62f,1},faint{.36f,.39f,.42f,1};
+constexpr ImVec4 accent{.89f,.95f,.24f,1},accentDim{.54f,.58f,.16f,1},ink{.06f,.07f,.04f,1};
+constexpr ImVec4 ok{.31f,.83f,.6f,1},warn{1.f,.72f,.29f,1},bad{1.f,.42f,.35f,1},info{.36f,.72f,1.f,1};
+ImU32 u32(ImVec4 c,float alpha=1.f) {c.w*=alpha;return ImGui::ColorConvertFloat4ToU32(c);}
+}
+struct Fonts {ImFont* body=nullptr;ImFont* note=nullptr;ImFont* title=nullptr;ImFont* mono=nullptr;};
+Fonts loadFonts(float scale) {
+    auto& io=ImGui::GetIO();Fonts f;
+    wchar_t winDir[MAX_PATH]{};GetWindowsDirectoryW(winDir,MAX_PATH);
+    const auto regular=std::filesystem::path(winDir)/L"Fonts"/L"msyh.ttc";
+    if(std::filesystem::is_regular_file(regular)) {
+        const auto* cjk=io.Fonts->GetGlyphRangesChineseFull();
+        f.body=io.Fonts->AddFontFromFileTTF(regular.string().c_str(),17*scale,nullptr,cjk);
+        f.note=io.Fonts->AddFontFromFileTTF(regular.string().c_str(),15*scale,nullptr,cjk);
+    }
+    if(!f.body) f.body=io.Fonts->AddFontDefault();
+    if(!f.note) f.note=f.body;
+    f.title=f.mono=f.body;io.FontDefault=f.body;
+    return f;
+}
+void applyTheme(float scale) {
+    ImGui::GetStyle()=ImGuiStyle();ImGui::StyleColorsDark();
+    auto& s=ImGui::GetStyle();s.FramePadding={8,5};s.ItemSpacing={8,6};s.WindowPadding={12,10};
+    s.ScaleAllSizes(scale);
+}
+
+// ---- widgets ----
+bool accentButton(const char* label,ImVec2 size={0,0}) {return ImGui::Button(label,size);}
+bool dangerButton(const char* label,ImVec2 size={0,0}) {return ImGui::Button(label,size);}
+void chip(const char* text,ImVec4 tint) {ImGui::TextColored(tint,"[%s]",text);}
+// A bordered group with a heading; content goes between begin/end.
+void beginCard(const char* id,const char* title,ImFont*,ImVec2 size={0,0}) {
+    ImGui::BeginChild(id,size,ImGuiChildFlags_Borders|ImGuiChildFlags_AlwaysUseWindowPadding|(size.y==0?ImGuiChildFlags_AutoResizeY:0));
+    if(title&&*title) ImGui::SeparatorText(title);
+}
+void endCard() {ImGui::EndChild();}
+void label(const char* text) {ImGui::TextDisabled("%s",text);}
+std::string formatPosition(const json& p) {
+    if(!p.is_array()||p.size()!=3) return "—";
+    char text[96];std::snprintf(text,sizeof text,"%.1f, %.1f, %.1f",p[0].get<double>(),p[1].get<double>(),p[2].get<double>());return text;
+}
+const char* blockerText(const std::string& b) {
+    return b=="host_world_isolation"?"房主世界隔离":b=="host_logical_players"?"房主逻辑玩家":b=="host_combat_settlement"?"房主战斗结算":
+           b=="host_scene_rules"?"房主地图与副本规则":b=="guest_map_loading"?"加载房主地图":b=="guest_entity_replicas"?"重建房主实体":
+           b=="guest_world_isolation"?"房客世界隔离":b=="guest_logical_players"?"房客逻辑玩家":b=="host_player_entity"?"房主侧角色":b.c_str();
+}
+
+// ---- interface state and drawing ----
+struct Ui {
+    std::function<std::future<json>(const json&)> post;
+    Fonts fonts;
+    json state=json::object(),hud=json::object();
+    std::future<json> statusCall,hudCall;std::uint64_t statusSent=0,hudSent=0;
+    struct Pending {std::future<json> result;std::string action;std::uint64_t sent=0;};std::vector<Pending> actions;
+    std::string toast;std::uint64_t toastAt=0;bool toastError=false;
+    int page=0;bool open=false,closeRequested=false,initialized=false,leaveConfirm=false,kickPending=false;int kickId=-1;
+    char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
+    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,squad=true,replay=true,markers=true,follow=true,combat=true;
+    std::uint64_t lastChat=0,lastMapPrompt=0;
+    void say(std::string text,bool error) {toast=std::move(text);toastAt=now();toastError=error;}
+    void act(json input) {const auto a=str(input,"action");actions.push_back({post(input),a,now()});}
+    void init() {
+        if(initialized||state.empty()) return;
+        initialized=true;copyText(name,sizeof name,str(state,"name"));
+        const auto c=state.value("configuration",json::object());copyText(room,sizeof room,str(c,"room_name"));
+        port=c.value("port",47615);limit=c.value("max_players",8);key=c.value("menu_key",kDefaultMenuKey);
+        remote=c.value("show_remote_players",true);squad=c.value("show_remote_squad",true);replay=c.value("replay_skills",true);markers=c.value("show_player_markers",true);
+        follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);
+    }
+    void poll(bool menuOpen) {
+        const auto t=now();
+        if(ready(statusCall)) {auto r=statusCall.get();if(r.contains("role")) {state=std::move(r);init();key=state.value("configuration",json::object()).value("menu_key",key);}}
+        else if(statusCall.valid()&&t-statusSent>5000) statusCall={}; // the game thread was busy (loading); ask again
+        if(!statusCall.valid()&&t-statusSent>=(menuOpen?250u:500u)) {statusSent=t;statusCall=post({{"action","status"}});}
+        if(ready(hudCall)) {auto r=hudCall.get();if(r.contains("markers")) hud=std::move(r);}
+        else if(hudCall.valid()&&t-hudSent>5000) hudCall={};
+        if(!hudCall.valid()&&t-hudSent>=50) {hudSent=t;hudCall=post({{"action","hud"}});}
+        for(auto it=actions.begin();it!=actions.end();) {
+            if(ready(it->result)) {
+                auto r=it->result.get();
+                if(r.contains("error")) say(r["error"].is_string()?r["error"].get<std::string>():"操作失败",true);
+                else if(r.contains("role")) state=std::move(r);
+                it=actions.erase(it);
+            } else if(t-it->sent>15000) it=actions.erase(it);
+            else ++it;
+        }
+    }
+    std::string role() const {return str(state,"role","offline");}
+    bool online() const {const auto r=role();return r=="host"||r=="client";}
+    void saveSettings() {
+        act({{"action","settings"},{"configuration",{{"player_name",name},{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},
+            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});
+        say("设置已保存",false);
+    }
+    void join() {if(*address) act({{"action","join"},{"address",address},{"password",joinPassword}});else say("请输入房主地址",true);}
+
+    // ---- HUD ----
+    void drawHud(ImVec2 size) {
+        auto* d=ImGui::GetBackgroundDrawList();
+        const bool tags=online()&&state.value("configuration",json::object()).value("show_player_markers",true);
+        if(tags) {
+            ImGui::PushFont(fonts.note);
+            for(const auto& m:hud.value("markers",json::array())) {
+                if(m.value("other_map",false)) continue;
+                float x=m.value("x",.5f)*size.x,y=m.value("y",.5f)*size.y;
+                if(!std::isfinite(x)||!std::isfinite(y)) continue;
+                const bool self=m.value("self",false),host=m.value("host",false);
+                bool off=m.value("behind",false)||x<24||y<24||x>size.x-24||y>size.y-24;
+                if(self&&off) continue;
+                if(off) {
+                    float dx=x-size.x*.5f,dy=y-size.y*.5f;if(m.value("behind",false)) {dx=-dx;dy=-dy;}
+                    if(std::abs(dx)+std::abs(dy)<.001f) dy=-1;
+                    const float k=1.f/(std::max)(std::abs(dx)/(std::max)(1.f,size.x*.5f-60),std::abs(dy)/(std::max)(1.f,size.y*.5f-60));
+                    x=size.x*.5f+dx*k;y=size.y*.5f+dy*k;
+                }
+                char head[160];std::snprintf(head,sizeof head,"#%d  %s",m.value("id",0),str(m,"name").c_str());
+                char tail[64];
+                if(self) std::snprintf(tail,sizeof tail,"你");
+                else std::snprintf(tail,sizeof tail,"%.0f m",m.value("distance",0.f));
+                const auto hs=ImGui::CalcTextSize(head),ts=ImGui::CalcTextSize(tail);
+                const float w=hs.x+ts.x+30,h=hs.y+10;
+                const float left=(std::clamp)(x-w*.5f,6.f,(std::max)(6.f,size.x-w-6)),top=(std::clamp)(y-h-10,6.f,(std::max)(6.f,size.y-h-6));
+                const auto tint=self?color::info:host?color::accent:color::ok;
+                d->AddRectFilled({left,top},{left+w,top+h},color::u32(color::base,.82f),4);
+                d->AddRectFilled({left,top},{left+3,top+h},color::u32(tint),4,ImDrawFlags_RoundCornersLeft);
+                d->AddText({left+10,top+5},color::u32(color::text),head);
+                d->AddText({left+w-ts.x-9,top+5},color::u32(tint),tail);
+                if(off) d->AddCircleFilled({x,y},5,color::u32(tint));
+                else d->AddTriangleFilled({x-5,top+h},{x+5,top+h},{x,top+h+6},color::u32(color::base,.82f));
+            }
+            ImGui::PopFont();
+        }
+        if(online()&&tags) drawRoster(size);
+        if(!toast.empty()&&now()-toastAt<4000&&!open) {
+            ImGui::PushFont(fonts.body);const auto ts=ImGui::CalcTextSize(toast.c_str());
+            const ImVec2 p{size.x*.5f-ts.x*.5f-16,size.y-140};
+            d->AddRectFilled(p,{p.x+ts.x+32,p.y+ts.y+18},color::u32(color::base,.9f),6);
+            d->AddText({p.x+16,p.y+9},color::u32(toastError?color::bad:color::accent),toast.c_str());ImGui::PopFont();
+        }
+        const auto change=state.value("game",json::object()).value("world_replication",json::object()).value("host_map_change",json::object());
+        if(!open&&role()=="client"&&change.value("pending",false)) {
+            ImGui::PushFont(fonts.body);const std::string text="房主已前往 "+str(change,"level")+"，按菜单键选择是否跟随";
+            const auto ts=ImGui::CalcTextSize(text.c_str());const ImVec2 p{size.x*.5f-ts.x*.5f-16,90};
+            d->AddRectFilled(p,{p.x+ts.x+32,p.y+ts.y+18},color::u32(color::base,.9f),6);
+            d->AddRect(p,{p.x+ts.x+32,p.y+ts.y+18},color::u32(color::accent,.8f),6);
+            d->AddText({p.x+16,p.y+9},color::u32(color::accent),text.c_str());ImGui::PopFont();
+        }
+    }
+    void drawRoster(ImVec2 size) {
+        auto* d=ImGui::GetBackgroundDrawList();
+        const auto peers=state.value("peers",json::array());
+        ImGui::PushFont(fonts.note);
+        const float line=ImGui::GetTextLineHeight(),width=330;
+        const float height=34+peers.size()*(line*2+12);
+        const ImVec2 p{size.x-width-18,size.y*.24f};
+        d->AddRectFilled(p,{p.x+width,p.y+height},color::u32(color::base,.72f),6);
+        d->AddRectFilled(p,{p.x+width,p.y+3},color::u32(color::accent),6,ImDrawFlags_RoundCornersTop);
+        auto roomName=str(state.value("room",json::object()),"name");if(roomName.empty()) roomName="房间";
+        char head[160];std::snprintf(head,sizeof head,"EF LINK  ·  %s  ·  %s",role()=="host"?"房主":"房客",roomName.c_str());
+        d->AddText({p.x+12,p.y+10},color::u32(color::accent),head);
+        if(role()=="client") {char rtt[32];std::snprintf(rtt,sizeof rtt,"%u ms",state.value("rtt_ms",0u));d->AddText({p.x+width-ImGui::CalcTextSize(rtt).x-12,p.y+10},color::u32(color::dim),rtt);}
+        float y=p.y+34;
+        for(const auto& peer:peers) {
+            const bool self=peer.value("local",false),host=peer.value("host",false),valid=peer.value("valid",false);
+            char who[160];std::snprintf(who,sizeof who,"#%d  %s%s%s",peer.value("id",0),str(peer,"name").c_str(),host?"  [房主]":"",self?"  [你]":"");
+            d->AddCircleFilled({p.x+14,y+line*.5f},3.5f,color::u32(!valid?color::faint:self?color::info:host?color::accent:color::ok));
+            d->AddText({p.x+24,y},color::u32(color::text),who);
+            std::string where=valid?formatPosition(peer.value("position",json::array()))+"   "+str(peer,"level",str(peer,"map","")):"等待角色状态";
+            d->AddText({p.x+24,y+line+2},color::u32(color::dim),where.c_str());
+            y+=line*2+12;
+        }
+        ImGui::PopFont();
+    }
+
+    // ---- menu ----
+    bool selectPage=true;
+    void drawMenu(ImVec2 size) {
+        ImGui::SetNextWindowSize({(std::min)(900.f,size.x-40),(std::min)(620.f,size.y-40)},ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos({size.x*.5f,size.y*.5f},ImGuiCond_Appearing,{.5f,.5f});
+        bool keep=true;
+        if(ImGui::Begin("EF Link  " EFLINK_VERSION "###eflink",&keep,ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings)) {
+            const auto r=role();
+            chip(r=="host"?"房主":r=="client"?"已连接":r=="connecting"?"连接中":"离线",r=="host"?color::accent:r=="client"?color::ok:r=="connecting"?color::warn:color::dim);
+            ImGui::SameLine();ImGui::TextUnformatted(str(state,"name","—").c_str());
+            if(online()) {ImGui::SameLine();ImGui::TextDisabled("房间：%s",str(state.value("room",json::object()),"name").c_str());}
+            ImGui::SameLine();ImGui::TextDisabled("（%s 开关菜单，Esc 关闭）",key==VK_OEM_PLUS?"=":("F"+std::to_string(key-VK_F1+1)).c_str());
+            if(ImGui::BeginTabBar("##tabs")) {
+                const char* names[]={"联机","玩家","聊天","设置","诊断"};
+                for(int i=0;i<5;++i) {
+                    if(ImGui::BeginTabItem(names[i],nullptr,selectPage&&page==i?ImGuiTabItemFlags_SetSelected:0)) {
+                        if(!selectPage) page=i;else if(i==page) selectPage=false; // requested tab is now current
+                        ImGui::BeginChild("##page");
+                        switch(i) {case 0: pageSession();break;case 1: pagePlayers();break;case 2: pageChat();break;case 3: pageSettings();break;default: pageDiagnostics();break;}
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+                }
+                ImGui::EndTabBar();
+            }
+            popups();
+        }
+        ImGui::End();
+        if(!keep) closeRequested=true;
+        if(ImGui::IsKeyPressed(ImGuiKey_Escape)&&!ImGui::GetIO().WantTextInput&&!ImGui::IsPopupOpen("",ImGuiPopupFlags_AnyPopupId)) closeRequested=true;
+    }
+    void title(const char*,const char* subtitle=nullptr) {if(subtitle) label(subtitle);ImGui::Spacing();}
+    void pageSession() {
+        const auto r=role();
+        if(!online()&&r!="connecting") {
+            title("联机","开放自己的房间，或加入好友的房间。连接后可以关闭菜单，联机继续进行。");
+            const float half=(ImGui::GetContentRegionAvail().x-14)*.5f;
+            ImGui::BeginGroup();
+            beginCard("##host","开放房间",fonts.title,{half,0});
+            label("房间名称");ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##room","例如：周末一起打",room,sizeof room);
+            label("房间密码（可留空）");ImGui::SetNextItemWidth(-1);ImGui::InputText("##hostpw",hostPassword,sizeof hostPassword,ImGuiInputTextFlags_Password);
+            label("人数上限");ImGui::SetNextItemWidth(-1);ImGui::SliderInt("##limit",&limit,2,16);
+            label("端口");ImGui::SetNextItemWidth(-1);ImGui::InputInt("##port",&port,0);port=(std::clamp)(port,1024,65535);
+            ImGui::Dummy({0,4});
+            if(accentButton("开放房间",{-1,0})) {
+                saveSettings();
+                act({{"action","host"},{"room_name",room},{"password",hostPassword},{"port",port},{"max_players",limit}});hostPassword[0]=0;
+            }
+            endCard();
+            ImGui::EndGroup();ImGui::SameLine(0,14);
+            ImGui::BeginGroup();
+            beginCard("##join","加入房间",fonts.title,{half,0});
+            label("房主地址（IP 或 IP:端口）");ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##address","192.168.1.20:47615",address,sizeof address);
+            label("房间密码（可留空）");ImGui::SetNextItemWidth(-1);ImGui::InputText("##joinpw",joinPassword,sizeof joinPassword,ImGuiInputTextFlags_Password);
+            if(accentButton("连接")) join();
+            ImGui::SameLine();if(ImGui::Button("收藏地址",{-1,0})&&*address) act({{"action","save_server"},{"address",address},{"name",*serverName?serverName:address}});
+            endCard();
+            ImGui::EndGroup();
+            ImGui::Dummy({0,4});
+            beginCard("##lan","局域网房间",fonts.title);
+            if(ImGui::SmallButton("刷新")) act({{"action","refresh"}});
+            const auto rooms=state.value("rooms",json::array());
+            if(rooms.empty()) label("暂未发现房间。让好友先开放房间，或直接输入地址。");
+            for(const auto& item:rooms) {
+                ImGui::PushID(str(item,"address").c_str());ImGui::Separator();
+                ImGui::Text("%s",str(item,"name","未命名房间").c_str());if(item.value("password",false)) {ImGui::SameLine();chip("密码",color::warn);}
+                ImGui::PushFont(fonts.note);label((str(item,"host")+"  ·  "+std::to_string(item.value("players",0))+"/"+std::to_string(item.value("max_players",0))+" 人  ·  "+str(item,"address")).c_str());ImGui::PopFont();
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x-60);
+                if(ImGui::Button("加入")) {copyText(address,sizeof address,str(item,"address"));if(item.value("password",false)) say("请输入房间密码后点击连接",false);else join();}
+                ImGui::PopID();
+            }
+            endCard();
+            const auto saved=state.value("configuration",json::object()).value("saved_servers",json::array());
+            if(!saved.empty()) {
+                beginCard("##saved","收藏",fonts.title);
+                for(const auto& s:saved) {
+                    const auto a=str(s,"address");ImGui::PushID(a.c_str());
+                    if(ImGui::Selectable((str(s,"name",a)+"   "+a).c_str(),false,0,{ImGui::GetContentRegionAvail().x-80,0})) copyText(address,sizeof address,a);
+                    ImGui::SameLine();if(ImGui::SmallButton("移除")) act({{"action","remove_server"},{"address",a}});
+                    ImGui::PopID();
+                }
+                endCard();
+            }
+            return;
+        }
+        title(r=="host"?"你的房间":r=="client"?"已加入房间":"正在连接",nullptr);
+        const auto roomInfo=state.value("room",json::object());
+        beginCard("##room","房间",fonts.title);
+        ImGui::Text("%s",str(roomInfo,"name",r=="connecting"?"连接中…":"房间").c_str());
+        ImGui::SameLine();chip(r=="host"?"房主":r=="client"?"房客":"连接中",r=="host"?color::accent:color::ok);
+        ImGui::SameLine();chip((std::to_string(state.value("peers",json::array()).size())+" / "+std::to_string(roomInfo.value("max_players",0))+" 人").c_str(),color::dim);
+        if(r=="client") {ImGui::SameLine();chip((std::to_string(state.value("rtt_ms",0u))+" ms").c_str(),color::info);}
+        if(r=="host") {
+            ImGui::Spacing();label("好友可通过以下地址加入：");
+            for(const auto& a:state.value("addresses",json::array())) {
+                const auto endpoint=str(a,"ip")+":"+std::to_string(roomInfo.value("port",47615));
+                ImGui::PushID(endpoint.c_str());ImGui::PushFont(fonts.mono);ImGui::TextUnformatted(endpoint.c_str());ImGui::PopFont();
+                ImGui::SameLine();if(ImGui::SmallButton("复制")) {ImGui::SetClipboardText(endpoint.c_str());say("地址已复制",false);}
+                ImGui::SameLine();ImGui::PushFont(fonts.note);label(str(a,"adapter").c_str());ImGui::PopFont();ImGui::PopID();
+            }
+        }
+        ImGui::Spacing();
+        if(dangerButton(r=="host"?"关闭房间":r=="client"?"离开房间":"取消连接",{0,0})) leaveConfirm=true;
+        endCard();
+        sync();
+    }
+    void sync() {
+        const auto world=state.value("world_session",json::object());const auto entry=world.value("entry",json::object());
+        const auto native=state.value("game",json::object()).value("world_replication",json::object());
+        beginCard("##sync","世界同步",fonts.title);
+        const bool active=entry.value("active",false);
+        chip(active?"已进入共享世界":"正在进入共享世界",active?color::ok:color::warn);
+        ImGui::SameLine();chip(("敌人 "+std::to_string(native.value("matched",0u))+" 已同步").c_str(),color::dim);
+        if(native.value("missing",0u)>0) {ImGui::SameLine();chip(("缺失 "+std::to_string(native.value("missing",0u))).c_str(),color::bad);}
+        for(const auto& b:entry.value("blockers",json::array())) if(b.is_string()) {ImGui::PushFont(fonts.note);label((std::string("· 等待：")+blockerText(b.get<std::string>())).c_str());ImGui::PopFont();}
+        const auto travel=str(native,"teleport");
+        if(travel=="failed") ImGui::TextColored(color::bad,"传送失败：%s",str(native,"error").c_str());
+        else if(!travel.empty()&&travel!="idle"&&travel!="complete") {ImGui::PushFont(fonts.note);label(("传送：" + travel).c_str());ImGui::PopFont();}
+        // Host changed map: follow or stay.
+        const auto change=native.value("host_map_change",json::object());
+        if(role()=="client"&&change.value("pending",false)) {
+            ImGui::Separator();ImGui::TextColored(color::accent,"房主已前往：%s",str(change,"level").c_str());
+            const auto blockers=entry.value("blockers",json::array());
+            const bool supported=std::find(blockers.begin(),blockers.end(),json("host_scene_rules"))==blockers.end();
+            const auto token=change.value("token",std::uint64_t(0));
+            ImGui::BeginDisabled(!supported);if(accentButton("跟随房主",{0,0})) act({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
+            if(!change.value("deferred",false)) {ImGui::SameLine();if(ImGui::Button("暂不跟随",{0,0})) act({{"action","host_map_choice"},{"token",token},{"follow",false}});}
+            if(!supported) {ImGui::PushFont(fonts.note);label("房主当前场景尚未开放联机入场，请等待其回到大世界。");ImGui::PopFont();}
+        }
+        endCard();
+    }
+    void pagePlayers() {
+        title("玩家","房间内所有玩家的编号、位置与状态。");
+        const auto peers=state.value("peers",json::array());
+        if(peers.empty()) {beginCard("##none","",fonts.title);label("加入或开放房间后，这里会列出房间内的玩家。");endCard();return;}
+        const bool host=role()=="host";
+        if(ImGui::BeginTable("##players",6,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerH|ImGuiTableFlags_SizingStretchProp|ImGuiTableFlags_PadOuterX)) {
+            ImGui::TableSetupColumn("编号",ImGuiTableColumnFlags_WidthFixed,56);ImGui::TableSetupColumn("玩家",0,1.4f);
+            ImGui::TableSetupColumn("地图",0,1.2f);ImGui::TableSetupColumn("坐标",0,1.6f);ImGui::TableSetupColumn("状态",0,1.1f);
+            ImGui::TableSetupColumn("操作",ImGuiTableColumnFlags_WidthFixed,host?170.f:96.f);
+            ImGui::TableHeadersRow();
+            for(const auto& p:peers) {
+                ImGui::PushID(p.value("id",0));ImGui::TableNextRow(0,40);
+                const bool self=p.value("local",false),valid=p.value("valid",false),stale=p.value("state_age_ms",4000)>3000;
+                ImGui::TableNextColumn();ImGui::AlignTextToFramePadding();ImGui::PushFont(fonts.mono);ImGui::Text("#%d",p.value("id",0));ImGui::PopFont();
+                ImGui::TableNextColumn();ImGui::AlignTextToFramePadding();ImGui::TextUnformatted(str(p,"name").c_str());
+                if(p.value("host",false)) {ImGui::SameLine();chip("房主",color::accent);}
+                if(self) {ImGui::SameLine();chip("你",color::info);}
+                ImGui::TableNextColumn();ImGui::AlignTextToFramePadding();ImGui::TextUnformatted(str(p,"level",str(p,"map","—")).c_str());
+                ImGui::TableNextColumn();ImGui::AlignTextToFramePadding();ImGui::PushFont(fonts.mono);ImGui::TextUnformatted(valid?formatPosition(p.value("position",json::array())).c_str():"—");ImGui::PopFont();
+                ImGui::TableNextColumn();ImGui::AlignTextToFramePadding();
+                if(self) ImGui::TextColored(color::info,"本机");
+                else if(!valid||stale) ImGui::TextColored(color::faint,"等待状态");
+                else if(p.value("same_map",false)) ImGui::TextColored(color::ok,"同地图");
+                else ImGui::TextColored(color::warn,"其他地图");
+                ImGui::TableNextColumn();
+                if(!self) {
+                    ImGui::BeginDisabled(!online()||!valid||stale);if(ImGui::SmallButton("传送到TA")) act({{"action","teleport_to_player"},{"id",p["id"]}});ImGui::EndDisabled();
+                    if(host) {ImGui::SameLine();if(ImGui::SmallButton("移出")) {kickId=p.value("id",0);kickPending=true;}}
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    void pageChat() {
+        title("聊天",nullptr);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,color::card);
+        ImGui::BeginChild("##messages",{0,-56},ImGuiChildFlags_Borders|ImGuiChildFlags_AlwaysUseWindowPadding);
+        std::uint64_t newest=0;
+        for(const auto& line:state.value("chat",json::array())) {
+            newest=(std::max)(newest,line.value("serial",std::uint64_t(0)));
+            if(line.value("system",false)) {ImGui::PushFont(fonts.note);label(("· "+str(line,"text")).c_str());ImGui::PopFont();continue;}
+            ImGui::TextColored(color::accent,"%s",str(line,"name").c_str());ImGui::SameLine();ImGui::TextWrapped("%s",str(line,"text").c_str());
+        }
+        if(newest!=lastChat) {ImGui::SetScrollHereY(1);lastChat=newest;}
+        ImGui::EndChild();ImGui::PopStyleColor();
+        ImGui::BeginDisabled(!online());
+        ImGui::SetNextItemWidth(-96);bool send=ImGui::InputTextWithHint("##chat","输入消息，Enter 发送",chat,sizeof chat,ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();send|=accentButton("发送",{-1,0});
+        if(send&&*chat) {act({{"action","chat"},{"text",chat}});chat[0]=0;ImGui::SetKeyboardFocusHere(-1);}
+        ImGui::EndDisabled();
+    }
+    void pageSettings() {
+        title("设置","名字与显示设置保存在本机。");
+        beginCard("##player","玩家",fonts.title);
+        label("显示名称");ImGui::SetNextItemWidth(320);ImGui::InputText("##name",name,sizeof name);
+        const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
+        label("菜单快捷键");ImGui::SetNextItemWidth(160);if(ImGui::Combo("##key",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
+        endCard();
+        beginCard("##display","显示",fonts.title);
+        ImGui::Checkbox("显示其他玩家的角色",&remote);
+        ImGui::BeginDisabled(!remote);ImGui::Checkbox("同时显示其他玩家队伍中的另外三名干员",&squad);
+        ImGui::Checkbox("在其他玩家的角色上重放技能动作、武器与特效",&replay);ImGui::EndDisabled();
+        ImGui::Checkbox("显示玩家名牌与房间成员面板（编号、坐标、距离）",&markers);
+        endCard();
+        beginCard("##coop","联机",fonts.title);
+        ImGui::Checkbox("作为房客时跟随房主的地图",&follow);
+        ImGui::Checkbox("同步战斗（共同攻击房主世界的敌人）",&combat);
+        endCard();
+        if(accentButton("保存设置",{0,0})) saveSettings();
+        ImGui::Dummy({0,8});
+        beginCard("##tools","工具",fonts.title);
+        if(ImGui::Button("应急回到四号谷地",{0,0})) act({{"action","emergency_home"}});
+        ImGui::SameLine();ImGui::PushFont(fonts.note);label("先离开房间，再用官方传送回到枢纽。");ImGui::PopFont();
+        const auto teleport=state.value("game",json::object()).value("world_replication",json::object()).value("official_teleport",json::object());
+        if(teleport.contains("error")) ImGui::TextColored(color::bad,"官方传送失败：%s",str(teleport,"error").c_str());
+        bool invincible=state.value("testing_invincible",false);
+        if(ImGui::Checkbox("测试：本机角色无敌（不保存）",&invincible)) act({{"action","testing_invincible"},{"enabled",invincible}});
+        endCard();
+    }
+    void pageDiagnostics() {
+        title("诊断","连接、同步与游戏接入的实时状态。");
+        const auto g=state.value("game",json::object());const auto native=g.value("world_replication",json::object());
+        const auto world=state.value("world_session",json::object());const auto entry=world.value("entry",json::object());
+        const auto combatState=native.value("combat",json::object());const auto squadState=native.value("squad",json::object());
+        auto row=[&](const char* k,const std::string& v,ImVec4 tint=color::text) {
+            ImGui::TableNextRow();ImGui::TableNextColumn();label(k);ImGui::TableNextColumn();ImGui::TextColored(tint,"%s",v.c_str());
+        };
+        auto num=[](const json& j,const char* k) {return std::to_string(j.value(k,std::uint64_t(0)));};
+        beginCard("##diag","",fonts.title);
+        if(ImGui::BeginTable("##d",2,ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("k",0,1);ImGui::TableSetupColumn("v",0,2.4f);
+            row("游戏接入",state.value("hook_ready",false)?"已连接":"等待场景",state.value("hook_ready",false)?color::ok:color::warn);
+            row("地图",str(g,"map_id","—")+" / "+str(g,"level_id","—"));
+            row("本机角色",g.value("local_valid",false)?"已读取（骨骼 "+std::to_string(g.value("local_bones",0))+"）":"未读取",g.value("local_valid",false)?color::ok:color::warn);
+            row("共享世界",str(entry,"phase","offline"),entry.value("active",false)?color::ok:color::warn);
+            row("房客隔离",native.value("guest_policy",json::object()).value("ready",false)?"就绪":str(native.value("guest_policy",json::object()),"error","—"));
+            row("战斗过滤",state.value("op_filter_ready",false)?"就绪":str(state,"op_filter_note","—"),state.value("op_filter_ready",false)?color::ok:color::warn);
+            row("敌人",num(native,"matched")+" 已同步 / "+num(native,"missing")+" 缺失");
+            row("命中",num(combatState,"guest_hits_sent")+" 发出 / "+num(combatState,"room_hits_applied")+" 结算");
+            row("技能重放",num(combatState,"player_casts_sent")+" 发出 / "+num(combatState,"player_casts_mirrored")+" 重放 / "+num(combatState,"player_casts_rejected")+" 失败");
+            if(!str(combatState,"player_cast_error").empty()) row("重放错误",str(combatState,"player_cast_error"),color::bad);
+            row("武器",str(combatState,"local_weapon").empty()?"未读取":"已读取（远端查询 "+num(combatState,"weapon_lookups")+"）");
+            row("队伍成员",num(squadState,"poses_sent")+" 发出 / "+num(squadState,"poses_in")+" 收到 / "+std::to_string(squadState.value("remote",json::array()).size())+" 远端");
+            if(!str(squadState,"error").empty()) row("队伍错误",str(squadState,"error"),color::bad);
+            row("网络延迟",std::to_string(state.value("rtt_ms",0u))+" ms");
+            const auto traffic=state.value("traffic",json::object());
+            row("UDP",traffic.value("udp_pongs",std::uint64_t(0))>0?"已连通":role()=="client"?"未连通（使用 TCP）":"—");
+            row("传送",str(native,"teleport","idle"));
+            for(const auto& e:{str(world,"error"),str(native,"error"),str(g,"error"),str(state,"last_error")}) if(!e.empty()) row("错误",e,color::bad);
+            const auto gui=state.value("gui_render",json::object());
+            row("界面",str(gui,"backend")+" · "+num(gui,"frames")+" 帧");
+            row("版本","EF Link " EFLINK_VERSION " · Windows x64");
+            ImGui::EndTable();
+        }
+        endCard();
+    }
+    void popups() {
+        if(leaveConfirm) {ImGui::OpenPopup("##leave");leaveConfirm=false;}
+        if(kickPending) {ImGui::OpenPopup("##kick");kickPending=false;}
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,{24,20});
+        if(ImGui::BeginPopupModal("##leave",nullptr,ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoTitleBar)) {
+            ImGui::PushFont(fonts.title);ImGui::TextUnformatted(role()=="host"?"关闭房间？":"离开房间？");ImGui::PopFont();
+            label(role()=="host"?"所有玩家都会断开连接。":"会回到进入房间前的位置。");ImGui::Spacing();
+            if(dangerButton("确认",{120,0})) {act({{"action","leave"}});ImGui::CloseCurrentPopup();}
+            ImGui::SameLine();if(ImGui::Button("返回",{120,0})) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        if(ImGui::BeginPopupModal("##kick",nullptr,ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoTitleBar)) {
+            ImGui::PushFont(fonts.title);ImGui::Text("移出玩家 #%d？",kickId);ImGui::PopFont();ImGui::Spacing();
+            if(dangerButton("移出",{120,0})) {act({{"action","kick"},{"id",kickId}});kickId=-1;ImGui::CloseCurrentPopup();}
+            ImGui::SameLine();if(ImGui::Button("返回",{120,0})) {kickId=-1;ImGui::CloseCurrentPopup();}
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar();
+    }
+};
+
+// ---- renderer: DirectComposition swap chain on a popup window ----
+struct Surface {
+    HWND window=nullptr;bool interactive=false,shown=false,transparent=true;unsigned width=0,height=0;
+    ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;ComPtr<IDXGISwapChain1> swap;ComPtr<ID3D11RenderTargetView> target;
+    ComPtr<IDCompositionDevice> dcomp;ComPtr<IDCompositionTarget> dtarget;ComPtr<IDCompositionVisual> visual;
     static LRESULT CALLBACK proc(HWND w,UINT m,WPARAM a,LPARAM b) {
-        auto* self=reinterpret_cast<Renderer*>(GetWindowLongPtrW(w,GWLP_USERDATA));
-        if(m==WM_NCCREATE) {self=static_cast<Renderer*>(reinterpret_cast<CREATESTRUCTW*>(b)->lpCreateParams);SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));}
-        if(self&&!self->interactive&&m==WM_NCHITTEST) return HTTRANSPARENT;
-        if(self&&!self->interactive&&m==WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+        auto* self=reinterpret_cast<Surface*>(GetWindowLongPtrW(w,GWLP_USERDATA));
+        if(m==WM_NCCREATE) {self=static_cast<Surface*>(reinterpret_cast<CREATESTRUCTW*>(b)->lpCreateParams);SetWindowLongPtrW(w,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));}
+        if(self&&self->transparent&&!self->interactive) {
+            if(m==WM_NCHITTEST) return HTTRANSPARENT;
+            if(m==WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+        }
         if(ImGui::GetCurrentContext()&&ImGui_ImplWin32_WndProcHandler(w,m,a,b)) return 1;
-        if(self&&m==WM_SIZE&&a!=SIZE_MINIMIZED) {self->width=LOWORD(b);self->height=HIWORD(b);return 0;}
-        if(self&&m==WM_CLOSE) {self->closing=true;return 0;}
-        if(self&&m==WM_HOTKEY) {self->toggle=true;return 0;}
+        if(m==WM_CLOSE) {if(self) self->closeRequested=true;return 0;}
+        if(m==WM_SIZE&&self&&a!=SIZE_MINIMIZED) {self->pendingWidth=LOWORD(b);self->pendingHeight=HIWORD(b);}
         return DefWindowProcW(w,m,a,b);
     }
+    bool closeRequested=false;unsigned pendingWidth=0,pendingHeight=0;
+    bool create(const wchar_t* className,HWND owner,bool overlay,int x,int y,unsigned w,unsigned h) {
+        transparent=overlay;width=(std::max)(1u,w);height=(std::max)(1u,h);
+        const DWORD ex=overlay?(WS_EX_NOREDIRECTIONBITMAP|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE):WS_EX_NOREDIRECTIONBITMAP;
+        window=CreateWindowExW(ex,className,L"EF Link",overlay?WS_POPUP:WS_OVERLAPPEDWINDOW,x,y,int(width),int(height),owner,nullptr,GetModuleHandleW(nullptr),this);
+        if(!window) return false;
+        if(overlay) SetLayeredWindowAttributes(window,0,255,LWA_ALPHA);
+        D3D_FEATURE_LEVEL level;
+        if(FAILED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,&level,&context))&&
+           FAILED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,&level,&context))) return false;
+        ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;ComPtr<IDXGIFactory2> factory;
+        if(FAILED(device.As(&dxgi))||FAILED(dxgi->GetAdapter(&adapter))||FAILED(adapter->GetParent(IID_PPV_ARGS(&factory)))) return false;
+        DXGI_SWAP_CHAIN_DESC1 d{};d.Width=width;d.Height=height;d.Format=DXGI_FORMAT_B8G8R8A8_UNORM;d.SampleDesc.Count=1;
+        d.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;d.BufferCount=2;d.Scaling=DXGI_SCALING_STRETCH;d.SwapEffect=DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        d.AlphaMode=DXGI_ALPHA_MODE_PREMULTIPLIED;
+        if(FAILED(factory->CreateSwapChainForComposition(device.Get(),&d,nullptr,&swap))) return false;
+        if(FAILED(DCompositionCreateDevice(dxgi.Get(),IID_PPV_ARGS(&dcomp)))||FAILED(dcomp->CreateTargetForHwnd(window,TRUE,&dtarget))||
+           FAILED(dcomp->CreateVisual(&visual))||FAILED(visual->SetContent(swap.Get()))||FAILED(dtarget->SetRoot(visual.Get()))||FAILED(dcomp->Commit())) return false;
+        makeTarget();return target!=nullptr;
+    }
     void makeTarget() {
-        ComPtr<ID3D11Texture2D> back;
+        target.Reset();ComPtr<ID3D11Texture2D> back;
         if(SUCCEEDED(swap->GetBuffer(0,IID_PPV_ARGS(&back)))) device->CreateRenderTargetView(back.Get(),nullptr,&target);
     }
-    HRESULT create() {
-        D3D_FEATURE_LEVEL feature;
-        auto hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,&feature,&context);
-        if(FAILED(hr)) hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,nullptr,0,D3D11_SDK_VERSION,&device,&feature,&context);
-        if(FAILED(hr)) return hr;
-        RECT bounds{};GetClientRect(window,&bounds);
-        ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;ComPtr<IDXGIFactory> factory;
-        device.As(&dxgi);dxgi->GetAdapter(&adapter);adapter->GetParent(IID_PPV_ARGS(&factory));
-        DXGI_SWAP_CHAIN_DESC d{};d.BufferCount=2;d.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;d.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        d.OutputWindow=window;d.SampleDesc.Count=1;d.Windowed=TRUE;d.SwapEffect=DXGI_SWAP_EFFECT_DISCARD;
-        hr=factory->CreateSwapChain(device.Get(),&d,&swap);if(FAILED(hr)) return hr;
-        makeTarget();return target?S_OK:E_FAIL;
+    void resize(unsigned w,unsigned h) {
+        w=(std::max)(1u,w);h=(std::max)(1u,h);if(w==width&&h==height) return;
+        width=w;height=h;target.Reset();context->ClearState();context->Flush();
+        swap->ResizeBuffers(0,width,height,DXGI_FORMAT_UNKNOWN,0);makeTarget();
+    }
+    // Click-through HUD layer, or an interactive menu that takes the keyboard.
+    void setInteractive(bool value) {
+        if(interactive==value) return;
+        interactive=value;
+        if(transparent) {
+            auto ex=GetWindowLongPtrW(window,GWL_EXSTYLE);
+            ex=value?(ex&~LONG_PTR(WS_EX_TRANSPARENT|WS_EX_NOACTIVATE)):(ex|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE);
+            SetWindowLongPtrW(window,GWL_EXSTYLE,ex);
+            SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+        }
+    }
+    void show(bool value) {
+        if(shown==value) return;
+        shown=value;ShowWindow(window,value?SW_SHOWNA:SW_HIDE);
+    }
+    void render(const float clear[4]) {
+        auto* rtv=target.Get();context->OMSetRenderTargets(1,&rtv,nullptr);context->ClearRenderTargetView(rtv,clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());swap->Present(1,0);
     }
     void capture(const std::filesystem::path& path) {
         ComPtr<ID3D11Texture2D> back;swap->GetBuffer(0,IID_PPV_ARGS(&back));D3D11_TEXTURE2D_DESC d{};back->GetDesc(&d);
@@ -73,463 +567,146 @@ struct Renderer {
         context->CopyResource(staging.Get(),back.Get());D3D11_MAPPED_SUBRESOURCE map{};
         if(FAILED(context->Map(staging.Get(),0,D3D11_MAP_READ,0,&map))) return;
         std::vector<unsigned char> pixels(std::size_t(d.Width)*d.Height*4);
-        for(unsigned y=0;y<d.Height;++y) for(unsigned x=0;x<d.Width;++x) {
-            auto* src=static_cast<unsigned char*>(map.pData)+y*map.RowPitch+x*4;auto* dst=pixels.data()+(std::size_t(y)*d.Width+x)*4;
-            bool bgra=d.Format==DXGI_FORMAT_B8G8R8A8_UNORM;dst[0]=src[bgra?0:2];dst[1]=src[1];dst[2]=src[bgra?2:0];dst[3]=255;
-        }
+        for(unsigned y=0;y<d.Height;++y) std::memcpy(pixels.data()+std::size_t(y)*d.Width*4,static_cast<unsigned char*>(map.pData)+y*map.RowPitch,d.Width*4);
         context->Unmap(staging.Get(),0);
         BITMAPFILEHEADER f{};BITMAPINFOHEADER info{};f.bfType=0x4D42;f.bfOffBits=sizeof(f)+sizeof(info);f.bfSize=f.bfOffBits+DWORD(pixels.size());
         info.biSize=sizeof(info);info.biWidth=LONG(d.Width);info.biHeight=-LONG(d.Height);info.biPlanes=1;info.biBitCount=32;info.biSizeImage=DWORD(pixels.size());
         std::filesystem::create_directories(path.parent_path());std::ofstream out(path,std::ios::binary);
         out.write(reinterpret_cast<char*>(&f),sizeof(f));out.write(reinterpret_cast<char*>(&info),sizeof(info));out.write(reinterpret_cast<char*>(pixels.data()),std::streamsize(pixels.size()));
     }
-};
-void theme() {
-    ImGui::StyleColorsDark();auto& s=ImGui::GetStyle();s.WindowRounding=8;s.ChildRounding=5;s.FrameRounding=3;s.WindowBorderSize=1;
-    s.WindowPadding={24,20};s.FramePadding={12,9};s.ItemSpacing={12,12};s.ScrollbarSize=10;
-    auto* c=s.Colors;c[ImGuiCol_WindowBg]={.065f,.075f,.082f,1};c[ImGuiCol_ChildBg]={.085f,.098f,.108f,1};
-    c[ImGuiCol_FrameBg]={.12f,.145f,.16f,1};c[ImGuiCol_Button]={.18f,.22f,.23f,1};c[ImGuiCol_ButtonHovered]={.29f,.35f,.35f,1};
-    c[ImGuiCol_Header]={.28f,.33f,.16f,1};c[ImGuiCol_HeaderHovered]={.34f,.39f,.20f,1};c[ImGuiCol_CheckMark]={.85f,.93f,.35f,1};
-    c[ImGuiCol_SliderGrab]=c[ImGuiCol_CheckMark];c[ImGuiCol_Separator]={.22f,.27f,.29f,1};
-}
-void copyText(char* dst,std::size_t capacity,const std::string& text) {strncpy_s(dst,capacity,text.c_str(),_TRUNCATE);}
-struct Panel {
-    Gui::Request request;json state;std::string feedback;int tab=0;bool close=false,initialized=false;std::uint64_t lastMapPrompt=0;
-    char name[65]{},room[65]{},hostPassword[129]{},address[257]{},joinPassword[129]{},serverName[129]{},chat[1001]{};
-    int port=47615,limit=8,key=kDefaultMenuKey;bool remote=true,markers=true,follow=true,combat=true;std::uint64_t lastRefresh=0,lastChat=0;
-    json call(const json& input) {
-        try {auto result=request(input);if(result.contains("error")) feedback=result["error"].get<std::string>();else {state=std::move(result);if(input.value("action",std::string{})!="status") feedback.clear();}return state;}
-        catch(const std::exception& e) {feedback=e.what();return state;}
-    }
-    void refresh() {
-        if(GetTickCount64()-lastRefresh<250) return;lastRefresh=GetTickCount64();call({{"action","status"}});
-        if(!initialized&&!state.empty()) {
-            initialized=true;copyText(name,sizeof(name),state.value("name",std::string{}));
-            auto c=state.value("configuration",json::object());copyText(room,sizeof(room),c.value("room_name",std::string{}));
-            port=c.value("port",47615);limit=c.value("max_players",8);key=c.value("menu_key",kDefaultMenuKey);remote=c.value("show_remote_players",true);
-            markers=c.value("show_player_markers",true);follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);
-        }
-    }
-    void join() {if(*address) call({{"action","join"},{"address",address},{"password",joinPassword}});else feedback="请输入房主地址";}
-    void save() {call({{"action","settings"},{"configuration",{{"player_name",name},{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},{"show_remote_players",remote},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}}}});}
-    void draw() {
-        refresh();auto role=state.value("role",std::string("offline"));bool online=role=="host"||role=="client",offline=role=="offline",requestLeave=false;
-        auto display=ImGui::GetIO().DisplaySize;ImGui::SetNextWindowPos({display.x*.5f,display.y*.5f},ImGuiCond_Always,{.5f,.5f});
-        ImGui::SetNextWindowSize({(std::min)(1020.f,display.x-24),(std::min)(700.f,display.y-24)},ImGuiCond_Always);
-        ImGui::Begin("EF Link",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings);
-        ImGui::TextColored({.85f,.93f,.35f,1},"EF LINK   /   终末地联机");ImGui::SameLine(ImGui::GetWindowWidth()-145);
-        if(ImGui::SmallButton("返回游戏  ×")) close=true;
-        ImGui::TextDisabled("%s  ·  %s",role=="host"?"房主":role=="client"?"已连接":role=="connecting"?"连接中":"离线",state.value("name",std::string("管理员")).c_str());
-        ImGui::Separator();
-        ImGui::BeginChild("navigation",{164,-42},false);const char* labels[]={"局域网房间","直接连接 / 收藏","开放房间","房间玩家","房间聊天","设置 / 诊断"};
-        for(int i=0;i<6;++i) {if(ImGui::Selectable(labels[i],tab==i,0,{0,36})) tab=i;}
-        ImGui::Spacing();ImGui::Separator();if(key==VK_OEM_PLUS)ImGui::TextDisabled("菜单：=");else ImGui::TextDisabled("菜单：F%d",key-VK_F1+1);ImGui::TextWrapped("连接后可关闭菜单，联机继续运行。");
-        ImGui::EndChild();ImGui::SameLine();ImGui::BeginChild("content",{0,-42},false);
-        if(tab==0) {
-            ImGui::Text("局域网房间");ImGui::SameLine();if(ImGui::Button("刷新列表")) call({{"action","refresh"}});
-            ImGui::TextDisabled("自动寻找同一局域网中的房间；也可以直接输入好友地址。");
-            ImGui::BeginDisabled(!offline);
-            auto rooms=state.value("rooms",json::array());if(rooms.empty()) {ImGui::Spacing();ImGui::TextWrapped("暂时没有发现房间。让好友先开放房间，或在“直接连接”中输入 IP:端口。");}
-            for(const auto& r:rooms) {
-                ImGui::PushID(r.value("address",std::string{}).c_str());ImGui::Separator();
-                ImGui::Text("%s  %s",r.value("name",std::string{}).c_str(),r.value("password",false)?"[密码]":"");
-                ImGui::TextDisabled("%s  ·  %d/%d 人  ·  %s",r.value("host",std::string{}).c_str(),r.value("players",0),r.value("max_players",0),r.value("address",std::string{}).c_str());
-                if(ImGui::Button("加入房间")) {copyText(address,sizeof(address),r.value("address",std::string{}));joinPassword[0]=0;if(r.value("password",false)) tab=1;else join();}
-                ImGui::PopID();
-            }
-            ImGui::EndDisabled();
-        } else if(tab==1) {
-            ImGui::Text("连接好友");ImGui::TextDisabled("地址示例：192.168.1.20:47615");
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##address","房主的 IP 或 IP:端口",address,sizeof(address));
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##password","房间密码（可留空）",joinPassword,sizeof(joinPassword),ImGuiInputTextFlags_Password);
-            ImGui::BeginDisabled(!offline);if(ImGui::Button("连接",{140,0})) join();ImGui::EndDisabled();
-            ImGui::SameLine();if(ImGui::Button("收藏此地址")) {call({{"action","save_server"},{"address",address},{"name",*serverName?serverName:address}});}
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##serverName","收藏名称（可留空）",serverName,sizeof(serverName));
-            ImGui::Separator();ImGui::Text("收藏的服务器");
-            for(const auto& s:state.value("configuration",json::object()).value("saved_servers",json::array())) {
-                auto a=s.value("address",std::string{});ImGui::PushID(a.c_str());
-                if(ImGui::Selectable((s.value("name",a)+"  /  "+a).c_str())) {copyText(address,sizeof(address),a);joinPassword[0]=0;}
-                if(ImGui::SmallButton("移除收藏")) call({{"action","remove_server"},{"address",a}});ImGui::PopID();
-            }
-        } else if(tab==2) {
-            ImGui::Text("将房间开放到局域网");ImGui::TextDisabled("当前为实验版本：支持连接与角色显示，完整房主世界接管尚未完成。");
-            if(!offline) {
-                ImGui::Spacing();
-                if(role=="host") {
-                    ImGui::TextColored({.85f,.93f,.35f,1},"当前房间已开放：%s",state.value("room",json::object()).value("name",std::string{}).c_str());
-                    ImGui::TextWrapped("开房设置暂时锁定。要修改名称、密码、人数或端口，请先关闭当前房间；已连接的玩家会断开。");
-                    if(ImGui::Button("关闭当前房间以修改设置")) requestLeave=true;
-                } else {
-                    ImGui::TextWrapped("%s",role=="connecting"?"正在连接房间。请先取消连接，再设置自己的房间。":"你已加入其他房间。请先断开连接，再设置自己的房间。");
-                    if(ImGui::Button(role=="connecting"?"取消当前连接":"断开当前连接以开放房间")) requestLeave=true;
-                }
-                ImGui::Separator();
-            }
-            ImGui::BeginDisabled(!offline);ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##room","房间名称",room,sizeof(room));
-            ImGui::SetNextItemWidth(-1);ImGui::InputTextWithHint("##roomPassword","房间密码（可留空）",hostPassword,sizeof(hostPassword),ImGuiInputTextFlags_Password);
-            ImGui::SliderInt("人数上限",&limit,2,16);ImGui::InputInt("连接端口",&port,0);
-            if(ImGui::Button("开放房间",{180,0})) {save();if(feedback.empty()) call({{"action","host"},{"room_name",room},{"password",hostPassword},{"port",port},{"max_players",limit}});hostPassword[0]=0;}
-            ImGui::EndDisabled();
-            if(role=="host") {
-                ImGui::Separator();ImGui::Text("房间已开放：%s",state["room"].value("name",std::string{}).c_str());
-                for(const auto& a:state.value("addresses",json::array())) {
-                    auto endpoint=a.value("ip",std::string{})+":"+std::to_string(state["room"].value("port",47615));
-                    ImGui::PushID(endpoint.c_str());ImGui::Text("%s",endpoint.c_str());ImGui::SameLine();if(ImGui::SmallButton("复制地址")) ImGui::SetClipboardText(endpoint.c_str());ImGui::TextDisabled("%s",a.value("adapter",std::string{}).c_str());ImGui::PopID();
-                }
-            }
-        } else if(tab==3) {
-            ImGui::Text("房间玩家   /   %s",state.value("room",json::object()).value("name",std::string{}).c_str());
-            auto entry=state.value("world_session",json::object()).value("entry",json::object());
-            if(online&&!entry.value("active",false)) ImGui::TextWrapped("已连接房间，世界接管尚未完成。当前无法共同结算战斗。");
-            if(!online) ImGui::TextWrapped("加入或开放房间后，这里会显示玩家和同步状态。");
-            for(const auto& p:state.value("peers",json::array())) {
-                ImGui::PushID(p.value("id",0));ImGui::Separator();ImGui::Text("%s  %s %s",p.value("name",std::string{}).c_str(),p.value("host",false)?"[房主]":"",p.value("local",false)?"[你]":"");
-                ImGui::TextDisabled("地图 %s  ·  %s",p.value("map",std::string("读取中")).c_str(),p.value("local",false)?"本机":!p.value("valid",false)||p.value("state_age_ms",4000)>3000?"等待角色状态":p.value("same_map",false)?"同地图 · 同步中":"在其他地图");
-                if(p.contains("distance")) {ImGui::SameLine();ImGui::TextDisabled("· %.1f 米",p["distance"].get<float>());}
-                if(!p.value("local",false)) {
-                    ImGui::BeginDisabled(!online||!p.value("valid",false)||p.value("state_age_ms",4000)>3000);
-                    if(ImGui::Button("传送到这位玩家")) call({{"action","teleport_to_player"},{"id",p["id"]}});
-                    ImGui::EndDisabled();
-                }
-                if(role=="host"&&!p.value("local",false)) {if(ImGui::Button("移出玩家")) {state["kick_id"]=p["id"];ImGui::OpenPopup("确认移出");}
-                    if(ImGui::BeginPopupModal("确认移出",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {ImGui::Text("将这位玩家移出当前房间？");if(ImGui::Button("确认")) {call({{"action","kick"},{"id",p["id"]}});ImGui::CloseCurrentPopup();}ImGui::SameLine();if(ImGui::Button("取消")) ImGui::CloseCurrentPopup();ImGui::EndPopup();}}
-                ImGui::PopID();
-            }
-        } else if(tab==4) {
-            ImGui::Text("房间聊天");ImGui::BeginChild("messages",{0,-100},true);
-            std::uint64_t newest=0;for(const auto& line:state.value("chat",json::array())) {
-                newest=(std::max)(newest,line.value("serial",std::uint64_t(0)));
-                auto text=(line.value("system",false)?std::string("· "):line.value("name",std::string{})+"：")+line.value("text",std::string{});ImGui::TextWrapped("%s",text.c_str());
-            }
-            if(newest!=lastChat) {ImGui::SetScrollHereY(1);lastChat=newest;}ImGui::EndChild();
-            ImGui::BeginDisabled(!online);ImGui::SetNextItemWidth(-86);bool send=ImGui::InputTextWithHint("##chat","输入消息，按 Enter 发送",chat,sizeof(chat),ImGuiInputTextFlags_EnterReturnsTrue);ImGui::SameLine();send|=ImGui::Button("发送");
-            if(send&&*chat) {call({{"action","chat"},{"text",chat}});chat[0]=0;}ImGui::EndDisabled();
-        } else {
-            ImGui::Text("玩家设置");ImGui::InputText("玩家名称",name,sizeof(name));ImGui::Checkbox("在游戏中显示其他玩家",&remote);
-            ImGui::Checkbox("屏幕显示玩家位置与距离",&markers);
-            ImGui::TextWrapped("真实共享世界正在实现，地图跟随和联机战斗尚未开放。旧场景复制已停用。");
-            const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
-            if(ImGui::Combo("菜单快捷键",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
-            if(ImGui::Button("保存设置")) save();ImGui::SameLine();ImGui::TextDisabled("收藏、名字与设置自动保存在本机。");
-            ImGui::Separator();
-            if(ImGui::Button("应急回到四号谷地")) call({{"action","emergency_home"}});
-            ImGui::SameLine();ImGui::TextDisabled("会先离开房间，再用官方传送回四号谷地的枢纽。");
-            {
-                auto teleport=state.value("game",json::object()).value("world_replication",json::object()).value("official_teleport",json::object());
-                if(teleport.contains("error"))ImGui::TextColored({1,.45f,.4f,1},"官方传送失败：%s",teleport.value("error",std::string{}).c_str());
-                else if(teleport.contains("hub"))ImGui::TextDisabled("最近一次官方传送：%s / %s",teleport.value("map",std::string{}).c_str(),teleport.value("hub",std::string{}).c_str());
-                else if(teleport.value("state",std::string{})=="queued")ImGui::TextDisabled("应急传送已排队：离房并恢复后执行");
-            }
-            {
-                bool invincible=state.value("testing_invincible",false);
-                if(ImGui::Checkbox("测试用：本机角色无敌（不保存，重开游戏自动关闭）",&invincible)) call({{"action","testing_invincible"},{"enabled",invincible}});
-                if(invincible)ImGui::TextColored({1,.75f,.3f,1},"无敌已开启：本机干员受到的伤害被作废。测试完请关闭。");
-            }
-            ImGui::Separator();ImGui::Text("房主世界接入");ImGui::TextWrapped("地图和实体加载完成后，还需完成客机世界隔离、逻辑玩家与房主规则接管。入场未完成时禁止客机结算战斗。");
-            auto g=state.value("game",json::object());ImGui::Text("游戏接入：%s",state.value("hook_ready",false)?"已连接":"等待终末地场景");
-            auto w=state.value("world_session",json::object());auto native=g.value("world_replication",json::object());
-            auto policy=native.value("guest_policy",json::object());
-            if(policy.value("restricted",false)) {
-                ImGui::TextWrapped("房客模式：地图机关、采集、资源破坏和私人副本入口已禁用。切图和传送由房主世界管理，离开房间后恢复。");
-                if(!policy.value("ready",false))ImGui::TextWrapped("交互隔离未就绪：%s",policy.value("error",std::string{}).c_str());
-            }
-            ImGui::Text("世界状态：%s  /  地图版本 %llu",w.value("ready",false)?"已收到":"等待房主",static_cast<unsigned long long>(w.value("epoch",std::uint64_t(0))));
-            auto entry=w.value("entry",json::object());
-            ImGui::Text("房主世界：%s",entry.value("active",false)?"已完成入场":"接管未完成");
-            ImGui::TextDisabled("%s",entry.value("phase",std::string("offline")).c_str());
-            for(const auto& block:entry.value("blockers",json::array())) {
-                auto blocker=block.get<std::string>();const char* description=
-                    blocker=="host_world_isolation"?"房主世界隔离":blocker=="host_logical_players"?"房主逻辑玩家":
-                    blocker=="host_combat_settlement"?"房主战斗结算":blocker=="host_scene_rules"?"房主地图与副本规则":
-                    blocker=="guest_map_loading"?"客机地图加载":blocker=="guest_entity_replicas"?"客机实体重建":
-                    blocker=="guest_world_isolation"?"客机世界隔离":blocker=="guest_logical_players"?"客机逻辑玩家":blocker.c_str();
-                ImGui::TextDisabled("待完成：%s",description);
-            }
-            ImGui::Text("敌人：已匹配 %u / 缺失 %u",native.value("matched",0u),native.value("missing",0u));
-            ImGui::Text("传送状态：%s",native.value("teleport",std::string("idle")).c_str());
-            for(auto err:{w.value("error",std::string{}),native.value("error",std::string{})}) if(!err.empty()) ImGui::TextWrapped("%s",err.c_str());
-            ImGui::Text("地图：%s   骨骼：%d",g.value("map_id",std::string{}).c_str(),g.value("local_bones",0));
-            ImGui::Text("与房主延迟：%u ms",state.value("rtt_ms",0u));
-            {
-                auto traffic=state.value("traffic",json::object());
-                if(role=="client") {
-                    if(traffic.value("udp_pongs",std::uint64_t(0))>0)ImGui::TextDisabled("UDP 已连通  ·  收到状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-                    else if(traffic.value("states_in",std::uint64_t(0))>0)ImGui::TextColored({.9f,.8f,.3f,1},"UDP 未连通，已改用 TCP 同步（收到状态 %llu）",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-                    else ImGui::TextColored({1,.6f,.3f,1},"UDP 未连通，正在改用 TCP 同步……");
-                } else if(role=="host")ImGui::TextDisabled("收到玩家状态 %llu",static_cast<unsigned long long>(traffic.value("states_in",std::uint64_t(0))));
-            }
-            if(auto error=g.value("error",std::string{});!error.empty()) ImGui::TextWrapped("游戏接入：%s",error.c_str());
-            ImGui::TextDisabled("EF Link %s  /  Windows x64  /  Better-Endfield 模块",EFLINK_VERSION);
-        }
-        auto error=state.value("last_error",std::string{});if(!feedback.empty()||!error.empty()) {ImGui::Separator();ImGui::TextColored({1,.65f,.4f,1},"%s",(!feedback.empty()?feedback:error).c_str());}
-        ImGui::EndChild();ImGui::Separator();
-        if(!offline) {if(ImGui::Button(role=="connecting"?"取消连接":role=="host"?"关闭房间":"断开连接")) requestLeave=true;
-            if(requestLeave) ImGui::OpenPopup("离开房间");
-            if(ImGui::BeginPopupModal("离开房间",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {ImGui::Text("%s",role=="host"?"关闭房间会断开所有玩家。":"确定结束当前连接？");if(ImGui::Button("确认")) {call({{"action","leave"}});joinPassword[0]=0;ImGui::CloseCurrentPopup();}ImGui::SameLine();if(ImGui::Button("返回")) ImGui::CloseCurrentPopup();ImGui::EndPopup();}}
-        else ImGui::TextDisabled("局域网连接  ·  同一地图显示玩家");
-        auto change=state.value("game",json::object()).value("world_replication",json::object()).value("host_map_change",json::object());
-        const bool pending=role=="client"&&change.value("pending",false);
-        const auto token=change.value("token",std::uint64_t(0));
-        auto blockers=state.value("world_session",json::object()).value("entry",json::object()).value("blockers",json::array());
-        const bool supported=std::find(blockers.begin(),blockers.end(),json("host_scene_rules"))==blockers.end();
-        {
-            // Travel failures (follow / teleport to a player) are shown, not only logged.
-            auto native=state.value("game",json::object()).value("world_replication",json::object());
-            if(native.value("teleport",std::string{})=="failed"&&!native.value("error",std::string{}).empty())
-                ImGui::TextColored({1,.45f,.4f,1},"传送失败：%s",native.value("error",std::string{}).c_str());
-        }
-        if(pending) {
-            ImGui::TextColored({.85f,.93f,.35f,1},"房主已切换地图：%s",change.value("level",std::string{}).c_str());
-            if(change.value("deferred",false)) {
-                ImGui::TextDisabled("已暂不跟随，联机战斗暂停；可稍后跟随或离开房间。");
-                ImGui::BeginDisabled(!supported);if(ImGui::Button("现在跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
-            }else {
-                // Always offer the choice inline: the reminder popup closes with the menu.
-                ImGui::BeginDisabled(!supported);if(ImGui::Button("跟随房主"))call({{"action","host_map_choice"},{"token",token},{"follow",true}});ImGui::EndDisabled();
-                ImGui::SameLine();if(ImGui::Button("暂不跟随"))call({{"action","host_map_choice"},{"token",token},{"follow",false}});
-                if(token!=lastMapPrompt) {lastMapPrompt=token;ImGui::OpenPopup("房主切换地图");}
-            }
-        }
-        if(ImGui::BeginPopupModal("房主切换地图",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {
-            if(!pending)ImGui::CloseCurrentPopup();
-            else {
-                ImGui::Text("房主已前往：%s",change.value("level",std::string{}).c_str());
-                ImGui::Text("是否跟随房主切换地图？");
-                ImGui::TextDisabled("暂不跟随会留在当前地图，并暂停联机战斗。");
-                if(!supported)ImGui::TextWrapped("房主当前场景尚未开放联机入场，请等待其回到大世界。");
-                ImGui::BeginDisabled(!supported);
-                if(ImGui::Button("跟随切换",{150,0})) {call({{"action","host_map_choice"},{"token",token},{"follow",true}});if(feedback.empty())ImGui::CloseCurrentPopup();}
-                ImGui::EndDisabled();ImGui::SameLine();
-                if(ImGui::Button("暂不跟随",{150,0})) {call({{"action","host_map_choice"},{"token",token},{"follow",false}});if(feedback.empty())ImGui::CloseCurrentPopup();}
-            }
-            ImGui::EndPopup();
-        }
-        ImGui::End();
+    void destroy() {
+        if(ImGui::GetCurrentContext()) {ImGui_ImplDX11_Shutdown();ImGui_ImplWin32_Shutdown();}
+        visual.Reset();dtarget.Reset();dcomp.Reset();target.Reset();swap.Reset();context.Reset();device.Reset();
+        if(window) DestroyWindow(window);window=nullptr;
     }
 };
-void drawMarkers(const json& data) {
-    const auto size=ImGui::GetIO().DisplaySize;auto* draw=ImGui::GetForegroundDrawList();float otherY=20;
-    for(const auto& marker:data.value("markers",json::array())) {
-        std::string label=marker.value("name",std::string{});
-        if(marker.value("other_map",false)) {
-            label+=" · "+marker.value("map",std::string{});draw->AddText({20,otherY},IM_COL32(190,205,216,240),label.c_str());otherY+=25;continue;
-        }
-        float x=marker.value("x",.5f)*size.x,y=marker.value("y",.5f)*size.y;
-        if(!std::isfinite(x)||!std::isfinite(y)) continue;
-        bool off=marker.value("behind",false)||x<30||y<30||x>size.x-30||y>size.y-30;
-        if(off) {
-            float dx=x-size.x*.5f,dy=y-size.y*.5f;if(marker.value("behind",false)) {dx=-dx;dy=-dy;}
-            if(std::abs(dx)+std::abs(dy)<.001f) dy=-1;
-            const float scale=1.f/(std::max)(std::abs(dx)/((std::max)(1.f,size.x*.5f-65)),std::abs(dy)/((std::max)(1.f,size.y*.5f-65)));
-            x=size.x*.5f+dx*scale;y=size.y*.5f+dy*scale;
-        }
-        char distance[40];std::snprintf(distance,sizeof distance," · %.1f m",marker.value("distance",0.f));label+=distance;
-        auto text=ImGui::CalcTextSize(label.c_str());float tx=(std::clamp)(x-text.x*.5f,8.f,(std::max)(8.f,size.x-text.x-8));float ty=y+12;
-        draw->AddRectFilled({tx-6,ty-4},{tx+text.x+6,ty+text.y+4},IM_COL32(10,17,21,195),4);
-        draw->AddText({tx,ty},IM_COL32(227,244,145,255),label.c_str());
-        draw->AddCircle({x,y},off?6.f:4.f,IM_COL32(227,244,145,255),12,2);
-    }
+float uiScale(unsigned clientHeight) {return (std::clamp)(float(clientHeight)/1080.f,.85f,1.6f);}
 }
-}
-struct Gui::NativeState {
-    Panel panel;NativeGuiCanvas canvas;unity::Api api;ImGuiContext* context=nullptr;HWND window=nullptr;
-    std::atomic<bool> visible=false,accepting=true,textInput=false;std::atomic<int> menuKey=kDefaultMenuKey;
-    bool installed=false,failed=false,lastVisible=false,warmed=false;std::uint64_t lastFrame=0,retryAt=0,lastCheck=0;int failures=0;
-    std::mutex eventsMutex;struct Event {UINT message;WPARAM value;};std::vector<Event> events;
-    InputOwnership inputOwnership;
-    NativeState(Request request,const json& options) {panel.request=std::move(request);menuKey=options.value("menu_key",kDefaultMenuKey);}
-    static LRESULT CALLBACK input(HWND window,UINT message,WPARAM a,LPARAM b,UINT_PTR,DWORD_PTR data) {
-        auto& state=*reinterpret_cast<NativeState*>(data);
-        if(message==WM_NCDESTROY) {
-            RemoveWindowSubclass(window,input,reinterpret_cast<UINT_PTR>(&state));state.installed=false;state.window=nullptr;
-            return DefSubclassProc(window,message,a,b);
-        }
-        if(!state.accepting.load()) return DefSubclassProc(window,message,a,b);
-        if(message==WM_KILLFOCUS)state.inputOwnership.focusLost();
-        const bool down=message==WM_KEYDOWN||message==WM_SYSKEYDOWN;
-        const bool up=message==WM_KEYUP||message==WM_SYSKEYUP;
-        // A printable hotkey ("=") still types into a focused menu text box.
-        const bool typing=state.visible.load()&&state.textInput.load()&&!(state.menuKey.load()>=VK_F1&&state.menuKey.load()<=VK_F12);
-        if((down||up)&&int(a)==state.menuKey.load()&&!typing) {
-            state.inputOwnership.route(std::size_t(a),down,true);
-            if(down&&!(b&(LPARAM(1)<<30)))state.visible=!state.visible.load();
-            return 0;
-        }
-        const bool menu=state.visible.load();
-        bool paired=false,forward=false;
-        if(down||up) {paired=true;forward=state.inputOwnership.route(std::size_t(a),down,menu);}
-        for(auto [press,release,button]:{std::tuple{WM_LBUTTONDOWN,WM_LBUTTONUP,0u},std::tuple{WM_RBUTTONDOWN,WM_RBUTTONUP,1u},
-            std::tuple{WM_MBUTTONDOWN,WM_MBUTTONUP,2u},std::tuple{WM_XBUTTONDOWN,WM_XBUTTONUP,3u}})
-            if(message==UINT(press)||message==UINT(release)) {
-                if(button==3u&&GET_XBUTTON_WPARAM(a)==XBUTTON2)button=4u;
-                paired=true;forward=state.inputOwnership.route(256u+button,message==UINT(press),menu);break;
-            }
-        if(message==WM_INPUT) {
-            RAWINPUT raw{};UINT size=sizeof(raw);
-            const auto read=GetRawInputData(reinterpret_cast<HRAWINPUT>(b),RID_INPUT,&raw,&size,sizeof(RAWINPUTHEADER));
-            bool route=!menu;
-            if(read!=UINT(-1)&&read>=sizeof(RAWINPUTHEADER)) {
-                if(raw.header.dwType==RIM_TYPEKEYBOARD) {
-                    const auto vk=raw.data.keyboard.VKey;
-                    route=state.inputOwnership.route(512u+vk,(raw.data.keyboard.Flags&RI_KEY_BREAK)==0,menu||int(vk)==state.menuKey.load());
-                }else if(raw.header.dwType==RIM_TYPEMOUSE) {
-                    // Forward a game-owned release even while the menu is open.
-                    // No input is generated or rewritten, and raw-motion-only
-                    // packets remain suppressed while interacting with ImGui.
-                    const auto flags=raw.data.mouse.usButtonFlags;
-                    if(flags&0x3ffu)route=false;
-                    for(unsigned i=0;i<5;++i) {
-                        if(flags&(1u<<(i*2)))route|=state.inputOwnership.route(768u+i,true,menu);
-                        if(flags&(2u<<(i*2)))route|=state.inputOwnership.route(768u+i,false,menu);
-                    }
-                }
-            }
-            return route?DefSubclassProc(window,message,a,b):DefWindowProcW(window,message,a,b);
-        }
-        if(menu) {
-            if(message==WM_CHAR||message==WM_MOUSEWHEEL||message==WM_MOUSEHWHEEL||
-               message==WM_LBUTTONDOWN||message==WM_LBUTTONUP||message==WM_RBUTTONDOWN||message==WM_RBUTTONUP||
-               message==WM_MBUTTONDOWN||message==WM_MBUTTONUP||message==WM_XBUTTONDOWN||message==WM_XBUTTONUP) {
-                std::lock_guard lock(state.eventsMutex);if(state.events.size()<2048) state.events.push_back({message,a});
-            }
-            // Never capture / move the mouse, change focus, or create a window.
-            if(paired&&forward)return DefSubclassProc(window,message,a,b);
-            if((message>=WM_MOUSEFIRST&&message<=WM_MOUSELAST)||(message>=WM_KEYFIRST&&message<=WM_KEYLAST)||message==WM_SETCURSOR) return 0;
-        }
-        if(paired&&!forward)return 0;
-        return DefSubclassProc(window,message,a,b);
-    }
-    void init(const BE_HostApiV1* host) {
-        api.bind(host);canvas.bind(host);accepting=true;warmed=false;window=findGame();if(!window) throw std::runtime_error("Native ImGui: game window unavailable");
-        if(GetWindowThreadProcessId(window,nullptr)!=GetCurrentThreadId()) throw std::runtime_error("Native ImGui: Canvas callback is not the window owner thread");
-        IMGUI_CHECKVERSION();context=ImGui::CreateContext();auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
-        io.BackendRendererName="eflink_unity_canvas";io.BackendPlatformName="eflink_game_input";
-        io.BackendFlags|=ImGuiBackendFlags_RendererHasVtxOffset;io.ConfigFlags|=ImGuiConfigFlags_NoMouseCursorChange;
-        ImGui::GetMainViewport()->PlatformHandleRaw=window;
-        wchar_t winDir[MAX_PATH]{};GetWindowsDirectoryW(winDir,MAX_PATH);auto font=std::filesystem::path(winDir)/L"Fonts"/L"msyh.ttc";
-        if(std::filesystem::is_regular_file(font)) io.Fonts->AddFontFromFileTTF(font.string().c_str(),18,nullptr,io.Fonts->GetGlyphRangesChineseFull());
-        theme();canvas.init(io.Fonts);
-        if(!SetWindowSubclass(window,input,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this))) throw std::runtime_error("Native ImGui: input subclass unavailable");
-        installed=true;panel.refresh();lastFrame=GetTickCount64();
-        // A module can be loaded while a physical button is already held.
-        for(unsigned vk=0;vk<256;++vk)if(GetAsyncKeyState(int(vk))&0x8000) {inputOwnership.seedGame(vk);inputOwnership.seedGame(512u+vk);}
-        unsigned button=0;for(int vk:{VK_LBUTTON,VK_RBUTTON,VK_MBUTTON,VK_XBUTTON1,VK_XBUTTON2}) {
-            if(GetAsyncKeyState(vk)&0x8000) {inputOwnership.seedGame(256u+button);inputOwnership.seedGame(768u+button);}++button;
-        }
-    }
-    void feedInput(ImGuiIO& io,bool focused) {
-        POINT position{};
-        if(focused&&GetCursorPos(&position)&&ScreenToClient(window,&position)) io.AddMousePosEvent(float(position.x),float(position.y));
-        else io.AddMousePosEvent(-FLT_MAX,-FLT_MAX);
-        std::vector<Event> pending;{std::lock_guard lock(eventsMutex);pending.swap(events);}
-        for(const auto& event:pending) if(focused) {
-            if(event.message==WM_CHAR) io.AddInputCharacterUTF16(ImWchar16(event.value));
-            else if(event.message==WM_MOUSEWHEEL) io.AddMouseWheelEvent(0,float(GET_WHEEL_DELTA_WPARAM(event.value))/WHEEL_DELTA);
-            else if(event.message==WM_MOUSEHWHEEL) io.AddMouseWheelEvent(-float(GET_WHEEL_DELTA_WPARAM(event.value))/WHEEL_DELTA,0);
-            else io.AddMouseButtonEvent(event.message==WM_LBUTTONDOWN||event.message==WM_LBUTTONUP?0:event.message==WM_RBUTTONDOWN||event.message==WM_RBUTTONUP?1:
-                event.message==WM_XBUTTONDOWN||event.message==WM_XBUTTONUP?(GET_XBUTTON_WPARAM(event.value)==XBUTTON2?4:3):2,
-                event.message==WM_LBUTTONDOWN||event.message==WM_RBUTTONDOWN||event.message==WM_MBUTTONDOWN||event.message==WM_XBUTTONDOWN);
-        }
-        for(auto [vk,key]:{std::pair{VK_TAB,ImGuiKey_Tab},{VK_LEFT,ImGuiKey_LeftArrow},{VK_RIGHT,ImGuiKey_RightArrow},{VK_UP,ImGuiKey_UpArrow},
-            {VK_DOWN,ImGuiKey_DownArrow},{VK_PRIOR,ImGuiKey_PageUp},{VK_NEXT,ImGuiKey_PageDown},{VK_HOME,ImGuiKey_Home},{VK_END,ImGuiKey_End},
-            {VK_INSERT,ImGuiKey_Insert},{VK_DELETE,ImGuiKey_Delete},{VK_BACK,ImGuiKey_Backspace},{VK_SPACE,ImGuiKey_Space},{VK_RETURN,ImGuiKey_Enter},{VK_ESCAPE,ImGuiKey_Escape}})
-            io.AddKeyEvent(key,focused&&(GetAsyncKeyState(vk)&0x8000)!=0);
-        for(int i=0;i<26;++i) io.AddKeyEvent(ImGuiKey(ImGuiKey_A+i),focused&&(GetAsyncKeyState('A'+i)&0x8000)!=0);
-        for(int i=0;i<10;++i) io.AddKeyEvent(ImGuiKey(ImGuiKey_0+i),focused&&(GetAsyncKeyState('0'+i)&0x8000)!=0);
-        for(auto [vk,key]:{std::pair{VK_CONTROL,ImGuiMod_Ctrl},{VK_SHIFT,ImGuiMod_Shift},{VK_MENU,ImGuiMod_Alt},{VK_LWIN,ImGuiMod_Super}})
-            io.AddKeyEvent(ImGuiKey(key),focused&&(GetAsyncKeyState(vk)&0x8000)!=0);
-    }
-    void shutdown(const BE_HostApiV1* host) {
-        accepting=false;visible=false;api.bind(host);canvas.bind(host);
-        if(installed&&window) {RemoveWindowSubclass(window,input,reinterpret_cast<UINT_PTR>(this));installed=false;}
-        canvas.shutdown();if(context) {ImGui::DestroyContext(context);context=nullptr;}
-    }
-};
+
+// ================= Gui =================
 Gui::Gui()=default;
 Gui::~Gui() {stop();}
-void Gui::tickGame(const BE_HostApiV1* host) {
-    if(!native||stopping) return;
-    auto& state=*native;
-    // A failed frame is retried a few times instead of leaving the player
-    // without a menu or markers for the rest of the session.
-    if(state.failed) {if(state.failures>5||GetTickCount64()<state.retryAt) return;state.failed=false;}
-    try {
-        if(!state.context) {state.init(host);uiReady=true;}
-        ImGui::SetCurrentContext(state.context);
-        if(GetTickCount64()-state.lastCheck>=500) {
-            state.lastCheck=GetTickCount64();state.canvas.bind(host);
-            if(!state.canvas.valid()) state.canvas.rebuild(ImGui::GetIO().Fonts);
-        }
-        if(!state.warmed) {
-            // Exercise the actual managed mesh setters/getters while the Canvas
-            // remains inactive. Readiness now includes a real geometry round trip.
-            auto& io=ImGui::GetIO();state.api.bind(host);
-            io.DisplaySize={float(state.api.value<int>(state.api.method("Screen","get_width","","System.Int32"))),float(state.api.value<int>(state.api.method("Screen","get_height","","System.Int32")))};
-            io.DeltaTime=.016f;ImGui::NewFrame();state.panel.draw();ImGui::Render();state.canvas.render(ImGui::GetDrawData(),false);state.warmed=true;
-        }
-        const bool focused=state.window&&GetForegroundWindow()==state.window&&!IsIconic(state.window);
-        if(focused&&openRequested.exchange(false)) state.visible=true;
-        if(!focused) state.visible=false;
-        const bool show=state.visible.load();menuVisible=show;
-        if(!show&&state.lastVisible) {ImGui::GetIO().ClearInputKeys();ImGui::GetIO().ClearInputMouse();}
-        state.lastVisible=show;state.panel.refresh();state.menuKey=state.panel.state.value("configuration",json::object()).value("menu_key",kDefaultMenuKey);
-        const auto hud=state.panel.request({{"action","hud"}});
-        if(!show&&(!focused||hud.value("markers",json::array()).empty())) {state.canvas.hide();return;}
-        auto& io=ImGui::GetIO();state.api.bind(host);
-        io.DisplaySize={float(state.api.value<int>(state.api.method("Screen","get_width","","System.Int32"))),float(state.api.value<int>(state.api.method("Screen","get_height","","System.Int32")))};
-        auto now=GetTickCount64();io.DeltaTime=(std::clamp)(float(now-state.lastFrame)/1000,.001f,.1f);state.lastFrame=now;
-        state.feedInput(io,show&&focused);io.MouseDrawCursor=show;
-        ImGui::NewFrame();if(show) state.panel.draw();else drawMarkers(hud);
-        if(show&&ImGui::IsKeyPressed(ImGuiKey_Escape)&&!io.WantTextInput) state.panel.close=true;
-        if(state.panel.close) {state.visible=false;menuVisible=false;state.panel.close=false;}
-        state.textInput=show&&io.WantTextInput;
-        ImGui::Render();state.canvas.render(ImGui::GetDrawData());++nativeFrames;
-    } catch(const std::exception& e) {
-        state.failed=true;state.visible=false;menuVisible=false;uiReady=false;
-        ++state.failures;state.retryAt=GetTickCount64()+3000;
-        try {state.shutdown(host);} catch(...) {}
-        state.panel.request({{"action","gui_error"},{"error",e.what()}});
+std::future<json> Gui::post(const json& input) {
+    auto call=std::make_shared<Call>();call->input=input;auto future=call->result.get_future();
+    std::lock_guard lock(callsMutex);
+    if(calls.size()>=64) {std::promise<json> busy;busy.set_value({{"error","界面请求过多"}});return busy.get_future();}
+    calls.push_back(std::move(call));return future;
+}
+void Gui::tickGame(const BE_HostApiV1*) {
+    gameThreadSeen=true;uiReady=overlayReady.load();
+    std::deque<std::shared_ptr<Call>> pending;{std::lock_guard lock(callsMutex);pending.swap(calls);}
+    for(auto& call:pending) {
+        try {call->result.set_value(request?request(call->input):json{{"error","模块未就绪"}});}
+        catch(const std::exception& e) {try {call->result.set_value({{"error",e.what()}});}catch(...) {}}
+        catch(...) {try {call->result.set_value({{"error","请求失败"}});}catch(...) {}}
+        ++callsServed;
     }
 }
-nlohmann::json Gui::diagnostics() const {return native?native->canvas.diagnostics():json::object();}
-void Gui::shutdownGame(const BE_HostApiV1* host) {
-    if(native) {native->shutdown(host);native.reset();}menuVisible=false;uiReady=false;
+void Gui::shutdownGame(const BE_HostApiV1*) {menuVisible=false;}
+nlohmann::json Gui::diagnostics() const {
+    std::string error;{std::lock_guard lock(errorMutex);error=lastError;}
+    return {{"backend","overlay_dcomp"},{"overlay_ready",overlayReady.load()},{"frames",overlayFrames.load()},{"calls_served",callsServed.load()},{"error",error}};
 }
-void Gui::start(Request request,const json& options) {
-    stop();stopping=false;nativeFrames=0;
-    if(!options.value("preview_mode",false)) {native=std::make_unique<NativeState>(std::move(request),options);return;}
-    thread=std::jthread([this,request=std::move(request),options]{
-        try {run(request,options);} catch(const std::exception& e) {request({{"action","gui_error"},{"error",e.what()}});}
-    });
+void Gui::start(Request handler,const json& options) {
+    stop();stopping=false;overlayFrames=0;request=std::move(handler);
+    if(options.value("preview_mode",false)) {
+        thread=std::jthread([this,options]{try {runPreview(request,options);}catch(const std::exception& e) {setError(e.what());}});
+        return;
+    }
+    thread=std::jthread([this,options]{try {runOverlay(options);}catch(const std::exception& e) {setError(e.what());}overlayReady=false;});
 }
-void Gui::stop() {stopping=true;if(native) {native->accepting=false;native->visible=false;}if(thread.joinable()) thread.join();menuVisible=false;uiReady=false;}
-void Gui::run(Request request,json options) {
-    if(!options.value("preview_mode",false)) throw std::runtime_error("The Win32 GUI is only available in standalone preview mode");
-    auto instance=GetModuleHandleW(nullptr);std::wstring className=L"EFLink.Preview."+std::to_wstring(GetCurrentProcessId());
-    WNDCLASSEXW wc{sizeof(wc),0,Renderer::proc,0,0,instance,nullptr,LoadCursorW(nullptr,IDC_ARROW),nullptr,nullptr,className.c_str(),nullptr};
-    if(!RegisterClassExW(&wc)) throw std::runtime_error("Cannot register standalone preview");
-    Renderer r;r.window=CreateWindowExW(0,className.c_str(),L"EF Link preview",WS_OVERLAPPEDWINDOW,100,80,1280,800,nullptr,nullptr,instance,&r);
-    if(!r.window||FAILED(r.create())) {if(r.window) DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);throw std::runtime_error("Cannot create standalone preview renderer");}
-    IMGUI_CHECKVERSION();ImGui::CreateContext();auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
-    wchar_t winDir[MAX_PATH]{};GetWindowsDirectoryW(winDir,MAX_PATH);auto fontPath=std::filesystem::path(winDir)/L"Fonts"/L"msyh.ttc";
-    if(std::filesystem::is_regular_file(fontPath)) io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(),18,nullptr,io.Fonts->GetGlyphRangesChineseFull());
-    theme();ImGui_ImplWin32_Init(r.window);ImGui_ImplDX11_Init(r.device.Get(),r.context.Get());
-    Panel panel;panel.request=std::move(request);panel.tab=options.value("preview_tab",0);panel.refresh();uiReady=true;menuVisible=true;
-    const auto capture=options.value("preview_capture",std::string{});if(capture.empty()) ShowWindow(r.window,SW_SHOWNA);
-    auto started=GetTickCount64();
-    while(!stopping&&!r.closing) {
-        MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}if(r.closing) break;
-        if(r.width&&r.height) {r.target.Reset();r.swap->ResizeBuffers(0,r.width,r.height,DXGI_FORMAT_UNKNOWN,0);r.width=r.height=0;r.makeTarget();}
-        if(!r.target) {std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;}
+void Gui::stop() {
+    stopping=true;if(thread.joinable()) thread.join();
+    std::deque<std::shared_ptr<Call>> pending;{std::lock_guard lock(callsMutex);pending.swap(calls);}
+    for(auto& call:pending) try {call->result.set_value({{"error","界面已关闭"}});}catch(...) {}
+    menuVisible=false;uiReady=false;overlayReady=false;
+}
+void Gui::runOverlay(json) {
+    const auto instance=GetModuleHandleW(nullptr);const std::wstring className=L"EFLink.Overlay."+std::to_wstring(GetCurrentProcessId());
+    WNDCLASSEXW wc{sizeof(wc),0,Surface::proc,0,0,instance,nullptr,LoadCursorW(nullptr,IDC_ARROW),nullptr,nullptr,className.c_str(),nullptr};
+    if(!RegisterClassExW(&wc)) throw std::runtime_error("界面窗口注册失败");
+    struct Unregister {const wchar_t* name;HINSTANCE instance;~Unregister() {UnregisterClassW(name,instance);}} unregister{className.c_str(),instance};
+    while(!stopping) {
+        HWND game=nullptr;
+        while(!stopping&&!(game=findGame())) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if(stopping) break;
+        RECT client{};GetClientRect(game,&client);POINT origin{0,0};ClientToScreen(game,&origin);
+        Surface surface;
+        if(!surface.create(className.c_str(),game,true,origin.x,origin.y,unsigned(client.right),unsigned(client.bottom))) {surface.destroy();throw std::runtime_error("界面渲染器创建失败（DirectComposition）");}
+        IMGUI_CHECKVERSION();auto* context=ImGui::CreateContext();ImGui::SetCurrentContext(context);
+        auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;io.ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard;
+        const float scale=uiScale(unsigned(client.bottom));
+        Ui ui;ui.fonts=loadFonts(scale);applyTheme(scale);
+        ImGui_ImplWin32_Init(surface.window);ImGui_ImplDX11_Init(surface.device.Get(),surface.context.Get());
+        ui.post=[this](const json& input){return post(input);};
+        overlayReady=true;bool keyDown=false;
+        while(!stopping&&IsWindow(game)) {
+            MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
+            const bool minimized=IsIconic(game)||!IsWindowVisible(game);
+            const HWND foreground=GetForegroundWindow();const bool focused=foreground==game||foreground==surface.window;
+            // Menu key: polled, one toggle per press; it types normally into a focused text box.
+            const bool down=(GetAsyncKeyState(ui.key)&0x8000)!=0;
+            if(down&&!keyDown&&focused&&!(ui.open&&io.WantTextInput)) ui.open=!ui.open;
+            keyDown=down;
+            if(openRequested.exchange(false)) ui.open=true;
+            if(ui.closeRequested) {ui.open=false;ui.closeRequested=false;}
+            if(minimized||!focused) ui.open=false;
+            const bool wasInteractive=surface.interactive;
+            surface.setInteractive(ui.open);
+            if(ui.open&&!wasInteractive) SetForegroundWindow(surface.window);
+            if(!ui.open&&wasInteractive&&GetForegroundWindow()==surface.window) SetForegroundWindow(game);
+            menuVisible=ui.open;
+            if(minimized) {surface.show(false);ui.poll(false);std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
+            RECT area{};GetClientRect(game,&area);POINT at{0,0};ClientToScreen(game,&at);
+            if(at.x!=origin.x||at.y!=origin.y||area.right!=client.right||area.bottom!=client.bottom||!surface.shown) {
+                client=area;origin=at;SetWindowPos(surface.window,nullptr,origin.x,origin.y,client.right,client.bottom,SWP_NOZORDER|SWP_NOACTIVATE);
+            }
+            surface.resize(unsigned(client.right),unsigned(client.bottom));surface.show(true);
+            ui.poll(ui.open);
+            ImGui_ImplDX11_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
+            const ImVec2 size{float(surface.width),float(surface.height)};
+            ui.drawHud(size);
+            if(ui.open) ui.drawMenu(size);
+            ImGui::Render();const float clear[4]{0,0,0,0};surface.render(clear);++overlayFrames;
+            if(!ui.open) std::this_thread::sleep_for(std::chrono::milliseconds(8)); // the HUD needs no more than ~60 fps
+        }
+        overlayReady=false;menuVisible=false;
+        surface.destroy();ImGui::DestroyContext(context);
+    }
+}
+void Gui::runPreview(Request handler,json options) {
+    const auto instance=GetModuleHandleW(nullptr);const std::wstring className=L"EFLink.NativeMenu."+std::to_wstring(GetCurrentProcessId());
+    WNDCLASSEXW wc{sizeof(wc),0,Surface::proc,0,0,instance,nullptr,LoadCursorW(nullptr,IDC_ARROW),nullptr,nullptr,className.c_str(),nullptr};
+    if(!RegisterClassExW(&wc)) throw std::runtime_error("预览窗口注册失败");
+    Surface surface;
+    if(!surface.create(className.c_str(),nullptr,false,80,60,1440,860)) {surface.destroy();UnregisterClassW(className.c_str(),instance);throw std::runtime_error("预览渲染器创建失败");}
+    IMGUI_CHECKVERSION();auto* context=ImGui::CreateContext();ImGui::SetCurrentContext(context);
+    auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
+    Ui ui;ui.fonts=loadFonts(1.f);applyTheme(1.f);
+    ImGui_ImplWin32_Init(surface.window);ImGui_ImplDX11_Init(surface.device.Get(),surface.context.Get());
+    ui.post=[handler](const json& input){std::promise<json> p;try {p.set_value(handler(input));}catch(const std::exception& e) {p.set_value({{"error",e.what()}});}return p.get_future();};
+    ui.page=options.value("preview_tab",0);
+    if(const char* tab=std::getenv("EFLINK_PREVIEW_TAB")) ui.page=(std::clamp)(std::atoi(tab),0,4);ui.open=!options.value("preview_hud",false);
+    json demoHud;
+    if(options.value("preview_hud",false)) demoHud={{"markers",json::array({{{"id",1},{"name","房主·Yvonne"},{"host",true},{"x",.52},{"y",.42},{"distance",12.4}},
+        {{"id",2},{"name","管理员"},{"self",true},{"x",.48},{"y",.55},{"distance",0}},{{"id",3},{"name","好友"},{"x",1.4},{"y",.3},{"distance",118.7}}})}};
+    const auto capture=str(options,"preview_capture");
+    if(capture.empty()) ShowWindow(surface.window,SW_SHOW);else surface.show(true);
+    uiReady=true;overlayReady=true;const auto started=now();
+    while(!stopping&&!surface.closeRequested) {
+        MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
+        if(surface.pendingWidth) {surface.resize(surface.pendingWidth,surface.pendingHeight);surface.pendingWidth=0;}
+        ui.poll(true);
+        if(!demoHud.is_null()) ui.hud=demoHud;
+        if(options.value("preview_hud",false)&&ui.state.contains("role")) {ui.state["role"]="client";ui.state["peers"]=json::array({{{"id",1},{"name","房主·Yvonne"},{"host",true},{"valid",true},{"position",{-153.9,104.7,-493.2}},{"level","map01_lv001"}},{{"id",2},{"name","管理员"},{"local",true},{"valid",true},{"position",{-152.1,104.6,-491.0}},{"level","map01_lv001"}}});}
         ImGui_ImplDX11_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
-        if(options.value("preview_hud",false)) drawMarkers({{"markers",json::array({{{"name","房主 · Yvonne"},{"x",.51},{"y",.37},{"distance",12.4}},{{"name","好友"},{"x",1.5},{"y",.25},{"distance",118.7}},{{"name","异地图玩家"},{"other_map",true},{"map","map02"}}})}});
-        else panel.draw();
-        ImGui::Render();const float clear[]={.025f,.032f,.04f,1.f};auto* target=r.target.Get();
-        r.context->OMSetRenderTargets(1,&target,nullptr);r.context->ClearRenderTargetView(target,clear);ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        if(!capture.empty()&&GetTickCount64()-started>1200) {r.capture(std::filesystem::path(std::u8string(capture.begin(),capture.end())));break;}
-        if(panel.close) break;r.swap->Present(1,0);
+        const ImVec2 size{float(surface.width),float(surface.height)};
+        ui.drawHud(size);if(ui.open) ui.drawMenu(size);
+        if(ui.closeRequested) {ui.closeRequested=false;}
+        ImGui::Render();const float clear[4]{.11f,.14f,.13f,1};surface.render(clear);++overlayFrames;
+        if(!capture.empty()&&now()-started>1500) {surface.capture(std::filesystem::path(std::u8string(capture.begin(),capture.end())));break;}
     }
-    menuVisible=false;uiReady=false;ImGui_ImplDX11_Shutdown();ImGui_ImplWin32_Shutdown();ImGui::DestroyContext();
-    DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);
+    surface.destroy();ImGui::DestroyContext(context);UnregisterClassW(className.c_str(),instance);
+    uiReady=false;overlayReady=false;
 }
 }

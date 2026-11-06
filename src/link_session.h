@@ -55,7 +55,7 @@ class Session {
     std::map<std::uint16_t,Json> growthRequests;
     // Hit results. Like an official co-op world, each player's own client resolves
     // its attacks; the host bounds them and owns the enemy's HP and death.
-    std::deque<Json> hits,playerHits,enemyCasts,enemyStates;std::map<std::uint16_t,std::uint64_t> hitSequences;
+    std::deque<Json> hits,playerHits,enemyCasts,enemyStates,playerCasts;std::map<std::uint16_t,std::pair<std::uint64_t,int>> castBudgets;std::map<std::uint16_t,std::uint64_t> hitSequences;
     std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> hitBudgets;std::uint64_t hitSequence=0,hitsAccepted=0;
     std::uint64_t lastGrowthPublish=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
@@ -241,6 +241,17 @@ public:
                     const auto key=b.at("key").get<std::string>(),skill=b.at("skill").get<std::string>();
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||key.empty()||key.size()>128||skill.empty()||skill.size()>128||enemyCasts.size()>=64) {++rejected;continue;}
                     enemyCasts.push_back({{"key",key},{"skill",skill},{"target",b.at("target").get<std::uint16_t>()},{"from",packet.from}});
+                } else if(kind=="player_cast"&&(role==Role::Client?packet.from==proto::kHostId:role==Role::Host&&find(s,packet.from)!=nullptr)) {
+                    // Presentation only: a player's operator began a native skill. A guest
+                    // speaks only for itself; the host relays it to every guest.
+                    const auto skill=b.at("skill").get<std::string>(),target=b.value("target",std::string{});
+                    const int slot=b.value("slot",0);const auto origin=role==Role::Host?packet.from:b.at("origin").get<std::uint16_t>();
+                    if(b.at("epoch").get<std::uint64_t>()!=epoch||skill.empty()||skill.size()>128||target.size()>128||slot<0||slot>4||playerCasts.size()>=64) {++rejected;continue;}
+                    auto& budget=castBudgets[origin];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
+                    if(budget.second>=30) {++rejected;continue;}
+                    ++budget.second;
+                    if(role==Role::Host) send(net,{{"kind","player_cast"},{"epoch",epoch},{"origin",origin},{"slot",slot},{"skill",skill},{"target",target}});
+                    playerCasts.push_back({{"origin",origin},{"slot",slot},{"skill",skill},{"target",target}});
                 } else if(kind=="enemy_state"&&role==Role::Host&&canAct(packet.from)) {
                     // Movement of enemies whose AI runs on that guest (ownership is
                     // assigned and checked by the host's game adapter).
@@ -300,6 +311,15 @@ public:
         return send(net,{{"kind","enemy_cast"},{"epoch",epoch},{"key",key},{"skill",skill},{"target",target}});
     }
     std::deque<Json> takeEnemyCasts() {std::deque<Json> out;out.swap(enemyCasts);return out;}
+    // Presentation: this player's operator (squad slot) began a native skill.
+    bool sendPlayerCast(Net& net,int slot,const std::string& skill,const std::string& target) {
+        if(!ready()||skill.empty()||skill.size()>128||target.size()>128||slot<0||slot>4) return false;
+        Json body{{"kind","player_cast"},{"epoch",epoch},{"origin",net.snapshot().localId},{"slot",slot},{"skill",skill},{"target",target}};
+        if(role==Role::Host) return send(net,std::move(body));
+        if(role==Role::Client) return send(net,std::move(body),proto::kHostId);
+        return false;
+    }
+    std::deque<Json> takePlayerCasts() {std::deque<Json> out;out.swap(playerCasts);return out;}
     // Guest: report the room enemies whose AI this player runs.
     bool sendEnemyStates(Net& net,const Json& states) {
         if(role!=Role::Client||!canAct(net.snapshot().localId)||!states.is_array()||states.empty()||states.size()>64) return false;

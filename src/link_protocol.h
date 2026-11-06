@@ -130,16 +130,19 @@ struct PlayerInfo {
     std::string name,modelPath,mapId,levelId;
     std::uint16_t skeleton=0;              // increments whenever bones changes
     std::vector<std::string> bones;        // names, in the order of PlayerState::bones
+    std::string weaponModel;               // equipped weapon's model path (empty: none / unknown)
 };
 inline void write(Writer& w,const PlayerInfo& p) {
     w.u16(p.id).str(p.name,64).str(p.modelPath,512).str(p.mapId,64).str(p.levelId,64).u16(p.skeleton);
     const auto count=std::uint8_t(std::min<std::size_t>(p.bones.size(),kMaxBones));w.u8(count);
     for(unsigned i=0;i<count;++i) w.str(p.bones[i],96);
+    w.str(p.weaponModel,512);
 }
 inline PlayerInfo readPlayerInfo(Reader& r) {
     PlayerInfo p;p.id=r.u16();p.name=r.str(64);p.modelPath=r.str(512);p.mapId=r.str(64);p.levelId=r.str(64);p.skeleton=r.u16();
     const auto count=r.u8();if(count>kMaxBones) throw std::runtime_error("too many bones");
     for(unsigned i=0;i<count;++i) p.bones.push_back(r.str(96));
+    p.weaponModel=r.str(512);
     return p;
 }
 

@@ -127,7 +127,7 @@ public:
         std::lock_guard lock(localMutex);
         info.name=localInfo.name;
         const bool changed=info.modelPath!=localInfo.modelPath||info.mapId!=localInfo.mapId||info.levelId!=localInfo.levelId||
-            info.skeleton!=localInfo.skeleton||info.bones!=localInfo.bones;
+            info.skeleton!=localInfo.skeleton||info.bones!=localInfo.bones||info.weaponModel!=localInfo.weaponModel;
         localInfo=std::move(info);if(changed) localInfoDirty=true;
     }
     std::string name() {std::lock_guard lock(localMutex);return localInfo.name;}

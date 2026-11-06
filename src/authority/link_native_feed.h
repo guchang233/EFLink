@@ -155,7 +155,26 @@ class NativeFeed {
         }
         return t;
     }
+    // Game 1.6.3 replaced Google.Protobuf with protobuf-net (pooled Proto.* classes):
+    // the message is read by ProtoBuf.Serializer.Deserialize(Type, Stream) from a
+    // MemoryStream over the bytes. Older clients keep the ByteString parser path.
+    void* parseProtobufNet(const char* type,const std::string& bytes) {
+        auto klass=api.klass(type,"Beyond.Network.Proto.dll","Proto");
+        if(!klass.type_object)throw std::runtime_error(std::string("proto type object unavailable: ")+type);
+        auto* buffer=api.array("Byte",bytes.data(),bytes.size(),1,"mscorlib.dll","System");
+        unity::Api::TemporaryRoot bufferRoot(runtime,buffer);
+        auto streamClass=api.klass("MemoryStream","mscorlib.dll","System.IO");
+        auto* stream=runtime->object_new(runtime->context,streamClass.class_info);
+        if(!stream)throw std::runtime_error("MemoryStream allocation failed");
+        unity::Api::TemporaryRoot streamRoot(runtime,stream);
+        api.call(api.method("MemoryStream",".ctor","System.Byte[]","System.Void","mscorlib.dll","System.IO"),stream,{buffer});
+        auto* message=api.call(api.method("Serializer","Deserialize","System.Type|System.IO.Stream","System.Object","protobuf-net.dll","ProtoBuf"),
+            nullptr,{klass.type_object,stream});
+        if(!message)throw std::runtime_error(std::string("protobuf-net rejected ")+type);
+        return message;
+    }
     void* parse(const char* type,const std::string& bytes) {
+        try {return parseProtobufNet(type,bytes);}catch(const std::exception& e) {protobufNetError=e.what();}
         auto* string=api.string(base64(bytes));unity::Api::TemporaryRoot stringRoot(runtime,string);
         auto* data=api.call(api.method("ByteString","FromBase64","System.String","Google.Protobuf.ByteString","Google.Protobuf.dll","Google.Protobuf"),nullptr,{string});
         unity::Api::TemporaryRoot dataRoot(runtime,data);
@@ -188,6 +207,15 @@ class NativeFeed {
     }
     void handle(const char* type,const char* handler,const std::string& bytes) {
         auto* message=parse(type,bytes);unity::Api::TemporaryRoot messageRoot(runtime,message);
+        if(std::strcmp(handler,"_Handle_EntityPropertyChange")==0) {
+            // Game 1.6.3 moved this handler to BattleManager.
+            try {
+                auto world=api.klass("GameWorld","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
+                auto* field=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(world.class_info,"battle");
+                void* battle=nullptr;if(field)symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(field,&battle);
+                if(battle) {api.call(api.method("BattleManager",handler,"Proto.SC_ENTITY_PROPERTY_CHANGE","System.Void","Gameplay.Beyond.dll","Beyond.Gameplay.Core"),battle,{message});return;}
+            }catch(...) {}
+        }
         auto* instance=api.call(api.method("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Gameplay.Beyond.dll","Beyond.Gameplay"));
         auto* network=instance?api.call(api.method("GameInstance","get_gameplayNetwork","","Beyond.Gameplay.GameplayNetwork","Gameplay.Beyond.dll","Beyond.Gameplay"),instance):nullptr;
         if(!network)throw std::runtime_error("GameplayNetwork unavailable");
@@ -239,11 +267,12 @@ public:
     // Native server-driven movement. The handler name follows the client's
     // _Handle_<Message> convention; EntityManager.ServerMoveEntity is the
     // documented receiver behind it.
-    std::uint64_t moved=0;std::string moveRoute;
+    std::uint64_t moved=0;std::string moveRoute,protobufNetError;
     void move(const std::vector<MoveSample>& moves,bool serverNotify) {
         if(moves.empty())return;
         const auto bytes=moveObjects(moves,serverNotify);
-        try {handle("SC_MOVE_OBJECT_MOVE","_Handle_MoveObjectMove",bytes);moveRoute="GameplayNetwork";}
+        try {handle("SC_MOVE_OBJECT_MOVE","_Handle_ObjectMove",bytes);moveRoute="GameplayNetwork";}
+        catch(...) {try {handle("SC_MOVE_OBJECT_MOVE","_Handle_MoveObjectMove",bytes);moveRoute="GameplayNetwork(1.5)";}
         catch(const std::exception&) {
             auto* message=parse("SC_MOVE_OBJECT_MOVE",bytes);unity::Api::TemporaryRoot messageRoot(runtime,message);
             auto klass=api.klass("EntityManager","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
@@ -252,7 +281,7 @@ public:
             if(!manager)throw std::runtime_error("EntityManager unavailable");
             api.call(api.method("EntityManager","ServerMoveEntity","Proto.SC_MOVE_OBJECT_MOVE","System.Void","Gameplay.Beyond.dll","Beyond.Gameplay.Core"),manager,{message});
             moveRoute="EntityManager";
-        }
+        }}
         moved+=moves.size();
     }
     // Native battle property push: SC_ENTITY_PROPERTY_CHANGE{inst_id, info{hp}}.
