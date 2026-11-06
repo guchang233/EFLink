@@ -32,7 +32,7 @@ inline std::filesystem::path settingsPath() {
 inline void validateSettings(const nlohmann::json& j) {
     if(!j.is_object()) throw std::runtime_error("configuration must be an object");
     for(auto key:{"player_name","room_name"}) if(j.contains(key)&&(!j[key].is_string()||j[key].get<std::string>().size()>64)) throw std::runtime_error(std::string(key)+": max 64 UTF-8 bytes");
-    for(auto key:{"show_remote_players","show_player_markers","follow_host_world","sync_combat","gui_enabled","preview_mode"}) if(j.contains(key)&&!j[key].is_boolean()) throw std::runtime_error(std::string(key)+": expected boolean");
+    for(auto key:{"show_remote_players","show_player_markers","follow_host_world","sync_combat","gui_enabled","preview_mode","window_menu","overlay_mode"}) if(j.contains(key)&&!j[key].is_boolean()) throw std::runtime_error(std::string(key)+": expected boolean");
     const auto port=j.value("port",47615);if(port<1024||port>65535||port==47616) throw std::runtime_error("端口须为 1024–65535，且不能使用发现端口 47616");
     const auto count=j.value("max_players",8);if(count<2||count>16) throw std::runtime_error("人数上限须为 2–16");
     if(!validMenuKey(j.value("menu_key",kDefaultMenuKey))) throw std::runtime_error("菜单快捷键须为 = 或 F1–F12");

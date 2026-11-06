@@ -132,13 +132,26 @@ class Metadata:
         if layout not in {"standard29", "endfield29-extended"}:
             raise MetadataError("unknown metadata layout")
         self.layout = layout
-        names = TABLES + (["unresolved_extended_table"] if layout == "endfield29-extended" else [])
-        minimum = 8 + len(names) * 8
-        if len(data) < minimum:
+        if len(data) < 16:
             raise MetadataError("truncated metadata header")
         magic, self.version = struct.unpack_from("<II", data)
         if magic != 0xFAB11BAF or self.version != 29:
             raise MetadataError("only metadata version 29 is supported")
+        # The first table always starts right after the header. Client updates
+        # append further extended tables, so infer the count from that offset
+        # instead of hard-coding one extra table for a single known build.
+        first_offset = struct.unpack_from("<I", data, 8)[0]
+        if first_offset < 8 + len(TABLES) * 8 or first_offset > len(data) or (first_offset - 8) % 8:
+            raise MetadataError("unsupported metadata header table count")
+        table_count = (first_offset - 8) // 8
+        if table_count > len(TABLES) + 8:
+            raise MetadataError("unsupported metadata header table count")
+        if layout == "standard29" and table_count != len(TABLES):
+            raise MetadataError("extended metadata header requires the extended layout")
+        names = list(TABLES) + [f"unresolved_extended_table_{i}" for i in range(table_count - len(TABLES))]
+        minimum = 8 + len(names) * 8
+        if len(data) < minimum:
+            raise MetadataError("truncated metadata header")
         self.tables = {}
         for i, name in enumerate(names):
             offset, size = struct.unpack_from("<II", data, 8 + i * 8)

@@ -274,7 +274,7 @@ int main() {
     reading.propertyHp=0;check(mineralObservation(reading).state["collected"]==false,
         "zero property durability cannot invent a not-yet-observed native collection flag");
     reading.propertyHp=-1;check(throws([&]{mineralObservation(reading);}),"invalid native property value is rejected rather than clamped to a fabricated result");
-    check(readOnlyBuildSupported("1.5.3")&&!readOnlyBuildSupported("")&&!readOnlyBuildSupported("1.5.4")&&!readOnlyBuildSupported("fixture-only"),
+    check(readOnlyBuildSupported("1.5.3")&&readOnlyBuildSupported("1.6.3")&&!readOnlyBuildSupported("1.6.4")&&!readOnlyBuildSupported("")&&!readOnlyBuildSupported("1.5.4")&&!readOnlyBuildSupported("fixture-only"),
         "native read-only hooks default off for unknown game builds");
     Host host;Fixture adapter;host.reset(scene(),"fixture-only");
     host.observe("player",{{"host","player",{{"hp",100},{"max_hp",100},{"dead",false}},10}});

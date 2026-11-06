@@ -28,7 +28,7 @@
             templateId=text(readField<void*>(info,"CharInfo","templateId","Beyond.Gameplay"));
             if(partySlot<0||partySlot>3)throw std::runtime_error("native player party slot unavailable");
             appearance["party_slot"]=partySlot;
-            appearance["controlled"]=api.call(mainCharacter)==entity;
+            appearance["controlled"]=mainEntity()==entity;
             const auto weaponId=readField<std::uint64_t>(info,"CharInfo","weaponInstId","Beyond.Gameplay");
             std::string weaponTemplate;
             if(weaponId) {

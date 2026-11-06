@@ -12,6 +12,8 @@ class NativeGuiCanvas {
     void* root=nullptr;void* material=nullptr;void* texture=nullptr;
     std::vector<Batch> batches;
     unsigned atlasWidth=0,atlasHeight=0;std::size_t lastVertices=0,lastChunks=0;
+    float meshMinX=0,meshMaxX=0,meshMinY=0,meshMaxY=0;
+    std::size_t lastTriangles=0,lastDropped=0;
     bool readbackVerified=false;
     // Standalone assets (mesh, material, font texture) are not kept alive by
     // DontDestroyOnLoad on the root. A scene change runs UnloadUnusedAssets and
@@ -82,6 +84,8 @@ public:
         if(!root||!data) return;
         const auto geometry=imguimesh::convert(*data,ImTextureID(reinterpret_cast<std::uintptr_t>(texture)));
         lastVertices=geometry.colors.size();const auto parts=imguimesh::chunks(lastVertices);lastChunks=parts.size();
+        meshMinX=geometry.minX;meshMaxX=geometry.maxX;meshMinY=geometry.minY;meshMaxY=geometry.maxY;
+        lastTriangles=geometry.triangles;lastDropped=geometry.dropped;
         if(!lastVertices) {hide();return;}
         for(std::size_t i=0;i<parts.size();++i) {
         if(i==batches.size()) batches.push_back(createBatch());auto& batch=batches[i];auto* mesh=batch.mesh;
@@ -109,7 +113,8 @@ public:
         for(std::size_t i=parts.size();i<batches.size();++i) api.setActive(batches[i].object,false);
         readbackVerified=true;api.setActive(root,visible);
     }
-    nlohmann::json diagnostics() const {return {{"index_bits",16},{"vertices",lastVertices},{"chunks",lastChunks},{"mesh_readback_verified",readbackVerified},{"atlas_width",atlasWidth},{"atlas_height",atlasHeight},{"rebuilds",rebuilds}};}
+    nlohmann::json diagnostics() const {return {{"index_bits",16},{"vertices",lastVertices},{"chunks",lastChunks},{"mesh_readback_verified",readbackVerified},{"atlas_width",atlasWidth},{"atlas_height",atlasHeight},{"rebuilds",rebuilds},
+        {"triangles",lastTriangles},{"dropped_triangles",lastDropped},{"mesh_min_x",meshMinX},{"mesh_max_x",meshMaxX},{"mesh_min_y",meshMinY},{"mesh_max_y",meshMaxY}};}
     void shutdown() {
         // Objects the game already destroyed are skipped, never touched.
         try {if(alive(root)) {hide();api.destroy(root);}} catch(...) {}

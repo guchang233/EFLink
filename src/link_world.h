@@ -12,6 +12,7 @@
 #include "authority/native_mine_entry.h"
 #include "authority/native_entity_withdrawal.h"
 #include "authority/native_character_info.h"
+#include "authority/native_event_registry.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "authority/link_metadata.h"
@@ -49,7 +50,7 @@ class World {
     nlohmann::json localAppearanceInfo;
     std::uint64_t lastAppearanceSample=0;
     std::string appearanceModel,appearanceError;
-    BE_ResolvedMethodV1 mainCharacter{},entityAlive{},entityCinematic{},entityModel{},modelGo{},modelPath{},
+    BE_ResolvedMethodV1 mainCharacter{},utilMainCharacter{},instanceMainCharacter{},entityAlive{},entityCinematic{},entityModel{},modelGo{},modelPath{},
         getTransform{},getPosition{},getRotation{},getLocalRotation{},
         getLocalPosition{},isAlive{},objectName{},
         childrenOf{},mapIdText{},levelIdText{};
@@ -61,6 +62,7 @@ class World {
     std::vector<Bone> bones;std::vector<std::string> boneNames;std::uint16_t skeleton=0;
     std::string localModel,mapId,levelId;std::uint32_t mapHash=0;
     std::uint64_t lastSample=0,lastMap=0,lastInvalid=0,samples=0;
+    nlohmann::json sampleProbe=nlohmann::json::object(); // read-only: which sampling step came back empty
     std::string localError;
     bool menuCursor=false,savedVisible=false;int savedLock=0;
     bool backgroundLease=false,backgroundOriginal=false,simulationPaused=false,nativeSceneInitialized=false;
@@ -76,6 +78,7 @@ class World {
     std::string nativeVersion;
     worldauthority::NativeMineEntry nativeMine;
     worldauthority::NativeEntityWithdrawal nativeEntityWithdrawal;
+    worldauthority::NativeEventRegistry nativeEventRegistry;
     std::vector<std::unique_ptr<worldauthority::NativeCharacterInfo>> privateCharacterData;
     // Compiled candidate adapter. No config/RPC can change its inherited false
     // execution, isolation, recovery or dual-client certificates.
@@ -126,6 +129,10 @@ class World {
         resolveRetryAt=nowMs()+5000;
         constexpr const char* G="Gameplay.Beyond.dll";
         mainCharacter=m("PlayerController","GetMainCharacter","","Beyond.Gameplay.Core.Entity",G,"Beyond.Gameplay.Core");
+        // 1.6.3: PlayerController.GetMainCharacter returns null in the open world
+        // (observed 2026-11-06); these static accessors exist in its metadata.
+        try {utilMainCharacter=m("GameUtil","get_mainCharacter","","Beyond.Gameplay.Core.Entity",G,"Beyond.Gameplay");}catch(...) {utilMainCharacter={};}
+        try {instanceMainCharacter=m("GameInstance","get_mainCharPtr","","Beyond.Gameplay.Core.Entity",G,"Beyond.Gameplay");}catch(...) {instanceMainCharacter={};}
         entityAlive=m("Entity","get_alive","","System.Boolean",G,"Beyond.Gameplay.Core");
         entityCinematic=m("Entity","get_inCinematic","","System.Boolean",G,"Beyond.Gameplay.Core");
         entityModel=m("Entity","get_modelCom","","Beyond.Gameplay.View.ModelComponent",G,"Beyond.Gameplay.Core");
@@ -183,6 +190,18 @@ class World {
 
     BE_ResolvedMethodV1 gm(const char* type,const char* name,const char* params="",const char* returns="System.Void",const char* space="Beyond.Gameplay.Core") {
         return m(type,name,params,returns,"Gameplay.Beyond.dll",space);
+    }
+    // The controlled character: the first accessor that returns a live entity.
+    std::string mainCharacterSource;
+    void* mainEntity() {
+        const std::pair<const BE_ResolvedMethodV1*,const char*> sources[]={{&mainCharacter,"PlayerController.GetMainCharacter"},
+            {&utilMainCharacter,"GameUtil.get_mainCharacter"},{&instanceMainCharacter,"GameInstance.get_mainCharPtr"}};
+        for(const auto& [method,name]:sources) {
+            if(!method->method_info&&!method->method_pointer)continue;
+            void* entity=nullptr;try {entity=api.call(*method);}catch(...) {entity=nullptr;}
+            if(entity&&usable(entity)) {mainCharacterSource=name;return entity;}
+        }
+        mainCharacterSource.clear();return nullptr;
     }
     void* staticObject(const char* field) {
         auto klass=api.klass("GameWorld","Gameplay.Beyond.dll","Beyond.Gameplay.Core");
@@ -396,7 +415,12 @@ class World {
     std::optional<worldauthority::NativeCharacterInfo::Lease> constructPrivateCharacterData(const worldauthority::Scope& scope,worldauthority::NativeDomain domain,
             std::uint16_t peer,std::uint64_t member,unsigned slot,void* nativePublicProfile,int nativeScope,int friendship,const std::function<bool()>& current) {
         if(!nativeAdapter.executionVerified()||!nativeAdapter.isolationVerified()||!nativeAdapter.recoveryVerified()||!nativeAdapter.dualClientVerified()||privateCharacterData.size()>=16)return {};
-        bindNativePins();auto data=std::make_unique<worldauthority::NativeCharacterInfo>();data->bind(runtime,nativeVersion,nativePins);
+        bindNativePins();
+        // Best-effort census binding. If the native event layout cannot be
+        // resolved, the registry stays unbound and cleanup keeps its retained
+        // record rather than claiming observed unsubscription.
+        if(!nativeEventRegistry.boundToRuntime()) {try {nativeEventRegistry.bind(runtime,nativeVersion);}catch(...) {}}
+        auto data=std::make_unique<worldauthority::NativeCharacterInfo>();data->bind(runtime,nativeVersion,nativePins);
         // Own the recovery record before invoking the constructor: its native
         // callbacks may attach listeners even if construction later throws.
         auto* entry=data.get();privateCharacterData.push_back(std::move(data));
@@ -484,9 +508,12 @@ private:
         if(net.currentRole()==Role::Host&&character&&nativeSceneInitialized&&!mapId.empty()&&!levelId.empty()) {
             auto* info=staticObject("worldInfo");
             auto position=api.value<V3>(gm("Entity","get_position","","UnityEngine.Vector3"),character);
+            // The dungeon lets guests follow through the official dungeon entry.
             link.publish(net,{{"map",mapId},{"level",levelId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
-                {"position",{position.x,position.y,position.z}},{"entities",nlohmann::json::array()} });
+                {"dungeon",currentDungeon()},{"position",{position.x,position.y,position.z}},{"entities",nlohmann::json::array()} });
         }
+        // Following the host and player teleports: this account's own official moves.
+        followTick(net,link);
     }
     void projectPeers(const Snapshot& view) {
         markers=nlohmann::json::array();if(!character) return;
@@ -534,17 +561,37 @@ private:
     #include "link_world_squad.h"
     #include "link_world_resources.h"
     #include "link_world_census.h"
+    #include "link_world_travel.h"
+    // Sampling failures are kept (step, message, count) instead of being cleared by
+    // the next successful frame, so a broken game contract is visible in status.
+    std::uint64_t tickFailures=0;nlohmann::json tickFailure=nullptr;
+    std::uint64_t sampleFailures=0;std::string sampleStep;nlohmann::json sampleFailure=nullptr;
     void sample(Net& net) {
+        try {sampleOnce(net);}
+        catch(const std::exception& e) {++sampleFailures;sampleFailure={{"step",sampleStep},{"error",e.what()},{"count",sampleFailures},{"at",nowMs()}};}
+    }
+    void sampleOnce(Net& net) {
         const auto now=nowMs();
+        sampleStep="read_map";
         if(now-lastMap>1000) {lastMap=now;readMap();}
-        auto* entity=api.call(mainCharacter);
+        sampleStep="main_character";
+        auto* entity=mainEntity();
+        sampleStep="model";
+        {
+            void* staticInfo=nullptr;if(worldInfoField)symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(worldInfoField,&staticInfo);
+            void* worldObject=nullptr;try {worldObject=staticObject("worldInfo");}catch(...) {}
+            sampleProbe={{"world_info_field",worldInfoField!=nullptr},{"world_info",staticInfo!=nullptr},{"game_world_info",worldObject!=nullptr},
+                {"map",mapId},{"level",levelId},{"main_character",entity!=nullptr},{"main_character_source",mainCharacterSource},{"at",now}};
+        }
         proto::PlayerState state;state.timeMs=std::uint32_t(now);state.mapHash=mapHash;
         void* go=nullptr;
         if(entity) {
             auto* component=api.call(entityModel,entity);
             go=component?api.call(modelGo,component):nullptr;
+            sampleProbe["model_component"]=component!=nullptr;sampleProbe["model_go"]=go!=nullptr;
             if(component&&(entity!=character||go!=model)) localModel=text(api.call(modelPath,component));
         }
+        if(go)sampleProbe["model_alive"]=alive(go);
         if(!go||!alive(go)) {
             if(model) dropLocalModel();
             character=nullptr;
@@ -552,8 +599,9 @@ private:
             if(now-lastInvalid>1000) {lastInvalid=now;net.setLocalState(state);}
             return;
         }
+        sampleStep="bind_model";
         if(go!=model) bindLocalModel(go);
-        character=entity;
+        character=entity;sampleStep="pose";
         if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity)) {
             localHp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             localMaxHp=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
@@ -713,7 +761,7 @@ public:
             if(count<0||count>4)throw std::runtime_error("unverified native source squad size");
             for(int slot=0;slot<count;++slot)if(api.call(gm("SquadManager","GetMemberBySlot","System.Int32","Beyond.Gameplay.Core.Entity"),squad,{&slot})==source.entity) {out["party_slot"]=slot;break;}
         }
-        out["source_is_controlled"]=api.call(mainCharacter)==source.entity;
+        out["source_is_controlled"]=mainEntity()==source.entity;
         auto* skillVariable=variable("skill_id","System.String");
         const auto skill=skillVariable?text(metadata.fieldObject(skillVariable,"m_value","System.String")):std::string{};
         if(skill.empty()||skill.size()>128)return out;
@@ -799,11 +847,34 @@ public:
     bool takeHostMapNotice() {return hostMapConsent.takeNotice();}
     void chooseHostMap(Net& net,std::uint64_t token,bool follow) {
         if(net.currentRole()!=Role::Client||!session||!session->followHost)throw std::runtime_error("当前不是跟随房主的房客");
-        if(follow) {
-            throw std::runtime_error("原生换图隔离与恢复适配器尚未实现；跟随未支持");
-        }
-        hostMapConsent.choose(token,false);
+        hostMapConsent.choose(token,follow);
+        if(follow) {travelState="queued";travelError.clear();}
     }
+    // Teleport to a player: the host's scene (including its dungeon) from the room
+    // manifest, any other player from their own reported map and position.
+    void teleportToPlayer(Net& net,std::uint16_t peer) {
+        const auto view=net.snapshot();
+        if(view.role==Role::Offline||!character)throw std::runtime_error("当前不在房间中或角色未就绪");
+        if(peer==view.localId)throw std::runtime_error("不能传送到自己");
+        if(travel&&travel->started)throw std::runtime_error("正在传送中");
+        if(peer==proto::kHostId&&view.role==Role::Client&&session&&session->ready()) {
+            const auto& w=session->snapshot();
+            hostMapConsent.explicitTeleport(w.at("map").get<std::string>()+"/"+w.at("level").get<std::string>()+"/"+w.value("dungeon",std::string{}));
+            auto p=vec(w.at("position"));p.x+=1.2f;p.z+=.6f;
+            travel=makeTravel(w.at("map").get<std::string>(),w.at("level").get<std::string>(),p,w.value("level_num",0),w.value("dungeon",std::string{}));
+        }else {
+            const PeerView* target=nullptr;for(const auto& p:view.peers)if(p.id==peer)target=&p;
+            if(!target||!target->hasInfo||target->states.empty()||nowMs()-target->states.back().receivedMs>3000||!(target->states.back().state.flags&proto::StateValid))
+                throw std::runtime_error("该玩家的位置尚未同步");
+            if(target->info.mapId.empty())throw std::runtime_error("该玩家的地图未知");
+            const auto& st=target->states.back().state;
+            travel=makeTravel(target->info.mapId,target->info.levelId,{st.position[0]+1.2f,st.position[1],st.position[2]+.6f},0,
+                target->info.mapId==mapId?currentDungeon():std::string{});
+        }
+        travelState="queued";travelError.clear();
+    }
+    // Menu: leave any room, then teleport officially to a hub in Valley IV (map01).
+    void requestEmergencyHome() {emergencyHomePending=true;officialTeleportStatus={{"purpose","emergency_home"},{"state","queued"},{"at",nowMs()}};}
     void resetAppearance() {
         officialAppearance.clear();localAppearanceInfo=nullptr;lastAppearanceSample=0;appearanceModel.clear();appearanceError.clear();
     }
@@ -975,11 +1046,12 @@ public:
                 !readField<bool>(instance,"GameInstance","m_isModeDelayedToSwitch","Beyond.Gameplay");
             if(nativeSceneInitialized&&!initialized)link.invalidateNativeScene();
             nativeSceneInitialized=initialized;
-            const bool sceneReady=initialized&&character&&api.call(mainCharacter)==character&&
+            const bool sceneReady=initialized&&character&&mainEntity()==character&&
                 text(api.call(mapIdText,info))==mapId&&text(api.call(levelIdText,info))==levelId;
             link.setLocalSceneReady(sceneReady);
             localError.clear();
-        } catch(const std::exception& e) {link.setLocalSceneReady(false);localError=e.what();character=nullptr;if(model) {try {dropLocalModel();} catch(...) {}}}
+        } catch(const std::exception& e) {link.setLocalSceneReady(false);localError=e.what();character=nullptr;
+            ++tickFailures;tickFailure={{"error",e.what()},{"count",tickFailures},{"at",nowMs()}};if(model) {try {dropLocalModel();} catch(...) {}}}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         runDiagnostics(); // lifecycle diagnostics must also execute while offline
 #endif
@@ -1000,7 +1072,9 @@ public:
     }
     // Game thread only.
     void clear() {
-        for(const auto& data:privateCharacterData)if(!data->cleanup())throw std::runtime_error("private native character data remains retained; cleanup must finish before unload");
+        for(const auto& data:privateCharacterData)
+            if(!data->cleanup([this](void* info) {return nativeEventRegistry.observeClear(info,nativePins);}))
+                throw std::runtime_error("private native character data remains retained; cleanup must finish before unload");
         privateCharacterData.clear();
         if(nativeEntityWithdrawal.retained()&&(!nativeEntityWithdrawal.retire(staticObject("entityManager"),
                 [this](void* manager,std::uint32_t handle){return observeEntityWithdrawal(manager,handle);})||nativeEntityWithdrawal.retained()))
@@ -1031,8 +1105,9 @@ public:
                 {"contracts_resolved",nativeMine.contractsResolved()},{"native_dispatch_calls",nativeMine.calls()},{"native_dispatch_accepted",nativeMine.acceptedCalls()},
                 {"execution_verified",false},{"native_witness_bridge",false},{"isolation_verified",false},{"recovery_verified",false},{"full_sync_verified",false}}},
             {"native_entity_withdrawal",nativeEntityWithdrawal.status()},
+            {"native_event_registry",nativeEventRegistry.status()},
             {"private_character_data",{{"records",privateDataStatus},{"native_actor_created",false},{"supported",false},{"full_sync_verified",false}}},
-            {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
+            {"local_bones",bones.size()},{"samples",samples},{"sample_probe",sampleProbe},{"sample_failure",sampleFailure},{"tick_failure",tickFailure},{"error",localError},{"avatars",nlohmann::json::array()},{"markers",markers},
             {"appearance",{{"local",localAppearanceInfo},{"ready",character!=nullptr&&appearanceModel==localModel&&!localAppearanceInfo.is_null()},
                 {"cache",officialAppearance.status()},{"sampling_error",appearanceError},{"stage","metadata_only"},{"lookup_ready",false},{"effects_replayed",false}}},
             {"presentation",{{"source","unified_host_object_ledger"},{"parallel_relay_removed",true},
@@ -1053,12 +1128,14 @@ public:
                 {"native_feed",{{"enabled",false},{"filter_active",false},{"legacy_removed",true},{"supported",false}}},
                 {"host_map_change",{{"pending",hostMapConsent.pending()},{"deferred",hostMapConsent.deferred()},
                     {"token",hostMapConsent.token()},{"map",hostMapChoiceMap},{"level",hostMapChoiceLevel}}},
-                {"error",replicationError},{"spawns",nlohmann::json::array()},{"players",nlohmann::json::array()},
-                {"enemy_targets",nlohmann::json::array()},{"teleport","unsupported"},{"scene_travel_supported",false},{"native_load_parameter_retained",false},
+                {"error",travelError.empty()?replicationError:travelError},{"spawns",nlohmann::json::array()},{"players",nlohmann::json::array()},
+                {"enemy_targets",nlohmann::json::array()},{"teleport",travelState},{"scene_travel_supported",true},{"native_load_parameter_retained",false},
+                {"travel",{{"target",travel?nlohmann::json{{"map",travel->map},{"level",travel->level},{"dungeon",travel->dungeon},{"following",travel->following},{"homeward",travel->homeward}}:nlohmann::json(nullptr)},
+                    {"lifecycle",travelLifecycle},{"official",officialTeleportStatus},{"official_teleports",officialTeleports},{"completed",completedTeleports}}},
                 {"combat",{{"settlement_policy","host_native_only"},{"legacy_numeric_damage",false},{"native_damage_verified",false},{"supported",false}}},
                 {"perf",{{"frame_ms",perf.frameMs},{"frame_max_ms",perf.frameMaxMs},{"replication_ms",perf.replicationMs},
                     {"remotes_ms",perf.remotesMs},{"container_enemy_scan",perf.containerScan},{"container_error",perf.containerError}}},
-                {"home",nullptr},{"background_lease",backgroundLease}}}};
+                {"home",home?nlohmann::json{{"map",home->map},{"level",home->level},{"dungeon",home->dungeon}}:nlohmann::json(nullptr)},{"background_lease",backgroundLease}}}};
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
         result["world_replication"]["native_operations"]=nativeOperations;
         result["world_replication"]["diagnostics"]=diagnosticResults;

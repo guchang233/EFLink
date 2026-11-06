@@ -398,3 +398,29 @@ SDK ZIP 已解压到独立目录，示例仅用 ZIP 内文件重新编译成功�
 当时提供玩家连接和角色姿态同步。战斗、敌人、建筑、任务、资源和存档
 未实现共享。远端模型不参与碰撞或伤害；武器和技能特效未同步。
 当前没有 EF 与 Minecraft 连接。
+
+## 1.6.3 客户端：菜单与联机解除版本门禁（2026-11-05）
+
+实测：1.6.3 启动后 EFML 报 `eflink.coop.stage1.1005 ready`，但
+`gui_ready=false`、`gui_frames=0`、`hook_error=未验证游戏版本 1.6.3`。原因是
+`installHook()` 在版本检查处直接返回，连 `Canvas.SendWillRenderCanvases`
+钩子都没有安装，菜单因此永远不会初始化——与玩家按什么键无关（默认菜单键是
+`=`，不是 F11）。
+
+改为分层门禁：菜单（Canvas 叠加绘制 + 窗口子类化输入）与联机（纯套接字）
+不属于原生游戏适配，任何版本都安装；只有写游戏状态的
+`CameraManager.TailLateTick` 世界适配仍要求 `readOnlyBuildSupported()`。未验证
+版本在状态里报 `build_verified=false`，面板显示「菜单与联机可用，原生世界
+同步停用」。这是去掉了一条错误的过度门禁，不是放宽原生适配认证：
+`docs/ACTIVE_GOAL.md` 的「不能通过配置或诊断指令绕过认证」仍然有效。
+
+同时新增只读 `native_census` 消息动作（`src/authority/native_census.h`）：
+只解析 CameraManager / EventManager / DungeonManager / GameAction / Canvas，
+`TailLateTick`、`SendWillRenderCanvases`、`LeaveDungeon` 三个方法，以及
+EventManager 的 `m_gameEvents`、`m_eventDispatcher`、`m_evtBindings` 字段偏移。
+不发钩子、不调用游戏方法、不读对象、不写游戏状态。它的输出是把新版本加入
+白名单的证据来源；它本身不是开关，不会让任何适配器启动。
+
+`eflink.coop.stage1.1006` 构建通过 24 组离线检查、源指纹一致、V1/V2 ABI 通过。
+本条目只证明构建与该只读动作可用；菜单实际显示、双端联机与原生同步均未验收，
+`full_sync_verified` 保持 false。

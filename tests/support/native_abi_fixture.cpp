@@ -5,6 +5,7 @@
 #include <memory>
 #define FIXTURE_EXPORT extern "C" __declspec(dllexport)
 FIXTURE_EXPORT const void* il2cpp_object_get_class(void* object) {return object?static_cast<AbiFixtureObject*>(object)->klass:nullptr;}
+FIXTURE_EXPORT const void* il2cpp_class_get_parent(const void* klass) {return static_cast<const AbiFixtureClass*>(klass)->parent;}
 FIXTURE_EXPORT bool il2cpp_class_is_valuetype(const void* klass) {return static_cast<const AbiFixtureClass*>(klass)->value;}
 FIXTURE_EXPORT int il2cpp_class_value_size(const void* klass,unsigned* alignment) {
     auto* value=static_cast<const AbiFixtureClass*>(klass);*alignment=value->alignment;return value->bytes;

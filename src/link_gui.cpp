@@ -17,6 +17,7 @@
 #include "link_native_gui.h"
 #include "link_input_ownership.h"
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <mutex>
 #include <tuple>
 
@@ -155,6 +156,14 @@ struct Gui::NativeState {
     std::atomic<bool> visible=false,accepting=true,textInput=false;std::atomic<int> menuKey=kDefaultMenuKey;
     bool installed=false,failed=false,lastVisible=false,warmed=false;std::uint64_t lastFrame=0,retryAt=0,lastCheck=0;int failures=0;
     std::mutex eventsMutex;struct Event {UINT message;WPARAM value;};std::vector<Event> events;
+    // Endfield 1.6.3 takes keyboard input through raw input, so the window never
+    // sees WM_KEYDOWN. The counters separate "no messages at all" from "messages
+    // arrive but the key differs", and the menu key is polled as well.
+    std::atomic<std::uint64_t> messages{0},keyMessages{0};
+    std::uint64_t hotkeyToggledAt=0;bool hotkeyDown=false;
+    // The display size the menu was laid out for; a canvas that disagrees with it
+    // is what makes the panel enormous or off-screen.
+    std::atomic<float> displayWidth{0},displayHeight{0};
     InputOwnership inputOwnership;
     NativeState(Request request,const json& options) {panel.request=std::move(request);menuKey=options.value("menu_key",kDefaultMenuKey);}
     static LRESULT CALLBACK input(HWND window,UINT message,WPARAM a,LPARAM b,UINT_PTR,DWORD_PTR data) {
@@ -164,12 +173,14 @@ struct Gui::NativeState {
             return DefSubclassProc(window,message,a,b);
         }
         if(!state.accepting.load()) return DefSubclassProc(window,message,a,b);
+        ++state.messages;
         if(message==WM_KILLFOCUS)state.inputOwnership.focusLost();
         const bool down=message==WM_KEYDOWN||message==WM_SYSKEYDOWN;
         const bool up=message==WM_KEYUP||message==WM_SYSKEYUP;
         // A printable hotkey ("=") still types into a focused menu text box.
         const bool typing=state.visible.load()&&state.textInput.load()&&!(state.menuKey.load()>=VK_F1&&state.menuKey.load()<=VK_F12);
         if((down||up)&&int(a)==state.menuKey.load()&&!typing) {
+            ++state.keyMessages;state.hotkeyToggledAt=GetTickCount64();
             state.inputOwnership.route(std::size_t(a),down,true);
             if(down&&!(b&(LPARAM(1)<<30)))state.visible=!state.visible.load();
             return 0;
@@ -290,7 +301,12 @@ void Gui::tickGame(const BE_HostApiV1* host) {
             io.DisplaySize={float(state.api.value<int>(state.api.method("Screen","get_width","","System.Int32"))),float(state.api.value<int>(state.api.method("Screen","get_height","","System.Int32")))};
             io.DeltaTime=.016f;ImGui::NewFrame();state.panel.draw();ImGui::Render();state.canvas.render(ImGui::GetDrawData(),false);state.warmed=true;
         }
-        const bool focused=state.window&&GetForegroundWindow()==state.window&&!IsIconic(state.window);
+        // Focus follows the process instead of one HWND: the client keeps other
+        // windows around (launcher view, message windows) and the foreground one
+        // is not always the window the menu was attached to.
+        const HWND foreground=GetForegroundWindow();DWORD foregroundPid=0;
+        if(foreground) GetWindowThreadProcessId(foreground,&foregroundPid);
+        const bool focused=foreground&&foregroundPid==GetCurrentProcessId()&&!IsIconic(foreground);
         // The menu is an overlay drawn onto the game's own canvas, not an OS
         // window: alt-tabbing, a launcher stealing focus, or the game being
         // minimised must not close it. Only the menu key, Escape and the
@@ -298,6 +314,15 @@ void Gui::tickGame(const BE_HostApiV1* host) {
         // every event while the game is in the background -- so a lingering menu
         // cannot swallow the player's clicks.
         if(focused&&openRequested.exchange(false)) state.visible=true;
+        // Polled hotkey: a raw-input client never delivers WM_KEYDOWN, so the menu
+        // key is also read from the async key state. A press already handled by the
+        // window messages suppresses the poll, so one press never flips the menu twice.
+        if(focused) {
+            const bool down=(GetAsyncKeyState(state.menuKey.load())&0x8000)!=0;
+            const bool typing=state.visible.load()&&state.textInput.load()&&!(state.menuKey.load()>=VK_F1&&state.menuKey.load()<=VK_F12);
+            if(down&&!state.hotkeyDown&&!typing&&GetTickCount64()-state.hotkeyToggledAt>300) state.visible=!state.visible.load();
+            state.hotkeyDown=down;
+        } else state.hotkeyDown=false;
         const bool show=state.visible.load();menuVisible=show;
         if(!show&&state.lastVisible) {ImGui::GetIO().ClearInputKeys();ImGui::GetIO().ClearInputMouse();}
         state.lastVisible=show;state.panel.refresh();state.menuKey=state.panel.state.value("configuration",json::object()).value("menu_key",kDefaultMenuKey);
@@ -311,6 +336,7 @@ void Gui::tickGame(const BE_HostApiV1* host) {
         const float width=float(state.api.value<int>(state.api.method("Screen","get_width","","System.Int32")));
         const float height=float(state.api.value<int>(state.api.method("Screen","get_height","","System.Int32")));
         if(width>1.f&&height>1.f) io.DisplaySize={width,height};
+        state.displayWidth=io.DisplaySize.x;state.displayHeight=io.DisplaySize.y;
         auto now=GetTickCount64();io.DeltaTime=(std::clamp)(float(now-state.lastFrame)/1000,.001f,.1f);state.lastFrame=now;
         state.feedInput(io,show&&focused);io.MouseDrawCursor=show;
         ImGui::NewFrame();if(show) state.panel.draw();else drawHud(hud);
@@ -325,18 +351,174 @@ void Gui::tickGame(const BE_HostApiV1* host) {
         state.panel.request({{"action","gui_error"},{"error",e.what()}});
     }
 }
-nlohmann::json Gui::diagnostics() const {return native?native->canvas.diagnostics():json::object();}
+nlohmann::json Gui::diagnostics() const {
+    if(!native) return json::object();
+    auto result=native->canvas.diagnostics();
+    // Whether the window receives messages at all decides if the menu key has to
+    // come from polling, so both counters travel with the render diagnostics.
+    result["input_messages"]=native->messages.load();
+    result["key_messages"]=native->keyMessages.load();
+    result["menu_key"]=native->menuKey.load();
+    result["hotkey_down"]=native->hotkeyDown;
+    result["display_width"]=native->displayWidth.load();
+    result["display_height"]=native->displayHeight.load();
+    return result;
+}
 void Gui::shutdownGame(const BE_HostApiV1* host) {
     if(native) {native->shutdown(host);native.reset();}menuVisible=false;uiReady=false;
 }
 void Gui::start(Request request,const json& options) {
     stop();stopping=false;nativeFrames=0;
+    // The menu is its own top-level window by default. A separate window cannot
+    // tear, cannot be hidden behind the scene, and never touches the game's
+    // renderer or input, so it keeps working on a client we have not verified.
+    windowMode=!options.value("preview_mode",false)&&options.value("window_menu",true);
+    if(windowMode) {
+        const bool overlay=options.value("overlay_mode",true);
+        overlayMode=overlay;
+        thread=std::jthread([this,request=std::move(request),options,overlay]{
+            try {
+                if(overlay) runOverlay(request,options); else runWindow(request,options);
+            } catch(const std::exception& e) {
+                // A client that refuses the transparent overlay still gets a usable
+                // menu in a normal window instead of no menu at all.
+                if(overlay) {
+                    try {runWindow(request,options);return;} catch(const std::exception&) {}
+                }
+                request({{"action","gui_error"},{"error",e.what()}});
+            }
+        });
+        return;
+    }
     if(!options.value("preview_mode",false)) {native=std::make_unique<NativeState>(std::move(request),options);return;}
     thread=std::jthread([this,request=std::move(request),options]{
         try {run(request,options);} catch(const std::exception& e) {request({{"action","gui_error"},{"error",e.what()}});}
     });
 }
 void Gui::stop() {stopping=true;if(native) {native->accepting=false;native->visible=false;}if(thread.joinable()) thread.join();menuVisible=false;uiReady=false;}
+// Real top-level window: Direct3D 11 plus the Win32 backend, the same panel the
+// canvas path draws. Nothing here calls into the game, so a client whose build is
+// not verified still gets a usable menu that cannot corrupt its renderer.
+void Gui::runWindow(Request request,json options) {
+    auto instance=GetModuleHandleW(nullptr);
+    const auto className=previewWindowClass(GetCurrentProcessId());
+    WNDCLASSEXW wc{sizeof(wc),0,Renderer::proc,0,0,instance,nullptr,LoadCursorW(nullptr,IDC_ARROW),nullptr,nullptr,className.c_str(),nullptr};
+    if(!RegisterClassExW(&wc)) throw std::runtime_error("Cannot register the EF Link window");
+    Renderer r;
+    r.window=CreateWindowExW(WS_EX_TOPMOST,className.c_str(),L"EF Link 联机菜单",WS_OVERLAPPEDWINDOW,
+        140,120,1180,780,nullptr,nullptr,instance,&r);
+    if(!r.window||FAILED(r.create())) {
+        if(r.window) DestroyWindow(r.window);
+        UnregisterClassW(className.c_str(),instance);
+        throw std::runtime_error("Cannot create the EF Link window");
+    }
+    ShowWindow(r.window,SW_SHOWNA);
+    ImGuiContext* context=ui::createContext(1080.f);
+    auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
+    ImGui_ImplWin32_Init(r.window);ImGui_ImplDX11_Init(r.device.Get(),r.context.Get());
+    eflink::UiPanel panel;panel.request=request;panel.refresh();
+    uiReady=true;menuVisible=true;
+    const int menuKey=options.value("menu_key",kDefaultMenuKey);
+    bool hotkeyDown=false;bool hidden=false;
+    while(!stopping&&!r.closing) {
+        MSG message;
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
+        if(r.closing) break;
+        // The menu key shows and hides the window while the game keeps focus. It is
+        // polled, so it works without a hook, a subclass or any game input path.
+        const bool down=(GetAsyncKeyState(menuKey)&0x8000)!=0;
+        if(down&&!hotkeyDown) {
+            hidden=!hidden;
+            ShowWindow(r.window,hidden?SW_HIDE:SW_SHOWNA);
+            if(!hidden) SetForegroundWindow(r.window);
+        }
+        hotkeyDown=down;
+        menuVisible=!hidden;
+        if(hidden) {std::this_thread::sleep_for(std::chrono::milliseconds(30));continue;}
+        if(r.width&&r.height) {r.target.Reset();r.swap->ResizeBuffers(0,r.width,r.height,DXGI_FORMAT_UNKNOWN,0);r.width=r.height=0;r.makeTarget();}
+        if(!r.target) {std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;}
+        ImGui_ImplDX11_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
+        panel.refresh();panel.draw();
+        if(panel.close) {
+            panel.close=false;hidden=true;menuVisible=false;
+            ImGui::EndFrame();ShowWindow(r.window,SW_HIDE);continue;
+        }
+        ImGui::Render();auto* target=r.target.Get();
+        r.context->OMSetRenderTargets(1,&target,nullptr);
+        const float clear[]={.055f,.062f,.072f,1.f};r.context->ClearRenderTargetView(target,clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        r.swap->Present(1,0);++nativeFrames;
+    }
+    menuVisible=false;uiReady=false;
+    ImGui_ImplDX11_Shutdown();ImGui_ImplWin32_Shutdown();ImGui::DestroyContext(context);
+    DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);
+}
+// Transparent overlay over the game window, using the same recipe as the EFML menu
+// module: a layered, topmost popup whose DWM frame is extended into the client area,
+// with Direct3D 11 clearing to full transparency so the game stays visible under the
+// menu. No hook, no Unity renderer, no game input path.
+void Gui::runOverlay(Request request,json options) {
+    auto instance=GetModuleHandleW(nullptr);
+    HWND game=findGame();
+    if(!game) throw std::runtime_error("EF Link overlay: game window unavailable");
+    const auto className=previewWindowClass(GetCurrentProcessId());
+    WNDCLASSEXW wc{sizeof(wc),0,Renderer::proc,0,0,instance,nullptr,LoadCursorW(nullptr,IDC_ARROW),nullptr,nullptr,className.c_str(),nullptr};
+    if(!RegisterClassExW(&wc)) throw std::runtime_error("EF Link overlay: cannot register the window class");
+    Renderer r;
+    r.window=CreateWindowExW(WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,className.c_str(),L"EF Link",
+        WS_POPUP,0,0,100,100,nullptr,nullptr,instance,&r);
+    if(!r.window) {UnregisterClassW(className.c_str(),instance);throw std::runtime_error("EF Link overlay: cannot create the window");}
+    // Both calls are required: the extended frame plus the layered alpha is what makes
+    // the client area composite instead of painting an opaque black rectangle.
+    MARGINS margins{-1,-1,-1,-1};
+    DwmExtendFrameIntoClientArea(r.window,&margins);
+    SetLayeredWindowAttributes(r.window,0,255,LWA_ALPHA);
+    if(FAILED(r.create())) {
+        DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);
+        throw std::runtime_error("EF Link overlay: Direct3D unavailable");
+    }
+    ImGuiContext* context=ui::createContext(1080.f);
+    auto& io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;
+    ImGui_ImplWin32_Init(r.window);ImGui_ImplDX11_Init(r.device.Get(),r.context.Get());
+    eflink::UiPanel panel;panel.request=request;panel.refresh();
+    const int menuKey=options.value("menu_key",kDefaultMenuKey);
+    bool hotkeyDown=false,hidden=true;
+    // The overlay mirrors the game's client area; a stale rectangle would leave the
+    // menu floating away from the picture after a resolution or window change.
+    auto follow=[&]() -> bool {
+        if(!IsWindow(game)||!IsWindowVisible(game)) game=findGame();
+        HWND target=game;
+        if(!target||!IsWindow(target)||!IsWindowVisible(target)||IsIconic(target)) return false;
+        RECT client{};if(!GetClientRect(target,&client)||client.right<8||client.bottom<8) return false;
+        POINT origin{0,0};if(!ClientToScreen(target,&origin)) return false;
+        SetWindowPos(r.window,HWND_TOPMOST,origin.x,origin.y,client.right,client.bottom,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        return true;
+    };
+    uiReady=true;
+    while(!stopping&&!r.closing) {
+        MSG message;
+        while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
+        if(r.closing) break;
+        const bool down=(GetAsyncKeyState(menuKey)&0x8000)!=0;
+        if(down&&!hotkeyDown) hidden=!hidden;
+        hotkeyDown=down;
+        menuVisible=!hidden;
+        if(hidden||!follow()) {ShowWindow(r.window,SW_HIDE);std::this_thread::sleep_for(std::chrono::milliseconds(30));continue;}
+        if(r.width&&r.height) {r.target.Reset();r.swap->ResizeBuffers(0,r.width,r.height,DXGI_FORMAT_UNKNOWN,0);r.width=r.height=0;r.makeTarget();}
+        if(!r.target) {std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;}
+        ImGui_ImplDX11_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
+        panel.refresh();panel.draw();
+        if(panel.close) {panel.close=false;hidden=true;}
+        ImGui::Render();
+        auto* target=r.target.Get();r.context->OMSetRenderTargets(1,&target,nullptr);
+        const float clear[]={0,0,0,0};r.context->ClearRenderTargetView(target,clear);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        r.swap->Present(1,0);++nativeFrames;
+    }
+    menuVisible=false;uiReady=false;
+    ImGui_ImplDX11_Shutdown();ImGui_ImplWin32_Shutdown();ImGui::DestroyContext(context);
+    DestroyWindow(r.window);UnregisterClassW(className.c_str(),instance);
+}
 void Gui::run(Request request,json options) {
     if(!options.value("preview_mode",false)) throw std::runtime_error("The preview renderer is only available in standalone preview mode");
     const std::string demo=options.value("preview_demo",std::string{});

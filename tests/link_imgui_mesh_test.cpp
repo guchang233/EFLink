@@ -1,19 +1,26 @@
 #include "link_imgui_mesh.h"
 #include <iostream>
+#include <limits>
 int main() {
     using namespace eflink::imguimesh;
     auto check=[](bool ok,const char* what){if(!ok) throw std::runtime_error(what);std::cout<<"PASS "<<what<<'\n';};
     Vertex input[]={{-10,5,0,0,255,0,0,255},{15,5,1,0,0,255,0,255},{5,25,.5f,1,0,0,255,255}};
-    Mesh clipped;triangle(clipped,input,{0,0,10,10},100);
+    Mesh clipped;triangle(clipped,input,{0,0,10,10},100,1e6f);
     check(!clipped.colors.empty()&&clipped.colors.size()%3==0,"partial triangle produces complete triangles");
     for(std::size_t i=0;i<clipped.colors.size();++i) {
         check(clipped.positions[i*3]>=0&&clipped.positions[i*3]<=10&&clipped.positions[i*3+1]>=90&&clipped.positions[i*3+1]<=100,"clip stays within all four bounds and flips Unity y");
         if(clipped.indices[i]!=int(i)) throw std::runtime_error("indices outside generated vertices");
     }
-    Mesh excluded;triangle(excluded,input,{40,40,50,50},100);check(excluded.colors.empty(),"fully clipped triangles emit no vertices");
+    Mesh excluded;triangle(excluded,input,{40,40,50,50},100,1e6f);check(excluded.colors.empty(),"fully clipped triangles emit no vertices");
     Vertex inside[]={{1,1,.2f,.3f,10,20,30,40},{4,1,.4f,.3f,10,20,30,40},{1,4,.2f,.6f,10,20,30,40}};
-    Mesh preserved;triangle(preserved,inside,{0,0,10,10},100);
+    Mesh preserved;triangle(preserved,inside,{0,0,10,10},100,1e6f);
     check(preserved.colors.size()==3&&preserved.colors[0]==0x281e140a&&preserved.uv[0]==.2f&&preserved.uv[1]==.3f,"unclipped triangle preserves UV and RGBA");
+    Vertex huge[]={{0,0,0,0,1,1,1,1},{5000,0,0,0,1,1,1,1},{0,5,0,0,1,1,1,1}};
+    Mesh oversized;triangle(oversized,huge,{0,0,1e5f,1e5f},100,1000);
+    check(oversized.colors.empty()&&oversized.dropped==1,"oversized triangle is dropped, not drawn as a screen wash");
+    Vertex broken[]={{0,0,0,0,1,1,1,1},{std::numeric_limits<float>::quiet_NaN(),0,0,0,1,1,1,1},{0,5,0,0,1,1,1,1}};
+    Mesh nonFinite;triangle(nonFinite,broken,{-1e5f,-1e5f,1e5f,1e5f},100,1000);
+    check(nonFinite.colors.empty(),"non-finite vertices never reach the canvas");
     IMGUI_CHECKVERSION();ImGui::CreateContext();auto& io=ImGui::GetIO();io.DisplaySize={800,600};io.DeltaTime=.016f;
     unsigned char* pixels;int w,h;io.Fonts->GetTexDataAsRGBA32(&pixels,&w,&h);io.Fonts->SetTexID(17);
     ImGui::NewFrame();auto* list=ImGui::GetForegroundDrawList();list->PushClipRect({20,20},{50,50});list->AddRectFilled({0,0},{100,100},0xffffffff);list->PopClipRect();ImGui::Render();

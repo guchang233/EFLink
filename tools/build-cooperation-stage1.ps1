@@ -11,7 +11,7 @@ $taskVs = & $taskVswhere -latest -products '*' -requires Microsoft.VisualStudio.
 if (-not $taskVs) { throw 'Visual Studio C++ tools unavailable' }
 $taskVc = (Get-ChildItem -LiteralPath (Join-Path $taskVs 'VC\Tools\MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
 $taskSdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
-$taskSdkVersion = (Get-ChildItem -LiteralPath (Join-Path $taskSdk 'Lib') -Directory | Sort-Object Name -Descending | Select-Object -First 1).Name
+$taskSdkVersion = (Get-ChildItem -LiteralPath (Join-Path $taskSdk 'Lib') -Directory | Where-Object { $_.Name -match '^10\.[0-9]+\.[0-9]+\.[0-9]+$' } | Sort-Object Name -Descending | Select-Object -First 1).Name
 $env:PATH = (Join-Path $taskVc 'bin\Hostx64\x64') + ';' + $env:PATH
 $env:INCLUDE = (@((Join-Path $taskVc 'include')) + @(@('ucrt','shared','um','winrt') | ForEach-Object { Join-Path $taskSdk "Include\$taskSdkVersion\$_" })) -join ';'
 $env:LIB = (@((Join-Path $taskVc 'lib\x64'),(Join-Path $taskSdk "Lib\$taskSdkVersion\ucrt\x64"),(Join-Path $taskSdk "Lib\$taskSdkVersion\um\x64"))) -join ';'
@@ -26,7 +26,8 @@ function Get-TaskSourceFingerprint {
             $taskSourceRows += $taskRelative+' '+(Get-FileHash -LiteralPath $taskSourceFile.FullName -Algorithm SHA256).Hash
         }
     }
-    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes(($taskSourceRows -join "`n")))).ToLowerInvariant()
+    $taskHashBytes = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(($taskSourceRows -join "`n")))
+    ([BitConverter]::ToString($taskHashBytes).Replace('-','')).ToLowerInvariant()
 }
 $taskFingerprint=Get-TaskSourceFingerprint
 $taskBuildId='dev/'+$taskFingerprint.Substring(0,32)
@@ -37,7 +38,7 @@ if ($TestsOnly) {
     if ($taskPrevious.source_sha256 -ne $taskFingerprint) { throw 'Source differs from the DLL; perform a full development build' }
 }
 Set-Content -LiteralPath $taskModuleHeader -Value @(('#define EFLINK_MODULE_ID "'+$ModuleId+'"'),('#define EFLINK_BUILD_ID "'+$taskBuildId+'"')) -Encoding ascii
-@{module=$ModuleId;build_id=$taskBuildId;source_sha256=$taskFingerprint;tests_passed=$false} | ConvertTo-Json | Set-Content -LiteralPath $taskManifestPath -Encoding utf8
+@{module=$ModuleId;build_id=$taskBuildId;source_sha256=$taskFingerprint;tests_passed=$false} | ConvertTo-Json | Set-Content -LiteralPath $taskManifestPath -Encoding ascii
 $taskFlags += "/FI$taskModuleHeader"
 function Invoke-TaskCompiler([string[]]$taskArguments) {
     & cl.exe @taskArguments
@@ -61,18 +62,18 @@ try {
     $taskNativeFixture=Join-Path $taskOutput 'native-abi-fixture'
     New-Item -ItemType Directory -Path $taskNativeFixture -Force | Out-Null
     Invoke-TaskCompiler ($taskFlags + @('/LD',"$taskProject\tests\support\native_abi_fixture.cpp","/Fe:$taskNativeFixture\GameAssembly.dll",'/link','/DYNAMICBASE','/NXCOMPAT'))
-    $taskTests = @('link_coop_contract_test','link_world_authority_test','link_native_bindings_test','link_native_pins_test','link_native_value_abi_test','link_unity_bridge_test','link_native_mine_entry_test','link_native_withdrawal_test','link_native_character_info_test','link_authority_appearance_test','link_native_construction_test','link_authority_session_test','link_damage_scope_test','link_world_delta_test','link_appearance_test','link_session_test','link_protocol_test','link_net_test','link_input_ownership_test','link_map_consent_test','link_api_test')
+    $taskTests = @('link_coop_contract_test','link_world_authority_test','link_native_bindings_test','link_native_pins_test','link_native_value_abi_test','link_unity_bridge_test','link_native_mine_entry_test','link_native_withdrawal_test','link_native_character_info_test','link_authority_appearance_test','link_native_construction_test','link_authority_session_test','link_freshness_test','link_native_event_registry_test','link_damage_scope_test','link_world_delta_test','link_appearance_test','link_session_test','link_protocol_test','link_net_test','link_input_ownership_test','link_map_consent_test','link_api_test')
     foreach ($taskTest in $taskTests) {
         Invoke-TaskCompiler ($taskFlags + @("$taskProject\tests\$taskTest.cpp","/Fe:$taskTest.exe",'/link','ws2_32.lib','iphlpapi.lib'))
         $taskArguments = @()
         if ($taskTest -eq 'link_api_test') { $taskArguments=@((Join-Path $taskOutput "$ModuleId.dll"),$ModuleId) }
-        elseif ($taskTest -in @('link_unity_bridge_test','link_native_mine_entry_test','link_native_withdrawal_test','link_native_character_info_test')) { $taskArguments=@((Join-Path $taskNativeFixture 'GameAssembly.dll')) }
+        elseif ($taskTest -in @('link_unity_bridge_test','link_native_mine_entry_test','link_native_withdrawal_test','link_native_character_info_test','link_native_event_registry_test')) { $taskArguments=@((Join-Path $taskNativeFixture 'GameAssembly.dll')) }
         & (Join-Path $taskOutput "$taskTest.exe") @taskArguments
         if ($LASTEXITCODE -ne 0) { throw "Offline test failed: $taskTest" }
     }
     if ((Get-TaskSourceFingerprint) -ne $taskFingerprint) { throw 'Source changed during compilation; discard this build and rebuild' }
     @{module=$ModuleId;build_id=$taskBuildId;source_sha256=$taskFingerprint;tests_passed=$true;test_count=$taskTests.Count;
       dll_sha256=(Get-FileHash -LiteralPath (Join-Path $taskOutput "$ModuleId.dll") -Algorithm SHA256).Hash;
-      verified_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath $taskManifestPath -Encoding utf8
+      verified_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath $taskManifestPath -Encoding ascii
     Write-Output 'All standalone Stage 1 checks passed. Source fingerprint verified. This script does not launch the game.'
 } finally { Pop-Location }

@@ -4,6 +4,7 @@
 // and the exported EFLink_GetApiV1 table.
 #include "link_world.h"
 #include "authority/efml_lifecycle.h"
+#include "authority/native_census.h"
 #include "BetterEndfield/ThirdPartyModule.h"
 #include "EndfieldLink/EndfieldLink.h"
 #include "runtime_scope.h"
@@ -33,6 +34,10 @@ eflink::Gui gui;
 std::recursive_mutex worldMutex;
 std::atomic<bool> hooked=false,canvasHooked=false,cleanupRequested=false,cleanupDone=false;
 std::atomic<bool> worldEverTicked=false,cleanupTaskScheduled=false;
+// The menu and the network never touch game state, so they stay available on an
+// unverified build. Only the world adapter is gated on a verified build.
+std::atomic<bool> buildVerified=false;
+std::string buildVersion;
 const eflink::worldauthority::EfmlHostExtensionV1* efmlLifecycleHost=nullptr;
 bool cleanupNetworkStopped=false; // protected by lifecycle
 std::jthread hookWorker;
@@ -129,17 +134,26 @@ BE_Result installHook() {
     try {gameVersion=eflink::worldauthority::nativeGameVersion(api);}
     catch(const std::exception& e) {hookError=e.what();return BE_Result_NotReady;}
     catch(...) {hookError="native version probe unavailable";return BE_Result_NotReady;}
-    if(!eflink::worldauthority::readOnlyBuildSupported(gameVersion)) {
-        hookError="未验证游戏版本 "+gameVersion+"；原生游戏适配停用，账号风险不能排除";
-        return BE_Result_ContractMismatch;
-    }
-    if(configuration.value("gui_enabled",true)&&!configuration.value("preview_mode",false)&&!canvasHooked) {
+    buildVersion=gameVersion;
+    // The menu draws onto the game's own canvas and only reads display metrics, and
+    // hosting/joining is pure sockets. Both must work before any build is verified,
+    // otherwise an unverified client cannot even be asked to test. The world adapter
+    // writes into game state and stays gated.
+    if(configuration.value("gui_enabled",true)&&!configuration.value("preview_mode",false)&&
+       !configuration.value("window_menu",true)&&!canvasHooked) {
         BE_MethodDescriptorV1 canvas{"UnityEngine.UIModule.dll","UnityEngine","Canvas","SendWillRenderCanvases",nullptr,"System.Void",0};
         if(api->resolve_method(api->context,&canvas,&canvasMethod)!=BE_Result_Ok||!canvasMethod.method_pointer) return BE_Result_NotReady;
         std::uint64_t canvasHandle=0;
         auto result=host.hooks->create(host.hooks->context,kId,canvasMethod.method_pointer,reinterpret_cast<void*>(onCanvas),reinterpret_cast<void**>(&nextCanvas),&canvasHandle);
         if(result!=BE_Result_Ok) return result;canvasHooked=true;
     }
+    const bool verified=eflink::worldauthority::readOnlyBuildSupported(gameVersion);
+    buildVerified.store(verified);
+    if(!verified) {
+        hookError="未验证游戏版本 "+gameVersion+"；原生游戏适配停用（菜单与联机仍可用），账号风险不能排除";
+        return BE_Result_ContractMismatch;
+    }
+    hookError.clear();
     BE_MethodDescriptorV1 d{"Gameplay.Beyond.dll","Beyond.Gameplay.View","CameraManager","TailLateTick","System.Single","System.Void",1};
     if(api->resolve_method(api->context,&d,&tickMethod)!=BE_Result_Ok||!tickMethod.method_pointer) return BE_Result_NotFound;
     BE_ResolvedClassV1 klass{};
@@ -231,9 +245,9 @@ json status(std::uint64_t chatAfter) {
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
         {"addresses",addresses},{"game",game},{"world_session",worldSession},{"room_character_lookup_ready",false},
-        {"player_cast_observer_ready",false},{"damage_hook_ready",false},{"transferred_hook_ready",false},{"immune_hook_ready",false},{"death_hook_ready",false},{"enemy_target_hook_ready",false},{"enemy_find_hook_ready",false},{"skill_hook_ready",false},{"hook_ready",hooked.load()},{"official_filter_ready",false},{"op_filter_ready",false},{"op_filter_note","旧原生上报/世界替换钩子已删除"},{"outbound",{{"ready",false},{"unsupported",true}}},{"testing_invincible",false},{"invincible_blocked",0},{"hook_error",hookError},
+        {"player_cast_observer_ready",false},{"damage_hook_ready",false},{"transferred_hook_ready",false},{"immune_hook_ready",false},{"death_hook_ready",false},{"enemy_target_hook_ready",false},{"enemy_find_hook_ready",false},{"skill_hook_ready",false},{"hook_ready",hooked.load()},{"game_version",buildVersion},{"build_verified",buildVerified.load()},{"official_filter_ready",false},{"op_filter_ready",false},{"op_filter_note","旧原生上报/世界替换钩子已删除"},{"outbound",{{"ready",false},{"unsupported",true}}},{"testing_invincible",false},{"invincible_blocked",0},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
-        {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
+        {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend",gui.windowMenu()?(gui.overlayMenu()?"d3d11_overlay":"d3d11_window"):"unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs}}}};
 }
 
@@ -332,9 +346,18 @@ json perform(const json& input) {
         if(address.empty()||address.size()>256||password.size()>128) throw std::runtime_error("地址或密码无效");net.join(address,password);
     } else if(action=="leave") net.leave();
     else if(action=="host_map_choice") {std::lock_guard lock(worldMutex);world.chooseHostMap(net,input.at("token").get<std::uint64_t>(),input.at("follow").get<bool>());}
-    else if(action=="teleport_to_player") throw std::runtime_error("共享世界传送原生适配未验收");
-    else if(action=="outbound_capture"||action=="emergency_home"||action=="testing_invincible"||action=="feed_option")
+    else if(action=="teleport_to_player") {std::lock_guard lock(worldMutex);world.teleportToPlayer(net,input.at("id").get<std::uint16_t>());}
+    else if(action=="emergency_home") {net.leave();std::lock_guard lock(worldMutex);world.requestEmergencyHome();}
+    else if(action=="outbound_capture"||action=="testing_invincible"||action=="feed_option")
         throw std::runtime_error("旧玩法/回放入口已移除；统一原生适配器尚未验收");
+    else if(action=="native_census") {
+        auto* api=runtime();if(!api) throw std::runtime_error("native runtime unavailable");
+        RuntimeThreadScope scope(true);if(!scope.ready()) throw std::runtime_error("runtime thread unavailable");
+        std::string version;
+        try {version=eflink::worldauthority::nativeGameVersion(api);} catch(...) {version=buildVersion;}
+        buildVersion=version;
+        return eflink::worldauthority::runNativeCensus(api,version);
+    }
     else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},
         {"native",world.status().at("world_replication")},{"objects",session.sharedObjects()}};}

@@ -99,21 +99,70 @@ public:
         if(!result)throw std::runtime_error("native boxed receiver unavailable");return result;
     }
     int count(void* collection) const {return bridge->value<int>(method(collection,"get_Count",{},"System.Int32"),self(collection));}
+    void* referenceGetter(void* object,const char* label) const {
+        if(!object)throw std::runtime_error("native reference getter receiver unavailable");
+        auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(object);const void* match=nullptr,*resultClass=nullptr;void* iterator=nullptr;
+        while(auto* candidate=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_methods")(klass,&iterator)) {
+            const auto* text=symbol<const char*(*)(const void*)>("il2cpp_method_get_name")(candidate);unsigned implementation=0;
+            const auto flags=symbol<unsigned(*)(const void*,unsigned*)>("il2cpp_method_get_flags")(candidate,&implementation);
+            if(!text||std::strcmp(text,label)||symbol<unsigned(*)(const void*)>("il2cpp_method_get_param_count")(candidate)||(flags&0x410))continue;
+            auto* type=symbol<const void*(*)(const void*)>("il2cpp_method_get_return_type")(candidate);
+            auto* result=symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(type);
+            if(!result||eflink::unity::Api::valueShape(result).isValue)continue;
+            const auto selected=method(object,label,{},typeName(type).c_str());
+            if(selected.method_info!=candidate||match)throw std::runtime_error("ambiguous native reference getter");match=candidate;resultClass=result;
+        }
+        if(!match)throw std::runtime_error("native reference getter unavailable");
+        BE_ResolvedMethodV1 selected{};selected.method_info=match;auto* result=bridge->call(selected,self(object));
+        if(result&&!symbol<bool(*)(const void*,const void*)>("il2cpp_class_is_assignable_from")(resultClass,symbol<const void*(*)(void*)>("il2cpp_object_get_class")(result)))
+            throw std::runtime_error("native getter reference type differs");return result;
+    }
+    // Find an existing Singleton<T> without running its allocating getter.
+    void* existingSingleton(const void* expected) const {
+        for(auto* current=expected;current;current=symbol<const void*(*)(const void*)>("il2cpp_class_get_parent")(current)) {
+            const void* match=nullptr;void* iterator=nullptr;
+            while(auto* candidate=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_methods")(current,&iterator)) {
+                const auto* text=symbol<const char*(*)(const void*)>("il2cpp_method_get_name")(candidate);unsigned implementation=0;
+                const auto flags=symbol<unsigned(*)(const void*,unsigned*)>("il2cpp_method_get_flags")(candidate,&implementation);
+                if(!text||std::strcmp(text,"get_instanceOrNull")||symbol<unsigned(*)(const void*)>("il2cpp_method_get_param_count")(candidate)||!(flags&0x10)||(flags&0x400))continue;
+                auto* type=symbol<const void*(*)(const void*)>("il2cpp_method_get_return_type")(candidate);
+                auto* declared=symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(type);
+                // Beyond.Singleton<T>.get_instanceOrNull declares the generic
+                // parameter T as its return type (verified against the client
+                // metadata), so il2cpp_class_from_type has no class to return.
+                // Accept that case; the actual instance is still checked with
+                // il2cpp_class_is_assignable_from below. A concrete but wrong
+                // declared type remains a hard rejection.
+                if((declared&&declared!=expected)||
+                   symbol<const void*(*)(const void*)>("il2cpp_method_get_class")(candidate)!=current)continue;
+                if(match)throw std::runtime_error("ambiguous native singleton getter");match=candidate;
+            }
+            if(match) {
+                BE_ResolvedMethodV1 selected{};selected.method_info=match;auto* result=bridge->call(selected);
+                if(result&&!symbol<bool(*)(const void*,const void*)>("il2cpp_class_is_assignable_from")(expected,symbol<const void*(*)(void*)>("il2cpp_object_get_class")(result)))throw std::runtime_error("native singleton instance type differs");return result;
+            }
+        }
+        throw std::runtime_error("non-allocating native singleton getter unavailable");
+    }
     // Let the native collection fill its exact reference array, then use
     // System.Array.GetValue. No array prefix, pointer stride or GC write is used.
     struct RetainedReference {void* object=nullptr;NativePin root;};
-    std::vector<RetainedReference> references(void* collection,const char* element,NativeObjectPins& roots,unsigned maximum=128) const {
+    std::vector<RetainedReference> references(void* collection,const char* element,NativeObjectPins& roots,unsigned maximum=128,bool allowValues=false,bool indexed=false) const {
         const auto n=count(collection);if(n<0||unsigned(n)>maximum)throw std::runtime_error("native reference collection outside bound");
-        const auto copy=method(collection,"CopyTo",{std::string(element)+"[]"},"System.Void");
+        std::vector<std::string> signature{std::string(element)+"[]"};if(indexed)signature.push_back("System.Int32");
+        const auto copy=method(collection,"CopyTo",signature,"System.Void");
         auto* parameter=symbol<const void*(*)(const void*,unsigned)>("il2cpp_method_get_param")(copy.method_info,0);
         auto* arrayClass=symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(parameter);
         if(!arrayClass||symbol<int(*)(const void*)>("il2cpp_class_get_rank")(arrayClass)!=1)throw std::runtime_error("native CopyTo array rank differs");
         auto* elementClass=symbol<const void*(*)(const void*)>("il2cpp_class_get_element_class")(arrayClass);
-        if(!elementClass||eflink::unity::Api::valueShape(elementClass).isValue)throw std::runtime_error("native reference array element differs");
+        if(!elementClass)throw std::runtime_error("native array element unavailable");
+        const auto elementShape=eflink::unity::Api::valueShape(elementClass);
+        if(elementShape.isValue) {if(!allowValues)throw std::runtime_error("native reference array element differs");authority::requireNativeValueShape(elementShape);}
         auto* array=symbol<void*(*)(const void*,std::uintptr_t)>("il2cpp_array_new")(elementClass,std::uintptr_t(n));
         if(!array)throw std::runtime_error("native reference array allocation failed");
         eflink::unity::Api::TemporaryRoot arrayRoot(bridge->raw(),array);
-        bridge->call(copy,self(collection),{array});if(count(collection)!=n)throw std::runtime_error("native reference collection changed during capture");
+        int zero=0;if(indexed)bridge->call(copy,self(collection),{array,&zero});else bridge->call(copy,self(collection),{array});
+        if(count(collection)!=n)throw std::runtime_error("native reference collection changed during capture");
         const auto get=bridge->method("Array","GetValue","System.Int32","System.Object","mscorlib.dll","System");
         std::vector<RetainedReference> out;out.reserve(n);std::set<void*> unique;
         for(int i=0;i<n;++i) {
@@ -123,6 +172,29 @@ public:
             out.push_back({object,roots.retain(reinterpret_cast<std::uintptr_t>(object))});
         }
         return out;
+    }
+    // Infer only the runtime CopyTo array's closed element type. This supports
+    // Dictionary.ValueCollection and boxed PendingInfo snapshots, not arbitrary
+    // enumeration or guessed generic/struct memory layouts.
+    std::vector<RetainedReference> objects(void* collection,NativeObjectPins& roots,unsigned maximum,bool allowValues=false) const {
+        if(!collection)throw std::runtime_error("native collection unavailable");
+        auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(collection);void* iterator=nullptr;std::string element;bool indexed=false;const void* match=nullptr;
+        while(auto* candidate=symbol<const void*(*)(const void*,void**)>("il2cpp_class_get_methods")(klass,&iterator)) {
+            const auto* name=symbol<const char*(*)(const void*)>("il2cpp_method_get_name")(candidate);
+            const auto count=symbol<unsigned(*)(const void*)>("il2cpp_method_get_param_count")(candidate);unsigned implementation=0;
+            if(!name||std::strcmp(name,"CopyTo")||(count!=1&&count!=2)||
+               (symbol<unsigned(*)(const void*,unsigned*)>("il2cpp_method_get_flags")(candidate,&implementation)&0x410)||
+               typeName(symbol<const void*(*)(const void*)>("il2cpp_method_get_return_type")(candidate))!="System.Void")continue;
+            auto* parameter=symbol<const void*(*)(const void*,unsigned)>("il2cpp_method_get_param")(candidate,0);
+            auto* array=symbol<const void*(*)(const void*)>("il2cpp_class_from_type")(parameter);
+            if(!array||symbol<int(*)(const void*)>("il2cpp_class_get_rank")(array)!=1)continue;
+            if(count==2&&typeName(symbol<const void*(*)(const void*,unsigned)>("il2cpp_method_get_param")(candidate,1))!="System.Int32")continue;
+            auto label=typeName(parameter);if(label.size()<3||label.substr(label.size()-2)!="[]")continue;
+            // Prefer the one-argument overload when both exist.
+            if(match&&!indexed&&count==2)continue;if(match&&indexed&&count==1)match=nullptr;
+            if(match)throw std::runtime_error("ambiguous native snapshot CopyTo");match=candidate;element=label.substr(0,label.size()-2);indexed=count==2;
+        }
+        if(!match)throw std::runtime_error("native snapshot CopyTo unavailable");return references(collection,element.c_str(),roots,maximum,allowValues,indexed);
     }
 };
 }

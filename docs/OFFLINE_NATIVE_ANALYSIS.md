@@ -26,3 +26,7 @@ PE 解析要求 Windows x64、唯一映射的原始节范围、与元数据一�
 2026-10-15，本地磁盘文件解析出 58,110 类型、453,234 方法、170 程序集。与已有只读实机记录核对了 461 个方法名/参数数量（其中 354 个完整类型签名可直接解析），无缺失；16 个此前实机读取的方法 RVA 与磁盘解析完全一致。11 项合成文件测试覆盖布局、边界、所有者/参数范围、错误代码指针、重复模块和未知类型。该证据只验证离线索引工具，不证明创建角色、原生执行、官方消息隔离或恢复安全。
 
 本地 metadata SHA256 为 `0076743397acadf03d3b0064343a963c7c88863b8160526d397e4b3efb96f02e`。完整本地分析输出保存在忽略的 `build/cooperation-stage1/ore-reference`；不将游戏二进制、完整游戏元数据或反汇编输出提交到仓库。当前开发 DLL 仍为 `.79`，这次工具改动不改变游戏运行行为。
+
+2026-11-05：磁盘上的客户端已更新，当前 `global-metadata.dat` SHA256 为 `461321d9dca6a832bce3bd2390402efc7c83c145554e97a8058bb68fbec1c8ca`，表头有 33 个表项（此前为 32），工具原先写死「一个扩展表」而报 `extended metadata header differs`。现改为从第一张表的偏移推断扩展表数量：标准布局仍要求恰好 31 张表，扩展布局允许追加表项并拒绝非 8 字节对齐或异常数量。合成文件测试增至 22 项，覆盖双扩展表与错误表头计数。`typeDefinitions` 仍为 92 字节行宽，91,478 个类型、574,771 个方法、172 个程序集全部解析，无类型解析失败。
+
+用修好的工具静态核对了 `NativeEventRegistry` 依赖的原生声明：`Beyond.EventManager` 继承 `Beyond.Singleton<Beyond.EventManager>`；`m_gameEvents` / `m_eventDispatcher` 为 `EventDispatcher<T>`；`EventDispatcher<T>.m_evtBindings` 为字典（含 `_version` 与 `get_Values`）；`EventBinding<T>` 的 `m_handlers` / `m_pendingOperator` / `m_iterCounter`，以及 `EventHandlerInfo.handler` / `PendingInfo.m_delegate`（值类型）全部存在；`System.Delegate` 与 `System.Array` 的目标方法在 `mscorlib.dll` 中。`Beyond.Singleton<T>.get_instanceOrNull` 的声明返回类型是泛型参数 `T`，据此放宽了 `existingSingleton` 对声明返回类的硬检查，保留实际实例的 `il2cpp_class_is_assignable_from` 校验，并补了反向用例。以上全为纯文件声明核对，`abi_verified=false`，不证明运行时封闭泛型解析、委托调用或隔离/恢复正确。

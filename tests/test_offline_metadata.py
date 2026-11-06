@@ -9,8 +9,10 @@ reader = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reader)
 
 
-def fixture(extended=False):
-    names = reader.TABLES + (["unresolved_extended_table"] if extended else [])
+def fixture(extended=False, extra=1):
+    # Client updates append extended tables to the header. Keep one for the
+    # original extended layout and allow more for newer client builds.
+    names = reader.TABLES + ([f"unresolved_extended_table_{i}" for i in range(extra)] if extended else [])
     data = bytearray(8 + len(names) * 8)
     struct.pack_into("<II", data, 0, 0xFAB11BAF, 29)
     strings = bytearray(b"\0")
@@ -104,6 +106,20 @@ class OfflineMetadataTest(unittest.TestCase):
         data = fixture(True)
         metadata = reader.Metadata(data, "endfield29-extended")
         self.assertEqual(metadata.select("Actor")[0]["methods"][0]["name"], "Run")
+        with self.assertRaises(reader.MetadataError):
+            reader.Metadata(data)
+
+    def test_additional_extended_tables_are_inferred(self):
+        data = fixture(True, extra=2)
+        metadata = reader.Metadata(data, "endfield29-extended")
+        self.assertEqual(len(metadata.tables), len(reader.TABLES) + 2)
+        self.assertEqual(metadata.select("Actor")[0]["methods"][0]["name"], "Run")
+        with self.assertRaises(reader.MetadataError):
+            reader.Metadata(data)
+
+    def test_misaligned_table_header_count_is_rejected(self):
+        data = fixture()
+        struct.pack_into("<I", data, 8, 8 + len(reader.TABLES) * 8 + 3)
         with self.assertRaises(reader.MetadataError):
             reader.Metadata(data)
 

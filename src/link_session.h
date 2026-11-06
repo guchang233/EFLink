@@ -6,6 +6,7 @@
 #include "link_world_delta.h"
 #include "link_version.h"
 #include "authority/world_authority.h"
+#include "link_freshness.h"
 #include <optional>
 
 namespace eflink {
@@ -29,8 +30,11 @@ inline bool validRoomRoster(const Json& players,const Json& scene) {
         return true;
     }catch(...) {return false;}
 }
-inline bool validWorld(const Json& w,bool received=false) {
+inline bool validWorld(const Json& source,bool received=false) {
     try {
+        // Optional host dungeon ID (guests follow through the official dungeon entry).
+        if(source.contains("dungeon")&&(!source.at("dungeon").is_string()||source.at("dungeon").get_ref<const std::string&>().size()>64))return false;
+        Json w=source;w.erase("dungeon");
         if(!worldauthority::exactFields(w,received?std::initializer_list<const char*>{"map","level","level_num","position","entities","players"}:
                                        std::initializer_list<const char*>{"map","level","level_num","position","entities"})||
            !w.at("map").is_string()||w.at("map").get_ref<const std::string&>().empty()||w.at("map").get_ref<const std::string&>().size()>64||
@@ -56,14 +60,16 @@ class Session {
     bool shutdownBarrierAvailable=false;
     std::map<std::uint16_t,std::uint64_t> nativeMembers;Json nativeGrant;std::uint64_t nativeRequest=0;
     std::string worldIncarnation;
-    std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0,authoritySeen=0;bool authoritySent=false;
+    std::uint64_t sentAuthorityRevision=0,lastAuthorityPublish=0,lastAuthorityBaseline=0;bool authoritySent=false;
+    AuthorityFreshness freshness; // the one freshness state every gate reads
+    std::string baselineReason;   // why the guest last had to wait for a full baseline (diagnostics)
     std::uint64_t authoritySequence=0,receivedAuthoritySequence=0;
     std::uint64_t authorityBaselines=0,authorityDeltas=0,authorityHeartbeats=0,authorityBytes=0;
     void resetSharedObjects() {
         nativeHandoff.withdraw();
         nativeMembers.clear();nativeGrant=nullptr;nativeRequest=0;
-        nativeAuthority.reset();nativeReplica.reset();sentAuthorityRevision=lastAuthorityPublish=lastAuthorityBaseline=authoritySeen=0;authoritySent=false;
-        authoritySequence=receivedAuthoritySequence=0;
+        nativeAuthority.reset();nativeReplica.reset();sentAuthorityRevision=lastAuthorityPublish=lastAuthorityBaseline=0;authoritySent=false;freshness.reset();
+        authoritySequence=receivedAuthoritySequence=0;baselineReason.clear();
     }
     bool adapterReady() const {
         return shutdownBarrierAvailable&&nativeAdapter&&!adapterVersion.empty()&&nativeAdapter->gameVersion()==adapterVersion&&
@@ -158,12 +164,16 @@ public:
                        !heartbeat.at("revision").is_number_unsigned()||nativeReplica.needsBaseline()) {++rejected;continue;}
                     const auto reported=heartbeat.at("revision").get<std::uint64_t>();
                     if(reported!=nativeReplica.version()) {
-                        if(reported>nativeReplica.version()) {nativeReplica.requireBaseline();nativeHandoff.withdraw();}
+                        if(reported>nativeReplica.version()) {nativeReplica.requireBaseline();nativeHandoff.withdraw();baselineReason="heartbeat_ahead";}
                         ++rejected;continue;
                     }
                 }else if(!expected.valid()||(kind=="authority_baseline"?!nativeReplica.baseline(b.at("baseline"),expected,true):
-                    worldauthority::Scope::parse(b.at("delta").at("scope"))!=expected||!nativeReplica.delta(b.at("delta"),true))) {++rejected;continue;}
-                receivedAuthoritySequence=b.at("seq").get<std::uint64_t>();authoritySeen=nowMs();
+                    worldauthority::Scope::parse(b.at("delta").at("scope"))!=expected||!nativeReplica.delta(b.at("delta"),true))) {
+                    if(kind=="authority_delta"&&nativeReplica.needsBaseline()&&baselineReason.empty())baselineReason="delta_gap";
+                    ++rejected;continue;
+                }
+                receivedAuthoritySequence=b.at("seq").get<std::uint64_t>();
+                if(kind=="authority_baseline") {freshness.baseline(nowMs());baselineReason.clear();}else freshness.update(nowMs());
             }else if(kind=="authority_grant") {
                 if(b.size()!=4||role!=Role::Client||packet.from!=proto::kHostId||!protocolCompatible(proto::kHostId)||!ready()||!localSceneOperational()||!nativeAdapter) {++rejected;continue;}
                 const auto& grant=b.at("grant");
@@ -176,7 +186,7 @@ public:
             }else if(kind=="world_intent") {
                 if(b.size()!=4||role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!protocolCompatible(packet.from)||!nativeAdapter||!nativeMembers.contains(packet.from)||
                    !nativeMemberPresent(s,packet.from)||
-                   !authoritySeen||nowMs()-authoritySeen>1500||!nativeAuthority.resume(*nativeAdapter)||!nativeAuthority.submit(b.at("intent"),packet.from,*nativeAdapter,nowMs()))++rejected;
+                   !freshness.open(nowMs())||!nativeAuthority.resume(*nativeAdapter)||!nativeAuthority.submit(b.at("intent"),packet.from,*nativeAdapter,nowMs()))++rejected;
             }else ++rejected;
         }catch(...) {++rejected;}
         updateNativeAuthority(net,s);
@@ -207,14 +217,14 @@ public:
     void requestTeleport(Net&,std::uint16_t) {throw std::runtime_error("共享世界传送原生隔离与恢复适配未验收");}
     bool observeNativeObjects(const std::string& kind,const std::vector<worldauthority::Observation>& values) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
-        nativeAuthority.observe(kind,values);authoritySeen=nowMs();return true;
+        nativeAuthority.observe(kind,values);freshness.baseline(nowMs());return true;
     }
     bool observeNativeFrame(const std::map<std::string,std::vector<worldauthority::Observation>>& frame) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat)return false;
-        nativeAuthority.observeFrame(frame);authoritySeen=nowMs();return true;
+        nativeAuthority.observeFrame(frame);freshness.baseline(nowMs());return true;
     }
     bool publishAuthority(Net& net,bool force=false) {
-        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return false;
+        if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!freshness.current(nowMs()))return false;
         if(!force&&(nowMs()-lastAuthorityPublish<50||net.transmitPressure()>64u*1024))return false;
         if(authoritySequence==UINT64_MAX) {nativeAuthority.suspend();error="authority packet sequence exhausted";return false;}
         Json message={{"map",world.at("map")},{"level",world.at("level")},{"seq",++authoritySequence}};
@@ -234,7 +244,8 @@ public:
         authoritySent=true;sentAuthorityRevision=nativeRevision;lastAuthorityPublish=nowMs();if(full)lastAuthorityBaseline=nowMs();return true;
     }
     Json sharedObjects() const {
-        if(!ready()||!localSceneOperational()||!followHost||!combat||!authoritySeen||nowMs()-authoritySeen>1500)return Json::array();
+        // A short stall keeps the applied picture; a desync or missing baseline clears it.
+        if(!ready()||!localSceneOperational()||!followHost||!combat||!freshness.live(nowMs())||(role==Role::Client&&nativeReplica.needsBaseline()))return Json::array();
         return role==Role::Host?nativeAuthority.baseline().at("objects"):nativeReplica.snapshot();
     }
     Json authorityBaseline() const {return nativeAuthority.baseline();}
@@ -268,7 +279,7 @@ public:
     }
     bool grantNativeParty(Net& net,std::uint16_t peer,std::uint64_t member,std::vector<worldauthority::Ref> actors) {
         if(role!=Role::Host||!ready()||!localSceneOperational()||!followHost||!combat||!adapterReady()||
-           !authoritySeen||nowMs()-authoritySeen>1500||!nativeMemberPresent(net.snapshot(),peer)||
+           !freshness.open(nowMs())||!nativeMemberPresent(net.snapshot(),peer)||
            !nativeAuthority.resume(*nativeAdapter))return false;
         for(const auto actor:actors) {
             const auto* object=nativeAuthority.find(actor);if(!object||object->kind!="player")return false;
@@ -303,7 +314,7 @@ public:
         }
         if(role!=Role::Client||!ready()||!localSceneOperational()||!followHost||!combat||!nativeAdapter||
            !protocolCompatible(proto::kHostId)||nativeGrant.is_null()||!nativeHandoff.roomOperationAllowed(scope)||
-           !authoritySeen||nowMs()-authoritySeen>1500||nativeReplica.needsBaseline()||nativeRequest==UINT64_MAX)return false;
+           !freshness.open(nowMs())||nativeReplica.needsBaseline()||nativeRequest==UINT64_MAX)return false;
         if(nativeGrant.at("scope")!=scope.json()||std::find(nativeGrant.at("actors").begin(),nativeGrant.at("actors").end(),actor.json())==nativeGrant.at("actors").end())return false;
         const auto objects=nativeReplica.snapshot();const Json* found=nullptr;bool actorLive=false;
         for(const auto& object:objects) {
@@ -318,16 +329,22 @@ public:
     }
 private:
     void updateNativeAuthority(Net& net,const Snapshot& s) {
-        const bool fresh=ready()&&localSceneOperational()&&followHost&&combat&&authoritySeen&&nowMs()-authoritySeen<=1500;
+        const auto now=nowMs();
+        const bool scene=ready()&&localSceneOperational()&&followHost&&combat;
+        const auto state=freshness.state(now);
+        const bool lost=state==AuthorityFreshness::State::Unseen||state==AuthorityFreshness::State::Desynced;
         if(role==Role::Host) {
             for(auto it=nativeMembers.begin();it!=nativeMembers.end();) {
                 if(!nativeMemberPresent(s,it->first)) {nativeAuthority.revoke(it->first);it=nativeMembers.erase(it);}else ++it;
             }
-            if(!fresh||!adapterReady()||!nativeAuthority.resume(*nativeAdapter)) {nativeAuthority.suspend();return;}
-            nativeAuthority.poll(nowMs());publishAuthority(net);
+            // Stalled: tickets stay, nothing new is admitted and nothing stale is published.
+            if(!scene||lost||!adapterReady()||!nativeAuthority.resume(*nativeAdapter)) {nativeAuthority.suspend();return;}
+            nativeAuthority.poll(now);publishAuthority(net);
         }else if(role==Role::Client) {
             const worldauthority::Scope scope{room,worldIncarnation,epoch};
-            if(!fresh||!adapterReady()||!protocolCompatible(proto::kHostId)||nativeReplica.needsBaseline())nativeHandoff.withdraw();
+            if(state==AuthorityFreshness::State::Desynced) {if(!nativeReplica.needsBaseline())baselineReason="desync";nativeReplica.requireBaseline();}
+            if(!scene||lost||!adapterReady()||!protocolCompatible(proto::kHostId)||nativeReplica.needsBaseline())nativeHandoff.withdraw();
+            else if(state==AuthorityFreshness::State::Stalled) {} // keep the room as applied, admit nothing new
             else {
                 if(nativeHandoff.phase()==worldauthority::WorldHandoff::Phase::Personal)nativeHandoff.begin(scope,*nativeAdapter,adapterVersion);
                 nativeHandoff.admit(nativeReplica,adapterVersion);
@@ -349,12 +366,12 @@ public:
     }
     void setLocalSceneReady(bool value) {
         if(localSceneReady==value)return;localSceneReady=value;
-        if(!value) {nativeAuthority.suspend();nativeReplica.reset();authoritySeen=0;authoritySent=false;nativeHandoff.withdraw();}
+        if(!value) {nativeAuthority.suspend();nativeReplica.reset();freshness.reset();authoritySent=false;nativeHandoff.withdraw();}
     }
     bool localSceneOperational() const {return localSceneReady;}
     void invalidateNativeScene() {setLocalSceneReady(false);if(role==Role::Host&&!world.empty())sceneResetPending=true;}
     bool canAct(std::uint16_t id) const {
-        if(!ready()||publishBlocked||!localSceneReady||!followHost||!combat||!adapterReady()||!authoritySeen||nowMs()-authoritySeen>1500)return false;
+        if(!ready()||publishBlocked||!localSceneReady||!followHost||!combat||!adapterReady()||!freshness.open(nowMs()))return false;
         if(role==Role::Client)return (id==0||id==localPeer)&&protocolCompatible(proto::kHostId)&&!nativeGrant.is_null()&&!nativeReplica.needsBaseline()&&
             nativeHandoff.roomOperationAllowed({room,worldIncarnation,epoch});
         return role==Role::Host&&nativeMembers.contains(id)&&(id==localPeer||protocolCompatible(id));
@@ -384,7 +401,10 @@ public:
             {"player_casts",{{"accepted",0},{"active",Json::array()},{"legacy_removed",true},{"replay_enabled",false}}},
             {"hit_claims",{{"accepted",0},{"legacy_removed",true},{"legacy_packets_rejected",legacyRejected},{"native_verification_required",true}}},
             {"world_authority",{{"host",nativeAuthority.status()},{"observed",sharedObjects().size()},{"replica_revision",nativeReplica.version()},{"handoff",nativeHandoff.status()},
-                {"baseline_required",nativeReplica.needsBaseline()},{"age_ms",authoritySeen?nowMs()-authoritySeen:0},
+                {"baseline_required",nativeReplica.needsBaseline()},{"baseline_reason",baselineReason},
+                {"scope",{{"room",room},{"world",worldIncarnation},{"epoch",epoch}}},
+                {"grant",nativeGrant.is_null()?Json(nullptr):Json{{"member",nativeGrant.at("member")},{"actors",nativeGrant.at("actors").size()}}},
+                {"members",nativeMembers.size()},{"age_ms",freshness.age(nowMs())},{"freshness",AuthorityFreshness::name(freshness.state(nowMs()))},
                 {"host_shutdown_barrier",shutdownBarrierAvailable},{"operation_adapter_verified",adapterReady()},
                 {"transport",{{"baselines_sent",authorityBaselines},{"deltas_sent",authorityDeltas},{"heartbeats_sent",authorityHeartbeats},
                     {"bytes_sent",authorityBytes},{"last_sent_sequence",authoritySequence},{"last_received_sequence",receivedAuthoritySequence}}},

@@ -11,6 +11,8 @@
   "default_configuration": {
     "player_name": "",
     "gui_enabled": true,
+    "window_menu": true,
+    "overlay_mode": true,
     "menu_key": 187,
     "show_remote_players": true,
     "show_player_markers": true,

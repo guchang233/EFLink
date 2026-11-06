@@ -20,6 +20,9 @@
 
 namespace eflink::worldauthority {
 using Json=nlohmann::json;
+// How long a pending native witness may sit before the next census. This hold
+// is independent of session authority freshness and is not driven by that state.
+inline constexpr std::uint64_t kWitnessCensusHoldMs=1500;
 inline bool positive(const Json& v) {
     return (v.is_number_unsigned()&&v.get<std::uint64_t>()>0)||
         (v.is_number_integer()&&!v.is_number_unsigned()&&v.get<std::int64_t>()>0);
@@ -529,8 +532,8 @@ public:
             // Making room can retire this very old action. Consuming its new
             // request identity must never dispatch it across that boundary.
             if(commandRetired(intent)) {++rejected;return {};}
-            if(now>UINT64_MAX-1500) {++rejected;return {};}
-            pending.emplace(ticket.serial,Pending{ticket,&adapter,now+1500});
+            if(now>UINT64_MAX-kWitnessCensusHoldMs) {++rejected;return {};}
+            pending.emplace(ticket.serial,Pending{ticket,&adapter,now+kWitnessCensusHoldMs});
             NativeDispatchPermit permit(ticket,&adapter,[this,&ticket,&adapter] {
                 if(!pending.contains(ticket.serial)||!usable(ticket.intent)||adapter.gameVersion()!=gameVersion_||adapter.path()!=ticket.path||
                    !adapter.executionVerified()||!adapter.isolationVerified()||!adapter.recoveryVerified()||!adapter.dualClientVerified())return false;

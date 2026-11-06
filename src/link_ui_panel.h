@@ -630,6 +630,10 @@ struct UiPanel {
         const auto& game=uid::objectAt(state,"game");
         const auto& native=replication();
         ui::keyValue("游戏接入","%s",uid::boolAt(state,"hook_ready",false)?"已连接":"等待终末地场景");
+        ui::keyValue("游戏版本","%s%s",uid::stringAt(state,"game_version","未知").c_str(),
+            uid::boolAt(state,"build_verified",false)?"":"（未验证）");
+        if(!uid::boolAt(state,"build_verified",true))
+            ui::notice(ui::Tone::Warning,"当前游戏版本未经原生适配验证：菜单与联机可用，原生世界同步停用。");
         ui::keyValue("世界状态","%s  /  地图版本 %llu",uid::boolAt(session,"ready",false)?"已收到":"等待房主",
             static_cast<unsigned long long>(uid::serialAt(session,"epoch",0)));
         ui::keyValue("房主世界","%s",uid::boolAt(entry(),"active",false)?"已完成入场":"接管未完成");
@@ -639,6 +643,17 @@ struct UiPanel {
         ui::keyValue("当前阶段","%s",uid::stringAt(entry(),"phase","offline").c_str());
         ui::keyValue("敌人","已匹配 %u  /  缺失 %u",uid::uintAt(native,"matched",0),uid::uintAt(native,"missing",0));
         ui::keyValue("传送状态","%s",uid::stringAt(native,"teleport","idle").c_str());
+        {
+            // Leaves any room, then this account's own official hub teleport to Valley IV.
+            const auto& official=uid::objectAt(uid::objectAt(native,"travel"),"official");
+            if(ui::secondaryButton("紧急返回四号谷地",{0,ui::px(30)}))call({{"action","emergency_home"}});
+            if(uid::stringAt(official,"purpose")=="emergency_home") {
+                const auto failure=uid::stringAt(official,"error");
+                ImGui::SameLine();
+                if(!failure.empty())ImGui::TextColored({1,.45f,.4f,1},"失败：%s",failure.c_str());
+                else ImGui::TextDisabled("%s",uid::stringAt(official,"state")=="queued"?"等待离开房间…":"已请求官方传送");
+            }
+        }
         const auto mapName=uid::stringAt(game,"map_id");
         ui::keyValue("本机地图","%s",mapName.empty()?"读取中":mapName.c_str());
         ui::keyValue("骨骼节点","%d",uid::intAt(game,"local_bones",0));

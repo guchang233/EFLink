@@ -4,7 +4,11 @@
 namespace eflink::worldauthority {
 // This allowlist proves the read-only metadata/census signatures only. It does
 // not certify any shared gameplay, official packet apply or account restoration.
-inline bool readOnlyBuildSupported(const std::string& version) {return version=="1.5.3";}
+// 1.6.3: offline metadata check on 2026-11-05 found every method the adapters call
+// (95) and every field they read except FacMarkInstRuntimeData.isTpRelated, which
+// was renamed to isTravelRelated and is handled. Runtime resolution still fails
+// closed per method; certificates (execution/isolation/recovery) stay false.
+inline bool readOnlyBuildSupported(const std::string& version) {return version=="1.5.3"||version=="1.6.3";}
 inline std::string nativeGameVersion(const BE_HostApiV1* api) {
     if(!api)throw std::runtime_error("native runtime unavailable");
     eflink::unity::Api bridge;bridge.bind(api);
