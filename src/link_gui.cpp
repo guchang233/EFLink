@@ -114,6 +114,9 @@ struct Ui {
     bool nameEdited=false; // the display name field was edited by the player
     // Chat on the HUD: recent lines stay for a while; Enter opens a one-line input.
     bool chatting=false,chatFocus=false,chatPrimed=false;char hudChat[1001]{};std::map<std::uint64_t,std::uint64_t> chatSeen;
+    // PVP duel invitations: a key to invite / answer, and a popup that can be clicked.
+    int pvpKey=VK_F7;std::uint64_t pvpNoticeSeen=0;bool pvpNoticePrimed=false;
+    bool popupShown=false;ImVec2 popupMin{},popupMax{};
     void say(std::string text,bool error) {toast=std::move(text);toastAt=now();toastError=error;}
     void act(json input) {const auto a=str(input,"action");actions.push_back({post(input),a,now()});}
     void init() {
@@ -122,12 +125,16 @@ struct Ui {
         const auto c=state.value("configuration",json::object());copyText(room,sizeof room,str(c,"room_name"));
         port=c.value("port",47615);limit=c.value("max_players",8);key=c.value("menu_key",kDefaultMenuKey);
         remote=c.value("show_remote_players",true);squad=c.value("show_remote_squad",true);replay=c.value("replay_skills",true);outline=c.value("outline_teammates",true);pvp=c.value("room_pvp",false);pvpScale=c.value("room_pvp_scale",1.f);pvpRevive=c.value("room_pvp_revive",true);markers=c.value("show_player_markers",true);
-        follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);
+        follow=c.value("follow_host_world",true);combat=c.value("sync_combat",true);pvpKey=c.value("pvp_key",int(VK_F7));
     }
     void poll(bool menuOpen) {
         const auto t=now();
         if(ready(statusCall)) {auto r=statusCall.get();if(r.contains("role")) {state=std::move(r);init();key=state.value("configuration",json::object()).value("menu_key",key);
-            if(!nameEdited) copyText(name,sizeof name,str(state,"name"));}}
+            if(!nameEdited) copyText(name,sizeof name,str(state,"name"));
+            // Duel messages (invited, accepted, declined, ended) appear as a toast.
+            const auto p=state.value("pvp",json::object());const auto serial=p.value("notice_serial",std::uint64_t(0));
+            if(pvpNoticePrimed&&serial!=pvpNoticeSeen&&!str(p,"notice").empty()) say("［PVP］"+str(p,"notice"),false);
+            pvpNoticeSeen=serial;pvpNoticePrimed=true;}}
         else if(statusCall.valid()&&t-statusSent>5000) statusCall={}; // the game thread was busy (loading); ask again
         if(!statusCall.valid()&&t-statusSent>=(menuOpen?250u:500u)) {statusSent=t;statusCall=post({{"action","status"}});}
         if(ready(hudCall)) {auto r=hudCall.get();if(r.contains("markers")) hud=std::move(r);}
@@ -147,7 +154,7 @@ struct Ui {
     bool online() const {const auto r=role();return r=="host"||r=="client";}
     void saveSettings() {
         json patch={{"room_name",room},{"port",port},{"max_players",limit},{"menu_key",key},
-            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"outline_teammates",outline},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat}};
+            {"show_remote_players",remote},{"show_remote_squad",squad},{"replay_skills",replay},{"outline_teammates",outline},{"show_player_markers",markers},{"follow_host_world",follow},{"sync_combat",combat},{"pvp_key",pvpKey}};
         if(nameEdited) {patch["player_name"]=name;nameEdited=false;}
         act({{"action","settings"},{"configuration",patch}});
         say("设置已保存",false);
@@ -212,6 +219,7 @@ struct Ui {
             d->AddRectFilled(p,{p.x+ts.x+32,p.y+ts.y+18},color::u32(color::base,.9f),6);
             d->AddText({p.x+16,p.y+9},color::u32(toastError?color::bad:color::accent),toast.c_str());ImGui::PopFont();
         }
+        drawDuelInvite(size);
         const auto change=state.value("game",json::object()).value("world_replication",json::object()).value("host_map_change",json::object());
         if(!open&&role()=="client"&&change.value("pending",false)) {
             ImGui::PushFont(fonts.body);const std::string text="房主已前往 "+str(change,"level")+"，按菜单键选择是否跟随";
@@ -220,6 +228,40 @@ struct Ui {
             d->AddRect(p,{p.x+ts.x+32,p.y+ts.y+18},color::u32(color::accent,.8f),6);
             d->AddText({p.x+16,p.y+9},color::u32(color::accent),text.c_str());ImGui::PopFont();
         }
+    }
+    static const char* fKeyName(int vk) {
+        static const char* names[]={"F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};
+        return vk>=VK_F1&&vk<=VK_F12?names[vk-VK_F1]:"?";
+    }
+    // An invitation slides in at the top: click Accept / Decline (with the mouse
+    // cursor shown, e.g. holding Alt), or press the PVP key to accept.
+    void drawDuelInvite(ImVec2 size) {
+        popupShown=false;
+        if(open||!online()) return;
+        const auto invites=state.value("pvp",json::object()).value("invites",json::array());
+        if(invites.empty()) return;
+        const auto& invite=invites.back();const int from=invite.value("id",0);
+        const float age=float(invite.value("age_ms",std::uint64_t(0)));
+        const float slide=(std::clamp)(age/250.f,0.f,1.f),ease=1.f-(1.f-slide)*(1.f-slide);
+        const float left=(std::clamp)(30000.f-age,0.f,30000.f)/1000.f;
+        const float width=(std::min)(460.f,size.x-40);
+        ImGui::SetNextWindowPos({size.x*.5f-width*.5f,-80.f+ease*(80.f+size.y*.12f)});
+        ImGui::SetNextWindowSize({width,0});ImGui::SetNextWindowBgAlpha(.92f);
+        ImGui::PushStyleColor(ImGuiCol_Border,color::accent);ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize,1.5f);
+        if(ImGui::Begin("##duelinvite",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoFocusOnAppearing)) {
+            ImGui::PushFont(fonts.body);
+            ImGui::TextColored(color::accent,"PVP 邀请");ImGui::SameLine();ImGui::TextDisabled("%.0f 秒",left);
+            ImGui::TextWrapped("%s 邀请你进行 PVP 对战。同意后你们可以互相锁定和攻击，任何一方都可以随时结束。",str(invite,"name").c_str());
+            ImGui::Spacing();
+            const float button=(ImGui::GetContentRegionAvail().x-ImGui::GetStyle().ItemSpacing.x)*.5f;
+            const std::string accept=std::string("同意（")+fKeyName(pvpKey)+"）";
+            if(ImGui::Button(accept.c_str(),{button,0})) act({{"action","pvp_duel"},{"op","accept"},{"target",from}});
+            ImGui::SameLine();
+            if(ImGui::Button("拒绝",{button,0})) act({{"action","pvp_duel"},{"op","decline"},{"target",from}});
+            ImGui::PopFont();
+            popupMin=ImGui::GetWindowPos();popupMax={popupMin.x+ImGui::GetWindowSize().x,popupMin.y+ImGui::GetWindowSize().y};popupShown=true;
+        }
+        ImGui::End();ImGui::PopStyleVar();ImGui::PopStyleColor();
     }
     void drawChat(ImVec2 size) {
         const auto lines=state.value("chat",json::array());const auto t=now();
@@ -283,6 +325,8 @@ struct Ui {
             d->AddText({x+3,y},ink,idText);
             std::string who=str(peer,"name");if(host) who+="  房主";
             shadowText(d,{x+is.x+14,y},valid?white:dim,who.c_str());
+            bool dueling=false;for(const auto& duel:state.value("pvp",json::object()).value("duels",json::array())) if(duel.value("id",-1)==id) dueling=true;
+            if(dueling) {const auto ws=ImGui::CalcTextSize(who.c_str());shadowText(d,{x+is.x+14+ws.x+8,y},color::u32(color::bad),"PVP");}
             char right[24];
             if(self) std::snprintf(right,sizeof right,"你");
             else if(auto it=distances.find(id);it!=distances.end()) std::snprintf(right,sizeof right,"%.0fm",it->second);
@@ -405,6 +449,7 @@ struct Ui {
             ImGui::Spacing();ImGui::SeparatorText("PVP");
             bool roomPvp=pvpState.value("allowed",false);
             if(ImGui::Checkbox("允许 PVP（玩家之间可以互相锁定、攻击）",&roomPvp)) act({{"action","room_pvp"},{"enabled",roomPvp}});
+            ImGui::PushFont(fonts.note);label((std::string("允许后，玩家按 ")+fKeyName(pvpKey)+" 向最近的玩家发起 PVP 邀请，对方同意后两人才能互相攻击。").c_str());ImGui::PopFont();
             ImGui::BeginDisabled(!roomPvp);
             label("玩家之间的伤害倍率");ImGui::SetNextItemWidth(260);
             if(!ImGui::IsAnyItemActive()) pvpScale=float(pvpState.value("scale",1.0));
@@ -511,6 +556,9 @@ struct Ui {
         label("显示名称（默认使用游戏昵称，修改后以你填写的为准）");ImGui::SetNextItemWidth(320);if(ImGui::InputText("##name",name,sizeof name)) nameEdited=true;
         const char* keys[]={"=","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"};int index=key==VK_OEM_PLUS?0:key-VK_F1+1;
         label("菜单快捷键");ImGui::SetNextItemWidth(160);if(ImGui::Combo("##key",&index,keys,13)) key=index==0?VK_OEM_PLUS:VK_F1+index-1;
+        int pvpIndex=(std::clamp)(pvpKey-VK_F1,0,11);
+        label("PVP 邀请键（向最近的玩家发起邀请；再按一次结束对战；收到邀请时按下即同意）");ImGui::SetNextItemWidth(160);
+        if(ImGui::Combo("##pvpkey",&pvpIndex,keys+1,12)) pvpKey=VK_F1+pvpIndex;
         endCard();
         beginCard("##display","显示",fonts.title);
         bool changed=ImGui::Checkbox("显示其他玩家的角色",&remote);
@@ -740,7 +788,7 @@ void Gui::runOverlay(json) {
         Ui ui;ui.fonts=loadFonts(scale);applyTheme(scale);
         ImGui_ImplWin32_Init(surface.window);ImGui_ImplDX11_Init(surface.device.Get(),surface.context.Get());
         ui.post=[this](const json& input){return post(input);};
-        overlayReady=true;bool keyDown=false,enterDown=false;
+        overlayReady=true;bool keyDown=false,enterDown=false,pvpKeyDown=false;
         while(!stopping&&IsWindow(game)) {
             MSG message;while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {TranslateMessage(&message);DispatchMessageW(&message);}
             const bool minimized=IsIconic(game)||!IsWindowVisible(game);
@@ -752,16 +800,28 @@ void Gui::runOverlay(json) {
             if(openRequested.exchange(false)) ui.open=true;
             if(ui.closeRequested) {ui.open=false;ui.closeRequested=false;}
             // Enter in the game (menu closed, in a room) opens the HUD chat input.
+            const bool pvpDown=(GetAsyncKeyState(ui.pvpKey)&0x8000)!=0;
+            if(pvpDown&&!pvpKeyDown&&foreground==game&&!ui.open&&!ui.chatting&&ui.online()) ui.act({{"action","pvp_key"}});
+            pvpKeyDown=pvpDown;
             const bool enter=(GetAsyncKeyState(VK_RETURN)&0x8000)!=0;
             if(enter&&!enterDown&&foreground==game&&!ui.open&&!ui.chatting&&ui.online()) {ui.chatting=true;ui.chatFocus=true;}
             enterDown=enter;
             if(ui.open) ui.chatting=false;
             if(minimized||!focused) {ui.open=false;ui.chatting=false;}
             const bool wantInput=ui.open||ui.chatting;
+            // The invitation popup takes clicks only while the game shows its cursor
+            // over it, without taking the keyboard from the game.
+            bool overPopup=false;
+            if(ui.popupShown&&!wantInput) {
+                CURSORINFO cursor{sizeof cursor};POINT p{};
+                if(GetCursorInfo(&cursor)&&(cursor.flags&CURSOR_SHOWING)&&GetCursorPos(&p)) {
+                    ScreenToClient(game,&p);overPopup=p.x>=ui.popupMin.x&&p.x<=ui.popupMax.x&&p.y>=ui.popupMin.y&&p.y<=ui.popupMax.y;
+                }
+            }
             const bool wasInteractive=surface.interactive;
-            surface.setInteractive(wantInput);
+            surface.setInteractive(wantInput||overPopup);
             if(wantInput&&!wasInteractive) SetForegroundWindow(surface.window);
-            if(!wantInput&&wasInteractive&&GetForegroundWindow()==surface.window) SetForegroundWindow(game);
+            if(!wantInput&&!overPopup&&wasInteractive&&GetForegroundWindow()==surface.window) SetForegroundWindow(game);
             menuVisible=ui.open;
             if(minimized) {surface.show(false);ui.poll(false);std::this_thread::sleep_for(std::chrono::milliseconds(100));continue;}
             RECT area{};GetClientRect(game,&area);POINT at{0,0};ClientToScreen(game,&at);

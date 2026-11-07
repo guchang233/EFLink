@@ -59,6 +59,74 @@ class Session {
     std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> hitBudgets;std::uint64_t hitSequence=0,hitsAccepted=0;
     std::uint64_t lastGrowthPublish=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
+    // ---- PVP duels: two players must agree before they can hurt each other ----
+    // The host relays invitations, keeps the agreed pairs and accepts PVP hits only
+    // between them. Every player keeps the set of players it duels with.
+    std::uint16_t self=0;
+    std::set<std::pair<std::uint16_t,std::uint16_t>> duelPairs;                       // host
+    std::map<std::pair<std::uint16_t,std::uint16_t>,std::uint64_t> duelPending;        // host: (inviter,invitee) -> issued
+    std::map<std::uint16_t,std::pair<std::uint64_t,int>> duelBudgets;                   // host
+    static constexpr std::uint64_t kDuelInviteMs=30000;
+    static std::pair<std::uint16_t,std::uint16_t> duelPair(std::uint16_t a,std::uint16_t b) {return a<b?std::make_pair(a,b):std::make_pair(b,a);}
+    std::string nameOf(const Snapshot& s,std::uint16_t id) const {
+        const auto* p=find(s,id);return p&&p->hasInfo&&!p->info.name.empty()?p->info.name:"玩家 "+std::to_string(id);
+    }
+    void duelNote(std::string text) {duelNotice=std::move(text);++duelNoticeSerial;}
+    // Host: tell one player (itself included) what happened.
+    void duelEvent(Net& net,const Snapshot& s,std::uint16_t to,const std::string& op,std::uint16_t origin) {
+        if(to==s.localId) {applyDuelEvent(s,op,origin);return;}
+        send(net,{{"kind","pvp_duel_event"},{"op",op},{"origin",origin}},to);
+    }
+    void applyDuelEvent(const Snapshot& s,const std::string& op,std::uint16_t origin) {
+        const auto who=nameOf(s,origin);
+        if(op=="invited") {duelInvites[origin]=nowMs();duelNote(who+" 邀请你进行 PVP 对战");}
+        else if(op=="started") {duels.insert(origin);duelInvites.erase(origin);duelNote("与 "+who+" 的 PVP 对战开始");}
+        else if(op=="declined") duelNote(who+" 拒绝了你的 PVP 邀请");
+        else if(op=="expired") {if(duelInvites.erase(origin))duelNote("来自 "+who+" 的 PVP 邀请已过期");else duelNote(who+" 没有回应你的 PVP 邀请");}
+        else if(op=="ended") {if(duels.erase(origin))duelNote("与 "+who+" 的 PVP 对战已结束");duelInvites.erase(origin);}
+        else if(op=="sent") duelNote("已向 "+who+" 发出 PVP 邀请");
+        else if(op=="unavailable") duelNote("房主没有允许 PVP");
+    }
+    void hostDuel(Net& net,const Snapshot& s,std::uint16_t from,const std::string& op,std::uint16_t target) {
+        if(target==from||!find(s,target)||!find(s,from)) return;
+        const auto pair=duelPair(from,target);
+        if(op=="invite") {
+            if(!pvp) {duelEvent(net,s,from,"unavailable",target);return;}
+            if(duelPairs.contains(pair)) return;
+            // Two crossed invitations are an agreement.
+            if(duelPending.erase({target,from})) {duelPairs.insert(pair);duelEvent(net,s,from,"started",target);duelEvent(net,s,target,"started",from);return;}
+            if(duelPending.contains({from,target})) return; // already waiting for an answer
+            duelPending[{from,target}]=nowMs();
+            duelEvent(net,s,target,"invited",from);duelEvent(net,s,from,"sent",target);
+        } else if(op=="accept") {
+            if(!pvp||!duelPending.erase({target,from})) return;
+            duelPairs.insert(pair);duelEvent(net,s,from,"started",target);duelEvent(net,s,target,"started",from);
+        } else if(op=="decline") {
+            if(duelPending.erase({target,from})) duelEvent(net,s,target,"declined",from);
+        } else if(op=="end") {
+            if(duelPairs.erase(pair)) {duelEvent(net,s,from,"ended",target);duelEvent(net,s,target,"ended",from);}
+        }
+    }
+    void maintainDuels(Net& net,const Snapshot& s) {
+        if(role==Role::Host) {
+            for(auto it=duelPairs.begin();it!=duelPairs.end();) {
+                const bool a=find(s,it->first)!=nullptr,b=find(s,it->second)!=nullptr;
+                if(pvp&&a&&b) {++it;continue;}
+                if(a)duelEvent(net,s,it->first,"ended",it->second);
+                if(b)duelEvent(net,s,it->second,"ended",it->first);
+                it=duelPairs.erase(it);
+            }
+            for(auto it=duelPending.begin();it!=duelPending.end();) {
+                const bool a=find(s,it->first.first)!=nullptr,b=find(s,it->first.second)!=nullptr;
+                if(pvp&&a&&b&&nowMs()-it->second<kDuelInviteMs) {++it;continue;}
+                if(a)duelEvent(net,s,it->first.first,"expired",it->first.second);
+                if(b)duelEvent(net,s,it->first.second,"expired",it->first.first);
+                it=duelPending.erase(it);
+            }
+        }
+        for(auto it=duels.begin();it!=duels.end();) it=find(s,*it)?std::next(it):duels.erase(it);
+        for(auto it=duelInvites.begin();it!=duelInvites.end();) it=find(s,it->first)&&nowMs()-it->second<kDuelInviteMs+5000?std::next(it):duelInvites.erase(it);
+    }
     bool send(Net& net,Json body,std::uint16_t to=proto::kEveryone) {
         body["schema"]=2;body["room"]=room;
         const auto text=body.dump();if(text.size()>proto::kMaxReliableData) {error="世界快照超过网络上限";return false;}
@@ -98,6 +166,20 @@ class Session {
 public:
     bool followHost=true,combat=true;
     bool pvp=false; // host: the room allows players to hurt each other (set by the game adapter)
+    std::set<std::uint16_t> duels;                       // players this one is in a PVP duel with
+    std::map<std::uint16_t,std::uint64_t> duelInvites;   // pending invitations to this player (inviter -> received)
+    std::string duelNotice;std::uint64_t duelNoticeSerial=0;
+    // invite / accept / decline / end a duel with `target`.
+    void duelAction(Net& net,const std::string& op,std::uint16_t target) {
+        const auto s=net.snapshot();
+        if(op!="invite"&&op!="accept"&&op!="decline"&&op!="end") throw std::runtime_error("unknown duel action");
+        if(op=="accept"||op=="decline") duelInvites.erase(target);
+        if(role==Role::Host) hostDuel(net,s,s.localId,op,target);
+        else if(role==Role::Client) {
+            if(!send(net,{{"kind","pvp_duel"},{"op",op},{"target",target}},proto::kHostId)) throw std::runtime_error("PVP 请求未发送");
+        } else throw std::runtime_error("请先连接房间");
+    }
+    bool duelAllowed(std::uint16_t attacker,std::uint16_t target) const {return pvp&&duelPairs.contains(duelPair(attacker,target));}
     void receive(std::uint16_t from,const void* data,std::size_t size) {
         if(!data||!size||size>proto::kMaxReliableData) return;
         auto parsed=Json::parse(static_cast<const unsigned char*>(data),static_cast<const unsigned char*>(data)+size,nullptr,false);
@@ -115,7 +197,9 @@ public:
             entries.clear();replica={};entryToken=lastEntryReport=lastEntryAck=0;admitted=false;entryBlockers=Json::array();
             realm.reset(room);
             growthRequests.clear();lastGrowthPublish=0;
+            duelPairs.clear();duelPending.clear();duelBudgets.clear();duels.clear();duelInvites.clear();
         }
+        self=s.localId;maintainDuels(net,s);
         if(role==Role::Host&&ready()) realm.reconcile(s,epoch,world.value("map",std::string{}),world.value("level",std::string{}));
         for(auto it=entries.begin();it!=entries.end();) {if(!find(s,it->first)) it=entries.erase(it);else ++it;}
         for(auto it=growthRequests.begin();it!=growthRequests.end();) {
@@ -231,7 +315,7 @@ public:
                     const double amount=b.at("amount").get<double>();const auto target=b.at("target").get<std::uint16_t>();
                     auto key=b.value("key",std::string{}).substr(0,128);
                     if(key.rfind("pvp:",0)==0) {
-                        if(!pvp) {++rejected;continue;}
+                        if(!duelAllowed(packet.from,target)) {++rejected;continue;}
                         key="pvp:"+std::to_string(packet.from); // never trust the claimed attacker
                     }
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||target==packet.from||!find(s,target)) {++rejected;continue;}
@@ -267,6 +351,14 @@ public:
                     ++budget.second;
                     if(role==Role::Host) send(net,{{"kind","vitals"},{"epoch",epoch},{"origin",origin},{"hp",hp},{"max",max}});
                     if(vitals.size()<64) vitals.push_back({{"origin",origin},{"hp",hp},{"max",max}});
+                } else if(kind=="pvp_duel"&&role==Role::Host) {
+                    const auto op=b.at("op").get<std::string>();const auto target=b.at("target").get<std::uint16_t>();
+                    auto& budget=duelBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
+                    if(budget.second>=8||(op!="invite"&&op!="accept"&&op!="decline"&&op!="end")) {++rejected;continue;}
+                    ++budget.second;hostDuel(net,s,packet.from,op,target);
+                } else if(kind=="pvp_duel_event"&&role==Role::Client&&packet.from==proto::kHostId) {
+                    const auto op=b.at("op").get<std::string>();if(op.size()>16) {++rejected;continue;}
+                    applyDuelEvent(s,op,b.at("origin").get<std::uint16_t>());
                 } else if(kind=="enemy_state"&&role==Role::Host&&canAct(packet.from)) {
                     // Movement of enemies whose AI runs on that guest (ownership is
                     // assigned and checked by the host's game adapter).

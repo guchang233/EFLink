@@ -37,6 +37,7 @@ inline void validateSettings(const nlohmann::json& j) {
     const auto port=j.value("port",47615);if(port<1024||port>65535||port==47616) throw std::runtime_error("端口须为 1024–65535，且不能使用发现端口 47616");
     const auto count=j.value("max_players",8);if(count<2||count>16) throw std::runtime_error("人数上限须为 2–16");
     if(!validMenuKey(j.value("menu_key",kDefaultMenuKey))) throw std::runtime_error("菜单快捷键须为 = 或 F1–F12");
+    if(j.contains("pvp_key")&&(!j["pvp_key"].is_number_integer()||j["pvp_key"].get<int>()<VK_F1||j["pvp_key"].get<int>()>VK_F12)) throw std::runtime_error("PVP 快捷键须为 F1–F12");
     if(j.contains("saved_servers")) {
         if(!j["saved_servers"].is_array()||j["saved_servers"].size()>64) throw std::runtime_error("最多收藏 64 个地址");
         for(const auto& s:j["saved_servers"]) if(!s.is_object()||!s.contains("address")||!s["address"].is_string()||s["address"].get<std::string>().empty()||s["address"].get<std::string>().size()>256||!s.value("name",nlohmann::json("")).is_string()||s.value("name",std::string{}).size()>128) throw std::runtime_error("invalid saved server");
@@ -52,7 +53,7 @@ inline void writeSettings(const nlohmann::json& config) {
     auto temp=path;temp+=L".tmp";
     // Persist only player preferences; never persist passwords, automatic joins or test options.
     nlohmann::json saved=nlohmann::json::object();
-    for(auto key:{"player_name","room_name","max_players","port","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","testing_invincible","room_pvp","room_pvp_scale","room_pvp_revive","player_name_custom","menu_key","saved_servers"}) if(config.contains(key)) saved[key]=config[key];
+    for(auto key:{"player_name","room_name","max_players","port","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","testing_invincible","room_pvp","room_pvp_scale","room_pvp_revive","player_name_custom","menu_key","pvp_key","saved_servers"}) if(config.contains(key)) saved[key]=config[key];
     saved["menu_key_revision"]=kMenuKeyRevision;
     {std::ofstream out(temp,std::ios::binary|std::ios::trunc);out<<saved.dump(2);out.flush();if(!out) throw std::runtime_error("无法保存联机设置");}
     if(!MoveFileExW(temp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("无法更新联机设置");

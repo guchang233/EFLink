@@ -2208,6 +2208,31 @@ private:
         if(outlineFx.empty()) {outlineFx="P_fxgp_common_char_outline_01_nofade_asset";outlineSource="builtin";}
         return outlineFx;
     }
+    // The camera fades out whatever stands between it and the controlled operator
+    // (CameraMono._ProcessDitherByTrace). Other players' stand-ins are exempt, through
+    // the camera's own whitelist (m_entityTraceDitherWhitelist).
+    std::uint64_t lastDitherExempt=0,ditherExempted=0;std::string ditherError;std::set<void*> ditherExempt;
+    void exemptStandInsFromDither() {
+        if(nowMs()-lastDitherExempt<1000)return;
+        lastDitherExempt=nowMs();
+        try {
+            auto* camera=api.call(m("Camera","get_main","","UnityEngine.Camera"));if(!camera)return;
+            auto* go=api.call(m("Component","get_gameObject","","UnityEngine.GameObject"),camera);if(!go)return;
+            auto* top=api.call(m("Transform","get_root","","UnityEngine.Transform"),api.call(getTransform,go));
+            auto* root=top?api.call(m("Component","get_gameObject","","UnityEngine.GameObject"),top):go;
+            const auto monos=components(root,"CameraMono","Gameplay.Beyond.dll","Beyond.Gameplay.View");
+            if(monos.empty())throw std::runtime_error("CameraMono not found");
+            std::set<void*> wanted;
+            for(const auto& [peer,a]:actors)if(a.entity&&a.started&&currentActor(a))wanted.insert(a.entity);
+            for(const auto& [key,member]:remoteMembers)if(member.actor.entity&&member.actor.started&&currentActor(member.actor))wanted.insert(member.actor.entity);
+            for(auto* mono:monos) {
+                auto* set=readField<void*>(mono,"CameraMono","m_entityTraceDitherWhitelist","Beyond.Gameplay.View");if(!set)continue;
+                for(auto* entity:ditherExempt)if(!wanted.contains(entity))collection(set,"Remove",{entity});
+                for(auto* entity:wanted)collection(set,"Add",{entity});
+            }
+            ditherExempt=std::move(wanted);ditherExempted=ditherExempt.size();ditherError.clear();
+        }catch(const std::exception& e) {ditherError=e.what();}
+    }
     void outlineStandIns() {
         auto play=gm("BaseModelComponent","PlayRenderHelper","System.String","System.Void","Beyond.Gameplay.View");
         auto stop=gm("BaseModelComponent","StopRenderHelper","System.String","System.Void","Beyond.Gameplay.View");
@@ -3163,6 +3188,7 @@ private:
         }
         return {1.0,true};
     }
+    void* pvpDownEntity=nullptr;std::uint64_t pvpDownAt=0;
     std::uint64_t pvpHitsSent=0,pvpHitsTaken=0,pvpHitsIgnored=0,pvpDefeats=0,pvpFactionSwitches=0,pvpRecoverAt=0,pvpImmuneUntil=0,lastVitals=0;
     std::string pvpError,pvpLastDefeat;
     std::map<std::uint16_t,std::pair<double,double>> vitals; // peer -> real hp, max hp
@@ -3171,28 +3197,61 @@ private:
         if(role==Role::Host)return pvpAllowed;
         return role==Role::Client&&session&&session->ready()&&session->snapshot().value("pvp",false);
     }
+    bool pvpWith(Net& net,std::uint16_t peer) {return pvpActive(net)&&session&&session->duels.contains(peer);}
+    // The PVP key: answer the newest invitation, otherwise invite (or end the duel
+    // with) the nearest other player in this map. Data only (any thread).
+public:
+    nlohmann::json pvpKey(Net& net) {
+        if(!session)throw std::runtime_error("请先连接房间");
+        if(!pvpActive(net))throw std::runtime_error("房主没有允许 PVP");
+        if(!session->duelInvites.empty()) {
+            auto newest=session->duelInvites.begin();
+            for(auto it=session->duelInvites.begin();it!=session->duelInvites.end();++it)if(it->second>newest->second)newest=it;
+            const auto peer=newest->first;session->duelAction(net,"accept",peer);return {{"op","accept"},{"target",peer}};
+        }
+        const auto view=net.snapshot();const PeerView* self=nullptr;
+        for(const auto& p:view.peers)if(p.local)self=&p;
+        if(!self||self->states.empty())throw std::runtime_error("本机角色尚未就绪");
+        const auto& me=self->states.back().state;std::uint16_t best=0;double bestDistance=1e18;
+        for(const auto& p:view.peers) {
+            if(p.local||!p.hasInfo||p.states.empty()||p.info.mapId!=self->info.mapId||p.info.levelId!=self->info.levelId)continue;
+            const auto& st=p.states.back().state;double d=0;for(int i=0;i<3;++i)d+=double(st.position[i]-me.position[i])*double(st.position[i]-me.position[i]);
+            if(d<bestDistance) {bestDistance=d;best=p.id;}
+        }
+        if(!best)throw std::runtime_error("附近没有其他玩家");
+        const std::string op=session->duels.contains(best)?"end":"invite";
+        session->duelAction(net,op,best);return {{"op",op},{"target",best}};
+    }
+private:
     void updatePvp(Net& net,Session& link) {
         const auto role=net.currentRole();
         link.pvp=role==Role::Host&&pvpAllowed;
         const bool active=(role==Role::Host||role==Role::Client)&&pvpActive(net);
         for(auto& v:link.takeVitals())vitals[v.at("origin").get<std::uint16_t>()]={v.at("hp").get<double>(),v.at("max").get<double>()};
         const auto setFaction=gm("Entity","OverrideFaction","Beyond.Gameplay.Core.FactionIndex");
+        const auto view=net.snapshot();
         for(auto& [peer,a]:actors) {
             if(!a.entity||!a.started||!currentActor(a))continue;
-            if(active!=a.pvpFaction) {
+            // A player whose operator has fallen (pose not alive, or zero health
+            // reported) cannot be locked or hit until it is up again.
+            bool up=true;
+            for(const auto& p:view.peers)if(p.id==peer&&!p.states.empty()&&!(p.states.back().state.flags&proto::StateAlive))up=false;
+            if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.first<=0)up=false;
+            const bool hostile=active&&up&&link.duels.contains(peer);
+            if(hostile!=a.pvpFaction) {
                 // Neutral is hostile to players (Good) and to monsters (Bad) alike:
                 // this player can lock and hit the stand-in, monsters still attack it.
                 // The battle manager decides lock-on candidates when an entity is
                 // registered (hostile factions only), so register again after it.
                 auto* battle=staticObject("battle");
-                if(active) {
+                if(hostile) {
                     a.factionOriginal=api.value<int>(gm("Entity","get_factionIndex","","Beyond.Gameplay.Core.FactionIndex"),a.entity);int neutral=4;api.call(setFaction,a.entity,{&neutral});
                     if(battle)api.call(gm("BattleManager","RegisterEntity","Beyond.Gameplay.Core.Entity"),battle,{a.entity});
                 } else {
                     if(battle)api.call(gm("BattleManager","UnRegisterEntity","Beyond.Gameplay.Core.Entity"),battle,{a.entity});
                     int original=a.factionOriginal>0?a.factionOriginal:2;api.call(setFaction,a.entity,{&original});
                 }
-                a.pvpFaction=active;++pvpFactionSwitches;
+                a.pvpFaction=hostile;++pvpFactionSwitches;
             }
             // The stand-in's health bar shows that player's real health.
             if(active)if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.second>0)
@@ -3235,7 +3294,18 @@ private:
         const auto [scale,revive]=pvpRules(net);amount*=scale;
         const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
         if(before<=0)return;
+        // A fallen operator takes no more PVP hits (late packets, or health the game
+        // restores before the fall completes) until it is back on its feet: up and
+        // above half health again, or another operator is controlled.
+        if(pvpDownEntity) {
+            const double max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
+            const bool back=pvpDownEntity!=character||(api.value<bool>(entityAlive,character)&&std::isfinite(max)&&max>0&&before>=max*.5&&nowMs()-pvpDownAt>3000);
+            if(!back) {++pvpHitsIgnored;return;}
+            pvpDownEntity=nullptr;
+        }
+        if(!api.value<bool>(entityAlive,character)) {++pvpHitsIgnored;return;}
         std::uint16_t attacker=0;try {attacker=std::uint16_t(std::stoul(key.substr(4)));}catch(...) {}
+        if(!session||!session->duels.contains(attacker)) {++pvpHitsIgnored;return;}
         ++pvpHitsTaken;
         if(revive) {
             double hp=(std::max)(1.,before-amount);
@@ -3250,6 +3320,7 @@ private:
         double hp=(std::max)(0.,before-amount);
         setHealth(ability,hp,false);
         if(hp<=0) {
+            pvpDownEntity=character;pvpDownAt=nowMs();
             if(!api.value<bool>(gm("Entity","get_markDie","","System.Boolean"),character))api.call(gm("AbilitySystem","OnHpZero"),ability);
             ++pvpDefeats;pvpLastDefeat=peerName(net,attacker);net.chat("［PVP］"+pvpLastDefeat+" 击倒了 "+peerName(net,net.snapshot().localId));
         }
@@ -3306,7 +3377,13 @@ public:
     }
     nlohmann::json pvpStatus(Net& net) {
         const auto [scale,revive]=pvpRules(net);
-        return {{"allowed",pvpAllowed},{"active",pvpActive(net)},{"scale",scale},{"revive",revive},{"hits_sent",pvpHitsSent},{"hits_taken",pvpHitsTaken},{"hits_ignored",pvpHitsIgnored},
+        auto duels=nlohmann::json::array(),invites=nlohmann::json::array();
+        if(session) {
+            for(auto id:session->duels)duels.push_back({{"id",id},{"name",peerName(net,id)}});
+            for(const auto& [id,at]:session->duelInvites)invites.push_back({{"id",id},{"name",peerName(net,id)},{"age_ms",nowMs()-at}});
+        }
+        return {{"allowed",pvpAllowed},{"active",pvpActive(net)},{"duels",duels},{"invites",invites},
+                {"notice",session?session->duelNotice:std::string{}},{"notice_serial",session?session->duelNoticeSerial:0},{"scale",scale},{"revive",revive},{"hits_sent",pvpHitsSent},{"hits_taken",pvpHitsTaken},{"hits_ignored",pvpHitsIgnored},
                 {"defeats",pvpDefeats},{"last_defeat_by",pvpLastDefeat},{"faction_switches",pvpFactionSwitches},{"error",pvpError}};
     }
 public:
@@ -4064,7 +4141,7 @@ public:
         else if(!showMarkers) markers=nlohmann::json::array();
         const auto remotesStart=std::chrono::steady_clock::now();
         try {
-            if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) {crash::mark("remotes");updateRemotes(net.snapshot(),showRemote);crash::mark("squad_pose");poseSquad();crash::mark("outline");outlineStandIns();crash::mark("world_tick");}
+            if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) {crash::mark("remotes");updateRemotes(net.snapshot(),showRemote);crash::mark("squad_pose");poseSquad();crash::mark("outline");outlineStandIns();crash::mark("dither");exemptStandInsFromDither();crash::mark("world_tick");}
             else {if(!avatars.empty()) clear();if(!remoteMembers.empty()) {for(auto& [key,member]:remoteMembers)dropMember(member);remoteMembers.clear();}}
         } catch(const std::exception& e) {localError=e.what();}
         try {if((net.currentRole()==Role::Host&&roomHost)||(net.currentRole()==Role::Client&&guestRealm))updateEnemyMotion();}
@@ -4132,7 +4209,7 @@ public:
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
-                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_effect",outlineFx},{"outline_source",outlineSource},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
+                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_effect",outlineFx},{"dither_exempted",ditherExempted},{"dither_error",ditherError},{"outline_source",outlineSource},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
                     {"player_cast_error",playerCastError},{"last_player_cast",lastPlayerCast},{"actor_effects_blocked",actorEffectsBlocked},
                     {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"weapon_states_applied",weaponStatesApplied},{"weapon_state_error",weaponStateError},{"cooldowns_reset",cooldownsReset},{"squad",squadStatus()},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},

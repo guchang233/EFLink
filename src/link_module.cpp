@@ -632,11 +632,11 @@ BE_Result installHook() {
         }
         BE_MethodDescriptorV1 playRender{"Gameplay.Beyond.dll","Beyond.Gameplay.View","BaseModelComponent","PlayRenderHelper","System.String","System.Void",1};
         if(api->resolve_method(api->context,&playRender,&playRenderMethod)==BE_Result_Ok&&playRenderMethod.method_pointer) {
-            std::uint64_t handle=0;renderHelperHooked=host.hooks->create(host.hooks->context,kId,playRenderMethod.method_pointer,reinterpret_cast<void*>(onPlayRender),reinterpret_cast<void**>(&nextPlayRender),&handle)==BE_Result_Ok;
+            std::uint64_t renderHandle=0;renderHelperHooked=host.hooks->create(host.hooks->context,kId,playRenderMethod.method_pointer,reinterpret_cast<void*>(onPlayRender),reinterpret_cast<void**>(&nextPlayRender),&renderHandle)==BE_Result_Ok;
         }
         BE_MethodDescriptorV1 photoConfig{"Gameplay.Beyond.dll","Beyond.Gameplay","SnapshotSystem","SetMoveRotateCharConfig","Beyond.Gameplay.SnapshotSystem/SnapshotMoveRotateCharConfig","System.Void",1};
         if(api->resolve_method(api->context,&photoConfig,&photoConfigMethod)==BE_Result_Ok&&photoConfigMethod.method_pointer) {
-            std::uint64_t handle=0;photoConfigHooked=host.hooks->create(host.hooks->context,kId,photoConfigMethod.method_pointer,reinterpret_cast<void*>(onPhotoConfig),reinterpret_cast<void**>(&nextPhotoConfig),&handle)==BE_Result_Ok;
+            std::uint64_t photoHandle=0;photoConfigHooked=host.hooks->create(host.hooks->context,kId,photoConfigMethod.method_pointer,reinterpret_cast<void*>(onPhotoConfig),reinterpret_cast<void**>(&nextPhotoConfig),&photoHandle)==BE_Result_Ok;
         }
         BE_MethodDescriptorV1 weaponModel{"Gameplay.Beyond.dll","Beyond.Gameplay","WeaponUtil","TryGetWeaponModelPathByCharInstId",nullptr,"System.Boolean",3};
         if(api->resolve_method(api->context,&weaponModel,&weaponModelMethod)==BE_Result_Ok&&weaponModelMethod.method_pointer) {
@@ -849,6 +849,8 @@ json perform(const json& input) {
         auto changed=configuration;changed["room_pvp"]=pvp;changed["room_pvp_scale"]=scale;changed["room_pvp_revive"]=revive;applyConfiguration(changed);save=true;
         net.host(hostOptions(input));
     }
+    else if(action=="pvp_key") {std::lock_guard lock(worldMutex);return world.pvpKey(net);}
+    else if(action=="pvp_duel") {std::lock_guard lock(worldMutex);session.duelAction(net,input.at("op").get<std::string>(),input.at("target").get<std::uint16_t>());return json{{"ok",true}};}
     else if(action=="room_pvp") {
         auto changed=configuration;
         const bool pvp=input.value("enabled",configuration.value("room_pvp",false));changed["room_pvp"]=pvp;
@@ -893,7 +895,7 @@ json perform(const json& input) {
     else if(action=="show_remote") {auto changed=configuration;changed["show_remote_players"]=input.at("enabled");applyConfiguration(changed);save=true;}
     else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);
         // The menu sends player_name only when the player edited the field.
-        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
+        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive","pvp_key"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
     else if(action=="save_server"||action=="remove_server") {
         auto address=input.at("address").get<std::string>();if(address.empty()||address.size()>256) throw std::runtime_error("请填写有效地址");
         auto servers=configuration.value("saved_servers",json::array());json updated=json::array();

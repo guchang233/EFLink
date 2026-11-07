@@ -193,6 +193,22 @@ int main() {
     raw(host,{{"schema",2},{"room",host.snapshot().roomId},{"kind","snapshot"},{"epoch",1},{"revision",999},{"world",scene()}});
     std::this_thread::sleep_for(std::chrono::milliseconds(100));tick();
     check(g.snapshot()["map"]=="map02"&&g.generation()==2,"old-map snapshots cannot corrupt a new map");
+    // PVP duels: an invitation must be accepted; the host keeps the pairs.
+    h.pvp=false;g.duelAction(guest,"invite",1);
+    check(wait([&]{tick();return g.duelNotice=="房主没有允许 PVP";})&&g.duels.empty(),"no duel invitations while the room does not allow PVP");
+    h.pvp=true;g.duelAction(guest,"invite",1);
+    check(wait([&]{tick();return h.duelInvites.contains(2);}),"the host receives the guest's invitation");
+    check(h.duels.empty()&&g.duels.empty()&&!h.duelAllowed(2,1),"an invitation alone allows no PVP");
+    h.duelAction(host,"decline",2);
+    check(wait([&]{tick();return g.duelNotice.find("拒绝")!=std::string::npos;})&&!h.duelAllowed(2,1),"a declined invitation is reported and allows no PVP");
+    g.duelAction(guest,"invite",1);check(wait([&]{tick();return h.duelInvites.contains(2);}),"a new invitation can follow a refusal");
+    h.duelAction(host,"accept",2);
+    check(wait([&]{tick();return h.duels.contains(2)&&g.duels.contains(1);})&&h.duelAllowed(2,1)&&h.duelAllowed(1,2),"an accepted invitation starts the duel on both sides");
+    g.duelAction(guest,"end",1);
+    check(wait([&]{tick();return h.duels.empty()&&g.duels.empty();})&&!h.duelAllowed(2,1),"either player can end the duel");
+    g.duelAction(guest,"invite",1);check(wait([&]{tick();return h.duelInvites.contains(2);}),"invite again");
+    h.duelAction(host,"accept",2);check(wait([&]{tick();return g.duels.contains(1);}),"duel again");
+    h.pvp=false;check(wait([&]{tick();return h.duels.empty()&&g.duels.empty();}),"turning PVP off ends every duel");
     guest.leave();check(wait([&]{tick();return guest.currentRole()==Role::Offline&&!g.ready()&&!g.canAct(2);}),"leave clears guest world and readiness");
     host.stop();guest.stop();late.stop();
     return failures?1:0;
