@@ -89,6 +89,27 @@ int main() {
     alice.leave();
     check(waitFor([&]{return find(bob.snapshot(),aliceId)==nullptr;}),"a departure reaches the remaining members");
     check(alicePeerEvents.load()>0,"peer callbacks fire");
+    // A member without any UDP path (blocked, TCP-only tunnel): poses and
+    // unreliable module data (squad poses) travel over its TCP link instead.
+    {
+        Net dave;std::atomic<int> daveFast=0,bobFromDave=0;
+        dave.onData=[&](std::uint16_t,std::uint32_t channel,const unsigned char*,std::size_t){if(channel==proto::fnv32("test.fast")) ++daveFast;};
+        bob.onData=[&](std::uint16_t,std::uint32_t channel,const unsigned char*,std::size_t){if(channel==proto::fnv32("test.slowpath")) ++bobFromDave;};
+        dave.setName("Dave");dave.setLocalInfo(info("chr_dave.prefab","map01"));dave.simulateTcpOnly(true);dave.start(discovery);
+        dave.join("127.0.0.1:"+std::to_string(port),"secret");
+        check(waitFor([&]{return dave.currentRole()==Role::Client;}),"a member without UDP joins over TCP");
+        check(waitFor([&]{return dave.snapshot().tcpOnlyLinks==1&&host.snapshot().tcpOnlyLinks==1;},8000),"both ends report the link as TCP only");
+        for(int i=0;i<40&&daveFast.load()==0;++i) {host.sendData(proto::fnv32("test.fast"),proto::kEveryone,"x",1,false);std::this_thread::sleep_for(std::chrono::milliseconds(50));}
+        check(daveFast.load()>0,"unreliable data reaches a TCP-only member");
+        for(int i=0;i<40&&bobFromDave.load()==0;++i) {dave.sendData(proto::fnv32("test.slowpath"),proto::kEveryone,"y",1,false);std::this_thread::sleep_for(std::chrono::milliseconds(50));}
+        check(bobFromDave.load()>0,"unreliable data from a TCP-only member is relayed to the others");
+        const auto daveId=dave.snapshot().localId;
+        for(int i=0;i<10;++i) {dave.setLocalState(state(float(70+i),proto::fnv32("map01")));std::this_thread::sleep_for(std::chrono::milliseconds(30));}
+        check(waitFor([&]{auto s=bob.snapshot();auto* d=find(s,daveId);return d&&!d->states.empty()&&d->states.back().state.position[0]==79.f;}),"poses of a TCP-only member reach the others");
+        dave.leave();check(waitFor([&]{return find(bob.snapshot(),daveId)==nullptr;}),"the TCP-only member leaves cleanly");
+        dave.stop();
+    }
+
 
     host.leave();
     check(waitFor([&]{return bob.currentRole()==Role::Offline;}),"closing the room disconnects members");

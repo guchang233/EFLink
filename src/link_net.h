@@ -88,6 +88,10 @@ struct Snapshot {
     std::uint32_t rttMs=0;
     std::uint64_t bytesIn=0,bytesOut=0,statesIn=0,statesOut=0;
     std::uint64_t pongs=0;
+    // Links whose UDP path is open / that run over TCP only (UDP blocked or a
+    // TCP-only tunnel), and unreliable module data carried or dropped on TCP.
+    std::uint32_t udpLinks=0,tcpOnlyLinks=0;
+    std::uint64_t unreliableOverTcp=0,unreliableDropped=0;
 };
 
 class Net {
@@ -143,6 +147,8 @@ public:
         post([this,channel,to,reliable,copy=std::move(copy)]{sendDataNow(channel,to,copy,reliable);});
         return true;
     }
+    // Tests: behave as if this end's UDP were blocked (TCP-only path).
+    void simulateTcpOnly(bool value) {tcpOnlyForTest=value;}
     Role currentRole() const {return role.load();}
     Snapshot snapshot() {
         std::lock_guard lock(viewMutex);
@@ -168,7 +174,7 @@ private:
         Connection tcp;
         sockaddr_in udp{};bool udpKnown=false;std::uint64_t joinedAt=0;
         std::uint32_t token=0;
-        bool welcomed=false;
+        bool welcomed=false,tcpNoticed=false;
         std::string address;
     };
     std::thread thread;
@@ -185,6 +191,7 @@ private:
     std::map<std::string,Room> rooms;
     std::deque<ChatLine> chatLog;std::uint64_t chatSerial=0;
     std::atomic<Role> role=Role::Offline;
+    std::atomic<bool> tcpOnlyForTest=false;
 
     // Network-thread state.
     SOCKET discovery=INVALID_SOCKET,udp=INVALID_SOCKET,listener=INVALID_SOCKET;
@@ -201,6 +208,28 @@ private:
     // Without a UDP path (TCP-only port forwarding) player states travel over TCP.
     static constexpr std::uint64_t kUdpGraceMs=3000;
     bool tcpStates() const {return role.load()==Role::Client&&!udpWelcomed&&joinStarted&&nowMs()-joinStarted>kUdpGraceMs;}
+    // Unreliable module data (squad poses) follows the same rule: to a link whose
+    // UDP path never opened it goes over TCP, dropped while that link is backed up
+    // (a newer sample supersedes it anyway). A client marks such a TCP data frame
+    // so the host relays it as unreliable data, not as reliable.
+    static constexpr std::uint16_t kUnreliableMark=0xFFFF;
+    static constexpr std::size_t kUnreliableBacklog=64*1024;
+    std::uint64_t unreliableOverTcp=0,unreliableDropped=0;bool udpNoticed=false;
+    bool tcpFallback(const Member& m) const {return !m.udpKnown&&m.welcomed&&nowMs()-m.joinedAt>kUdpGraceMs;}
+    void queueUnreliable(Connection& c,const proto::Writer& frame) {
+        if(c.out.size()>kUnreliableBacklog) {++unreliableDropped;return;}
+        queue(c,proto::Tcp::Data,frame);++unreliableOverTcp;
+    }
+    // Host: unreliable data from `from` to every other member it is meant for.
+    void relayUnreliable(std::uint16_t from,std::uint16_t to,std::uint32_t channel,const unsigned char* bytes,std::size_t size) {
+        auto datagram=proto::udpHeader(proto::Udp::Data,roomId);datagram.u16(from).u16(to).u32(channel).u16(std::uint16_t(size)).raw(bytes,size);
+        proto::Writer frame;frame.u16(from).u16(to).u32(channel).u32(std::uint32_t(size)).raw(bytes,size);
+        for(auto& [id,other]:members) {
+            if(id==from||(to!=proto::kEveryone&&to!=id))continue;
+            if(other.udpKnown)sendTo(udp,other.udp,datagram.bytes);
+            else if(tcpFallback(other))queueUnreliable(other.tcp,frame);
+        }
+    }
     std::uint64_t lastBeacon=0,lastDiscover=0,lastPing=0,lastUdpHello=0,lastInfoSent=0,discoverReplyAt=0;
     std::uint32_t rtt=0,stateSequence=0;
     std::uint64_t bytesIn=0,bytesOut=0,statesIn=0,statesOut=0;
@@ -266,6 +295,7 @@ private:
     }
     void sendTo(SOCKET s,const sockaddr_in& to,const std::vector<unsigned char>& bytes) {
         if(s==INVALID_SOCKET||bytes.size()>proto::kMaxDatagram) return;
+        if(tcpOnlyForTest.load()&&s==udp) return;
         if(sendto(s,reinterpret_cast<const char*>(bytes.data()),int(bytes.size()),0,reinterpret_cast<const sockaddr*>(&to),sizeof to)>0) bytesOut+=bytes.size();
     }
     void broadcast(const std::vector<unsigned char>& bytes) {
@@ -386,7 +416,7 @@ private:
         const int result=connect(server.socket,reinterpret_cast<sockaddr*>(&target),sizeof target);
         if(result!=0&&WSAGetLastError()!=WSAEWOULDBLOCK) {closeSocket(udp);closeSocket(server.socket);notice("无法连接到 "+address,true);return;}
         serverUdp=target;joinPassword=password;joinStarted=nowMs();joinAddress=text(target);
-        role.store(Role::Connecting);udpWelcomed=false;
+        role.store(Role::Connecting);udpWelcomed=false;udpNoticed=false;
         {std::lock_guard lock(viewMutex);view.lastError.clear();}
         resetView();publishPeers();
         notice("正在连接 "+joinAddress+" …");
@@ -477,9 +507,15 @@ private:
             proto::Writer w;w.u16(m.id).str(line,1024);relayFrame(m.id,proto::Tcp::Chat,w);addChat(m.id,who,line);break;
         }
         case proto::Tcp::Data: {
-            r.u16();const auto to=r.u16();const auto channel=r.u32();const auto size=r.u32();
+            const bool unreliable=r.u16()==kUnreliableMark;const auto to=r.u16();const auto channel=r.u32();const auto size=r.u32();
             if(size>proto::kMaxReliableData) throw std::runtime_error("data too large");
             const auto* bytes=r.take(size);
+            if(unreliable) {
+                if(size>proto::kMaxUnreliableData) break;
+                relayUnreliable(m.id,to,channel,bytes,size);
+                if((to==proto::kEveryone||to==localId)&&onData) onData(m.id,channel,bytes,size);
+                break;
+            }
             proto::Writer w;w.u16(m.id).u16(to).u32(channel).u32(size).raw(bytes,size);
             if(to==proto::kEveryone) relayFrame(m.id,proto::Tcp::Data,w);
             else if(auto target=members.find(to);target!=members.end()&&to!=m.id) queue(target->second.tcp,proto::Tcp::Data,w);
@@ -514,8 +550,7 @@ private:
             r.u16();const auto to=r.u16();const auto channel=r.u32();const auto size=r.u16();
             if(size>proto::kMaxUnreliableData) return;
             const auto* bytes=r.take(size);
-            auto w=proto::udpHeader(proto::Udp::Data,roomId);w.u16(m->id).u16(to).u32(channel).u16(size).raw(bytes,size);
-            for(auto& [id,other]:members) if(id!=m->id&&other.udpKnown&&(to==proto::kEveryone||to==id)) sendTo(udp,other.udp,w.bytes);
+            relayUnreliable(m->id,to,channel,bytes,size);
             if((to==proto::kEveryone||to==localId)&&onData) onData(m->id,channel,bytes,size);
         }
     }
@@ -622,9 +657,14 @@ private:
                 else if(auto m=members.find(to);m!=members.end()) queue(m->second.tcp,proto::Tcp::Data,w);
             } else queue(server,proto::Tcp::Data,w);
         } else {
-            auto w=proto::udpHeader(proto::Udp::Data,roomId);w.u16(localId).u16(to).u32(channel).u16(std::uint16_t(data.size())).raw(data.data(),data.size());
-            if(role.load()==Role::Host) {for(auto& [id,m]:members) if(m.udpKnown&&(to==proto::kEveryone||to==id)) sendTo(udp,m.udp,w.bytes);}
-            else sendTo(udp,serverUdp,w.bytes);
+            if(role.load()==Role::Host) {relayUnreliable(localId,to,channel,data.data(),data.size());return;}
+            if(udpWelcomed) {
+                auto w=proto::udpHeader(proto::Udp::Data,roomId);w.u16(localId).u16(to).u32(channel).u16(std::uint16_t(data.size())).raw(data.data(),data.size());
+                sendTo(udp,serverUdp,w.bytes);
+            } else if(tcpStates()) {
+                proto::Writer frame;frame.u16(kUnreliableMark).u16(to).u32(channel).u32(std::uint32_t(data.size())).raw(data.data(),data.size());
+                queueUnreliable(server,frame);
+            }
         }
     }
     void sendChat(const std::string& line) {
@@ -760,6 +800,10 @@ private:
             if(now-lastBeacon>1000) {lastBeacon=now;broadcast(proto::encode(beacon()));}
             std::vector<std::uint16_t> silent;
             for(auto& [id,m]:members) {
+                if(!m.tcpNoticed&&tcpFallback(m)) {
+                    m.tcpNoticed=true;
+                    notice("玩家 "+(peers.contains(id)?peers[id].info.name:std::to_string(id))+" 的 UDP 未连通，动作与队伍同步改走 TCP（延迟更高）。请同时转发 UDP 端口 "+std::to_string(options.port));
+                }
                 if(now-m.tcp.lastSent>2000) queue(m.tcp,proto::Tcp::KeepAlive,{});
                 if(now-m.tcp.lastHeard>10000) silent.push_back(id);
             }
@@ -771,6 +815,7 @@ private:
                 lastUdpHello=now;auto w=proto::udpHeader(proto::Udp::Hello,roomId);w.u16(localId).u32(token);sendTo(udp,serverUdp,w.bytes);
             }
             if(udpWelcomed&&now-lastPing>1000) {lastPing=now;auto w=proto::udpHeader(proto::Udp::Ping,roomId);w.u64(now);sendTo(udp,serverUdp,w.bytes);}
+            if(!udpNoticed&&tcpStates()) {udpNoticed=true;notice("与房主的 UDP 未连通，动作与队伍同步改走 TCP（延迟更高）。请让房主同时转发 UDP 端口");}
             if(now-server.lastSent>2000) queue(server,proto::Tcp::KeepAlive,{});
             if(now-server.lastHeard>10000) closeSession("房主无响应（超时）",false,true);
         }
@@ -779,6 +824,9 @@ private:
         if(now-lastDiscover>3000&&role.load()!=Role::Host) sendDiscover();
         std::lock_guard lock(viewMutex);
         view.rttMs=rtt;view.bytesIn=bytesIn;view.bytesOut=bytesOut;view.statesIn=statesIn;view.statesOut=statesOut;view.pongs=pongs;
+        view.udpLinks=0;view.tcpOnlyLinks=0;view.unreliableOverTcp=unreliableOverTcp;view.unreliableDropped=unreliableDropped;
+        if(role.load()==Role::Host) {for(const auto& [id,m]:members) {if(m.udpKnown)++view.udpLinks;else if(tcpFallback(m))++view.tcpOnlyLinks;}}
+        else if(role.load()==Role::Client) {if(udpWelcomed)view.udpLinks=1;else if(tcpStates())view.tcpOnlyLinks=1;}
         if(!view.peers.empty()&&view.peers.front().local) view.peers.front().rttMs=rtt;
         for(auto it=rooms.begin();it!=rooms.end();) it=now-it->second.seenMs>6000?rooms.erase(it):std::next(it);
     }

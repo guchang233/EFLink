@@ -272,7 +272,9 @@ struct Ui {
         const std::string head="EF LINK // "+roomName+(state.value("pvp",json::object()).value("active",false)?"  // PVP":"");
         d->AddRectFilled({x,y+2},{x+3,y+line-2},accent);
         shadowText(d,{x+9,y},accent,head.c_str());
-        if(role()=="client") {char rtt[32];std::snprintf(rtt,sizeof rtt,"%ums",state.value("rtt_ms",0u));shadowText(d,{x+width-ImGui::CalcTextSize(rtt).x,y},dim,rtt);}
+        const bool tcpOnly=state.value("traffic",json::object()).value("tcp_only_links",0u)>0;
+        if(role()=="client"||tcpOnly) {char rtt[32];if(tcpOnly)std::snprintf(rtt,sizeof rtt,"TCP");else std::snprintf(rtt,sizeof rtt,"%ums",state.value("rtt_ms",0u));
+            shadowText(d,{x+width-ImGui::CalcTextSize(rtt).x,y},tcpOnly?color::u32(color::warn):dim,rtt);}
         y+=line+5;d->AddLine({x,y},{x+width,y},color::u32(color::accent,.4f));y+=6;
         for(const auto& peer:peers) {
             const int id=peer.value("id",0);const bool self=peer.value("local",false),host=peer.value("host",false),valid=peer.value("valid",false);
@@ -390,7 +392,9 @@ struct Ui {
         ImGui::Text("%s",str(roomInfo,"name",r=="connecting"?"连接中…":"房间").c_str());
         ImGui::SameLine();chip(r=="host"?"房主":r=="client"?"房客":"连接中",r=="host"?color::accent:color::ok);
         ImGui::SameLine();chip((std::to_string(state.value("peers",json::array()).size())+" / "+std::to_string(roomInfo.value("max_players",0))+" 人").c_str(),color::dim);
-        if(r=="client") {ImGui::SameLine();chip((std::to_string(state.value("rtt_ms",0u))+" ms").c_str(),color::info);}
+        const bool tcpOnly=state.value("traffic",json::object()).value("tcp_only_links",0u)>0;
+        if(tcpOnly) {ImGui::SameLine();chip("UDP 未连通 · 走 TCP",color::warn);}
+        else if(r=="client") {ImGui::SameLine();chip((std::to_string(state.value("rtt_ms",0u))+" ms").c_str(),color::info);}
         const auto pvpState=state.value("pvp",json::object());
         if(pvpState.value("active",false)) {
             ImGui::SameLine();chip("PVP",color::bad);
@@ -512,7 +516,8 @@ struct Ui {
         bool changed=ImGui::Checkbox("显示其他玩家的角色",&remote);
         ImGui::BeginDisabled(!remote);changed|=ImGui::Checkbox("同时显示其他玩家队伍中的另外三名干员",&squad);
         changed|=ImGui::Checkbox("在其他玩家的角色上重放技能动作、武器与特效",&replay);
-        changed|=ImGui::Checkbox("给其他玩家的角色加上黄色描边",&outline);ImGui::EndDisabled();
+        changed|=ImGui::Checkbox("给其他玩家的角色加上描边",&outline);ImGui::EndDisabled();
+
         changed|=ImGui::Checkbox("显示玩家标记与成员列表（编号、名字、距离）",&markers);
         endCard();
         beginCard("##coop","联机",fonts.title);
@@ -559,7 +564,8 @@ struct Ui {
             if(!str(squadState,"error").empty()) row("队伍错误",str(squadState,"error"),color::bad);
             row("网络延迟",std::to_string(state.value("rtt_ms",0u))+" ms");
             const auto traffic=state.value("traffic",json::object());
-            row("UDP",traffic.value("udp_pongs",std::uint64_t(0))>0?"已连通":role()=="client"?"未连通（使用 TCP）":"—");
+            if(traffic.value("tcp_only_links",0u)>0) row("UDP",std::to_string(traffic.value("tcp_only_links",0u))+" 条连接未连通，走 TCP（备用通道 "+std::to_string(traffic.value("unreliable_over_tcp",std::uint64_t(0)))+" 包，丢弃 "+std::to_string(traffic.value("unreliable_dropped",std::uint64_t(0)))+"）",color::warn);
+            else row("UDP",traffic.value("udp_links",0u)>0?"已连通":"—");
             row("传送",str(native,"teleport","idle"));
             for(const auto& e:{str(world,"error"),str(native,"error"),str(g,"error"),str(state,"last_error")}) if(!e.empty()) row("错误",e,color::bad);
             const auto gui=state.value("gui_render",json::object());

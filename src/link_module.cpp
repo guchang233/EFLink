@@ -200,6 +200,37 @@ void __fastcall onTeleport(std::uint64_t reason,void* level,void* position,void*
     }
     nextTeleport(reason,level,position,rotation,ui,options,callback,node,info);
 }
+// Observed only: every render-helper effect name the game plays on a model, and
+// the photo mode's character outline config (set from Lua). Logged once per name.
+// No world lock here: EF Link itself calls PlayRenderHelper under that lock.
+std::mutex renderNamesMutex;std::set<std::string> renderNames;bool renderHelperHooked=false,photoConfigHooked=false;
+std::string managedAscii(void* string) {
+    if(!string) return {};
+    const auto length=*reinterpret_cast<const std::int32_t*>(static_cast<const char*>(string)+16);
+    if(length<=0||length>1024) return {};
+    const auto* chars=reinterpret_cast<const char16_t*>(static_cast<const char*>(string)+20);
+    std::string out;for(int i=0;i<length;++i) out.push_back(chars[i]<0x80?char(chars[i]):'?');
+    return out;
+}
+void noteRenderName(const char* kind,void* string) {
+    auto name=managedAscii(string);if(name.empty()) return;
+    {std::lock_guard lock(renderNamesMutex);if(renderNames.size()>=256||!renderNames.insert(std::string(kind)+name).second) return;}
+    if(host.log) host.log(host.context,(std::string("[render] ")+kind+" "+name).c_str());
+}
+using PlayRenderCall=void(__fastcall*)(void*,void*,void*);
+PlayRenderCall nextPlayRender=nullptr;BE_ResolvedMethodV1 playRenderMethod{};
+void __fastcall onPlayRender(void* self,void* name,void* info) {
+    // Callers pass no MethodInfo (the native entry is called directly).
+    if(!cleanupRequested) {try {noteRenderName("PlayRenderHelper",name);} catch(...) {}}
+    nextPlayRender(self,name,info);
+}
+using PhotoConfigCall=void(__fastcall*)(void*,void*,void*);
+PhotoConfigCall nextPhotoConfig=nullptr;BE_ResolvedMethodV1 photoConfigMethod{};
+void __fastcall onPhotoConfig(void* self,void* config,void* info) {
+    // SnapshotMoveRotateCharConfig (> 8 bytes) arrives by reference; outlineAsset first.
+    if(config&&!cleanupRequested) {try {noteRenderName("photo_outline",*static_cast<void**>(config));} catch(...) {}}
+    nextPhotoConfig(self,config,info);
+}
 // Windows x64: TargetHandleView is exactly one pointer-sized value; the
 // Nullable<CastSkillOptions> value (> 8 bytes) is passed indirectly. Validate
 // the target view layout from runtime metadata before installing this hook.
@@ -599,6 +630,14 @@ BE_Result installHook() {
         if(api->resolve_method(api->context,&teleport,&teleportMethod)==BE_Result_Ok&&teleportMethod.method_pointer) {
             std::uint64_t teleportHandle=0;teleportHooked=host.hooks->create(host.hooks->context,kId,teleportMethod.method_pointer,reinterpret_cast<void*>(onTeleport),reinterpret_cast<void**>(&nextTeleport),&teleportHandle)==BE_Result_Ok;
         }
+        BE_MethodDescriptorV1 playRender{"Gameplay.Beyond.dll","Beyond.Gameplay.View","BaseModelComponent","PlayRenderHelper","System.String","System.Void",1};
+        if(api->resolve_method(api->context,&playRender,&playRenderMethod)==BE_Result_Ok&&playRenderMethod.method_pointer) {
+            std::uint64_t handle=0;renderHelperHooked=host.hooks->create(host.hooks->context,kId,playRenderMethod.method_pointer,reinterpret_cast<void*>(onPlayRender),reinterpret_cast<void**>(&nextPlayRender),&handle)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 photoConfig{"Gameplay.Beyond.dll","Beyond.Gameplay","SnapshotSystem","SetMoveRotateCharConfig","Beyond.Gameplay.SnapshotSystem/SnapshotMoveRotateCharConfig","System.Void",1};
+        if(api->resolve_method(api->context,&photoConfig,&photoConfigMethod)==BE_Result_Ok&&photoConfigMethod.method_pointer) {
+            std::uint64_t handle=0;photoConfigHooked=host.hooks->create(host.hooks->context,kId,photoConfigMethod.method_pointer,reinterpret_cast<void*>(onPhotoConfig),reinterpret_cast<void**>(&nextPhotoConfig),&handle)==BE_Result_Ok;
+        }
         BE_MethodDescriptorV1 weaponModel{"Gameplay.Beyond.dll","Beyond.Gameplay","WeaponUtil","TryGetWeaponModelPathByCharInstId",nullptr,"System.Boolean",3};
         if(api->resolve_method(api->context,&weaponModel,&weaponModelMethod)==BE_Result_Ok&&weaponModelMethod.method_pointer) {
             std::uint64_t weaponHandle=0;weaponModelHooked=host.hooks->create(host.hooks->context,kId,weaponModelMethod.method_pointer,reinterpret_cast<void*>(onWeaponModel),reinterpret_cast<void**>(&nextWeaponModel),&weaponHandle)==BE_Result_Ok;
@@ -708,10 +747,10 @@ json status(std::uint64_t chatAfter) {
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"pvp",world.pvpStatus(net)},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"render_helper_hook_ready",renderHelperHooked},{"photo_config_hook_ready",photoConfigHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"pvp",world.pvpStatus(net)},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
         {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
-        {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs}}}};
+        {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs},{"udp_links",s.udpLinks},{"tcp_only_links",s.tcpOnlyLinks},{"unreliable_over_tcp",s.unreliableOverTcp},{"unreliable_dropped",s.unreliableDropped}}}};
 }
 
 // ---- public C API ----
@@ -900,6 +939,7 @@ BE_Result BE_CALL initialize(const BE_ThirdPartyHostV1* input,const char* config
         },configuration);
         if(configuration.value("auto_host",false)) net.host(hostOptions(json::object()));
         else if(auto address=configuration.value("auto_join",std::string{});!address.empty()) net.join(address,configuration.value("auto_join_password",std::string{}));
+        {std::lock_guard world_(worldMutex);world.log=[](const std::string& line) {if(host.log) host.log(host.context,("[world] "+line).c_str());};}
         if(host.log) host.log(host.context,"EF Link ready: press = for the native multiplayer menu");
         return BE_Result_Ok;
     } catch(...) {
@@ -933,7 +973,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;teleportHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
+        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;teleportHooked=false;renderHelperHooked=false;photoConfigHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     eflink::crash::uninstall();

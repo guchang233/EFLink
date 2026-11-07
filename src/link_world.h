@@ -8,6 +8,7 @@
 #include "unity_bridge.h"
 #include "link_native_identity.h"
 #include "link_map_consent.h"
+#include "link_settings.h"
 #include "authority/link_native_feed.h"
 #include "authority/link_metadata.h"
 #include "authority/link_native_op_policy.h"
@@ -70,7 +71,7 @@ class World {
     struct Actor {
         std::uint64_t id=0,epoch=0,retry=0;std::uint16_t peer=0;
         std::string model,templateId,error,weapon;int weaponState=-1,weaponHandle=0;
-        bool outlined=false;std::uint64_t outlineAt=0;
+        bool outlined=false;std::uint64_t outlineAt=0;std::string outlineName;
         int factionOriginal=-1;bool pvpFaction=false; // PVP: the stand-in is switched to the neutral faction
         void* entity=nullptr;void* info=nullptr;
         void* movement=nullptr;
@@ -884,7 +885,14 @@ class World {
         auto klass=api.klass(type,library,space);
         auto* descriptor=symbol<const void*(*)(const void*,const char*)>("il2cpp_class_get_field_from_name")(klass.class_info,name);
         if(!descriptor) throw std::runtime_error(std::string("field unavailable: ")+type+"."+name);
-        T value{};symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value")(object,descriptor,&value);return value;
+        T value{};
+        // A static field has no storage in the object: il2cpp_field_get_value would
+        // read the instance at the static offset (garbage).
+        if(symbol<int(*)(const void*)>("il2cpp_field_get_flags")(descriptor)&0x10) {
+            symbol<void(*)(const void*,void*)>("il2cpp_field_static_get_value")(descriptor,&value);return value;
+        }
+        if(!object) throw std::runtime_error(std::string("field read on null: ")+type+"."+name);
+        symbol<void(*)(void*,const void*,void*)>("il2cpp_field_get_value")(object,descriptor,&value);return value;
     }
     void* collection(void* object,const char* name,std::initializer_list<void*> args={}) {
         auto* klass=symbol<const void*(*)(void*)>("il2cpp_object_get_class")(object);
@@ -1501,6 +1509,7 @@ class World {
             {"in_dungeon",inDungeon},{"in_subgame",inSubgame},{"main_scope",mainScope},{"loading",loading}};
         if(loading) {
             travel->observedLoading=true;travelState="loading";
+            travel->until=(std::max)(travel->until,nowMs()+45000);
             travelLifecycle["loading_ms"]=nowMs()-travel->startedAt;
             travelLifecycle["progress"]=api.value<float>(gm("GameLevelLoader","get_progress","","System.Single"),levelLoader);
             try {if(auto* step=readField<void*>(levelLoader,"GameLevelLoader","m_curStep"))travelLifecycle["step"]=classOf(step);}catch(...) {}
@@ -1722,7 +1731,7 @@ private:
             if(!enemies.empty()||!privateEnemies.empty()||!spawnedEnemies.empty()) dropEnemies();dropActors();enemyEpoch=0;
             // Leaving the host's world returns this player to where they entered
             // from, behind the loading panel, like leaving an official co-op world.
-            if(home) {travel=std::move(*home);home.reset();travel->until=nowMs()+60000;travelState="returning_home";replicationError.clear();}
+            if(home) {travel=std::move(*home);home.reset();travel->until=nowMs()+120000;travelState="returning_home";replicationError.clear();note("left the room: returning to "+travel->map+"/"+travel->level);}
             else if(travel&&!travel->homeward) {travel.reset();travelState="idle";}
             if(travel)try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
             return;
@@ -1869,6 +1878,16 @@ private:
         if(!info) {mapId.clear();levelId.clear();mapHash=0;return;}
         mapId=text(api.call(mapIdText,info));levelId=text(api.call(levelIdText,info));
         mapHash=mapId.empty()?0:proto::fnv32(mapId);
+    }
+    // Offline nothing is sampled, but the trip home after leaving a room needs the
+    // current map and controlled character: both change when a teleport arrives.
+    void refreshOffline() {
+        readMap();
+        auto* entity=mainEntity();void* go=nullptr;
+        if(entity) {auto* component=api.call(entityModel,entity);go=component?api.call(modelGo,component):nullptr;}
+        if(!go||!alive(go)) {if(model)dropLocalModel();character=nullptr;return;}
+        if(model&&go!=model)dropLocalModel();
+        character=entity;
     }
     void sample(Net& net) {
         const auto now=nowMs();
@@ -2140,27 +2159,53 @@ private:
     // Teammates (every stand-in) get an accent outline and rim light through the
     // character shader's own properties. Re-applied periodically: material changes
     // (weapon swap, LOD) can reset them.
-    // Teammates (every stand-in) get the game's own outline effect: the render
-    // helper effect interactive objects use for their general outline, looked up
-    // the same way (InteractiveHintConfig: generalOutlineDefaultKey ->
-    // interactiveOutlineConfigs), played on the stand-in's model like the photo
-    // mode's character outline (BaseModelComponent.PlayRenderHelper).
-    std::string outlineFx;std::uint64_t outlineFxChecked=0;
+    // Teammates (every stand-in) get the game's own character outline: the effect
+    // the photo mode draws around the operator being moved. Its asset comes from the
+    // photo mode UI (SnapshotSystem.m_moveRotateCharConfig.outlineAsset, set from
+    // Lua, no C# constant) and is played the photo mode's way,
+    // BaseModelComponent.PlayRenderHelper(asset) on the model component. It exists
+    // once the photo mode has been opened, so it is remembered for later sessions.
+    // (InteractiveHintConfig's general outline is not a character effect: the game
+    // shows it on interactive objects through a separate hint event.)
+    struct MoveRotateCharConfig {void* outlineAsset=nullptr;void* sliderPrefab=nullptr;float pickRatio=0,pickMin=0,pickMax=0,pad=0;};
+    std::string outlineFx,outlineSource;std::uint64_t outlineFxChecked=0;bool outlineSavedRead=false;
+    static std::filesystem::path outlineFile() {return settingsPath().parent_path()/L"outline_asset.txt";}
+    static bool validAsset(const std::string& s) {
+        if(s.empty()||s.size()>512||s.find("..")!=std::string::npos)return false;
+        for(unsigned char c:s)if(c<0x20||c>0x7e)return false;
+        return true;
+    }
+    std::string photoOutline() {
+        auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
+        auto* player=instance?api.call(gm("GameInstance","get_player","","Beyond.Gameplay.GamePlayer","Beyond.Gameplay"),instance):nullptr;
+        auto* snapshot=player?readField<void*>(player,"GamePlayer","snapshotSystem","Beyond.Gameplay"):nullptr;
+        if(!snapshot)return {};
+        const auto config=readField<MoveRotateCharConfig>(snapshot,"SnapshotSystem","m_moveRotateCharConfig","Beyond.Gameplay");
+        return config.outlineAsset?text(config.outlineAsset):std::string{};
+    }
     const std::string& outlineEffect() {
-        if(!outlineFx.empty()||nowMs()-outlineFxChecked<5000)return outlineFx;
+        if(outlineSource=="photo"||nowMs()-outlineFxChecked<5000)return outlineFx;
         outlineFxChecked=nowMs();
         try {
-            auto* instance=api.call(gm("GameInstance","get_instance","","Beyond.Gameplay.GameInstance","Beyond.Gameplay"));
-            auto* data=instance?readField<void*>(instance,"GameInstance","dataManager","Beyond.Gameplay"):nullptr;
-            auto* config=data?api.call(gm("DataManager","get_interactiveHintConfig","","Beyond.Gameplay.InteractiveHintConfig","Beyond.Gameplay"),data):nullptr;
-            if(!config)throw std::runtime_error("interactive hint config unavailable");
-            auto* key=readField<void*>(config,"InteractiveHintConfig","generalOutlineDefaultKey","Beyond.Gameplay");
-            auto* table=readField<void*>(config,"InteractiveHintConfig","interactiveOutlineConfigs","Beyond.Gameplay");
-            if(!key||!table)throw std::runtime_error("outline key or table missing");
-            void* name=nullptr;auto* found=collection(table,"TryGetValue",{key,&name});
-            if(!found||!*static_cast<bool*>(runtime->object_unbox(runtime->context,found))||!name)throw std::runtime_error("outline effect not configured for "+text(key));
-            outlineFx=text(name);outlineError.clear();
-        }catch(const std::exception& e) {outlineError=e.what();}
+            if(auto photo=photoOutline();validAsset(photo)) {
+                if(photo!=outlineFx) {
+                    outlineFx=photo;
+                    try {std::filesystem::create_directories(outlineFile().parent_path());std::ofstream(outlineFile(),std::ios::binary|std::ios::trunc)<<photo;}catch(...) {}
+                    note("outline: photo mode effect "+photo);
+                }
+                outlineSource="photo";outlineError.clear();return outlineFx;
+            }
+        }catch(const std::exception& e) {outlineError=std::string("photo mode outline: ")+e.what();}
+        if(!outlineSavedRead) {
+            outlineSavedRead=true;
+            try {
+                std::ifstream in(outlineFile(),std::ios::binary);
+                std::string saved((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+                if(validAsset(saved)) {outlineFx=saved;outlineSource="saved";}
+            }catch(...) {}
+        }
+        // The photo mode's character outline as observed in game 1.6.3 (2026-11-07).
+        if(outlineFx.empty()) {outlineFx="P_fxgp_common_char_outline_01_nofade_asset";outlineSource="builtin";}
         return outlineFx;
     }
     void outlineStandIns() {
@@ -2169,12 +2214,13 @@ private:
         auto apply=[&](Actor& a) {
             if(!a.entity||!a.started||!currentActor(a))return;
             if(!outlineTeammates&&!a.outlined)return;
-            const auto& fx=outlineEffect();if(fx.empty())return;
             try {
                 auto* component=api.call(entityModel,a.entity);if(!component)return;
-                if(!outlineTeammates) {api.call(stop,component,{api.string(fx)});a.outlined=false;return;}
-                if(a.outlined)return;
-                api.call(play,component,{api.string(fx)});a.outlined=true;++outlinesApplied;
+                if(!outlineTeammates) {api.call(stop,component,{api.string(a.outlineName)});a.outlined=false;return;}
+                const auto& fx=outlineEffect();if(fx.empty())return;
+                if(a.outlined&&a.outlineName==fx)return;
+                if(a.outlined)api.call(stop,component,{api.string(a.outlineName)});
+                api.call(play,component,{api.string(fx)});a.outlined=true;a.outlineName=fx;++outlinesApplied;
             }catch(const std::exception& e) {outlineError=e.what();}
         };
         for(auto& [peer,a]:actors)apply(a);
@@ -2763,7 +2809,7 @@ public:
     bool replayPlayerCast(std::uint16_t peer,int slot,const std::string& id,const std::string& key) {
         Actor* standIn=nullptr;
         if(slot==0) {if(auto actor=actors.find(peer);actor!=actors.end())standIn=&actor->second;}
-        else if(auto member=remoteMembers.find({peer,slot-1});member!=remoteMembers.end())standIn=&member->second.actor;
+        else if(auto member=remoteMembers.find({peer,slot-1});member!=remoteMembers.end()&&!member->second.hidden)standIn=&member->second.actor;
         if(!standIn||!standIn->entity||!standIn->started||!currentActor(*standIn))throw StandInNotReady("stand-in not ready");
         auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),standIn->entity);
         if(!ability)throw std::runtime_error("stand-in has no ability system");
@@ -2853,7 +2899,7 @@ public:
             }catch(const StandInNotReady& ex) {
                 // The stand-in is being (re)created, e.g. after an operator switch: keep
                 // the cast briefly instead of losing its effects.
-                if(now-at<700&&heldCasts.size()<32) {heldCasts.emplace_back(std::move(cast),at);++playerCastsHeld;continue;}
+                if(now-at<1500&&heldCasts.size()<32) {heldCasts.emplace_back(std::move(cast),at);++playerCastsHeld;continue;}
                 ++playerCastsRejected;playerCastError=ex.what();++castRejects["slot "+std::to_string(slot)+": not ready"];
             }catch(const std::exception& ex) {
                 ++playerCastsRejected;playerCastError=ex.what();
@@ -3664,7 +3710,7 @@ public:
     std::array<LocalMember,4> localMembers;
     std::uint32_t squadSequence=0;std::uint16_t squadSkeletons=0;std::uint64_t lastSquadInfo=0;
     std::array<std::string,4> squadInfoSent;
-    struct RemoteMember {std::string model,weapon;nlohmann::json growth;bool present=false;PeerView view;Avatar avatar;Actor actor;};
+    struct RemoteMember {std::string model,weapon;nlohmann::json growth;bool present=false,hidden=false;std::uint64_t lastWanted=0;PeerView view;Avatar avatar;Actor actor;};
     std::map<std::pair<std::uint16_t,int>,RemoteMember> remoteMembers;
     std::mutex squadInboxMutex;std::deque<std::pair<std::uint16_t,std::vector<unsigned char>>> squadInbox;
     std::uint64_t squadPosesSent=0,squadPosesIn=0,squadInfosIn=0,squadRejected=0;std::string squadError;
@@ -3776,7 +3822,15 @@ public:
             }catch(...) {++squadRejected;}
         }
     }
-    void dropMember(RemoteMember& m) {destroyActor(m.actor);m.actor.entity=nullptr;m.avatar=Avatar{};}
+    void dropMember(RemoteMember& m) {destroyActor(m.actor);m.actor.entity=nullptr;m.avatar=Avatar{};m.hidden=false;}
+    void setMemberVisible(RemoteMember& m,bool visible) {
+        try {
+            if(!m.actor.entity||!m.actor.started||!currentActor(m.actor))return;
+            auto* component=api.call(entityModel,m.actor.entity);auto* object=component?api.call(modelGo,component):nullptr;
+            if(object&&alive(object))api.call(setActive,object,{&visible});
+        }catch(...) {}
+        m.hidden=!visible;m.avatar=Avatar{};
+    }
     // Start a created stand-in and keep it inert (no AI, full health).
     bool prepareStandIn(Actor& actor) {
         actor.inited=api.value<bool>(gm("Entity","get_hasInited","","System.Boolean"),actor.entity);
@@ -3811,7 +3865,16 @@ public:
             const bool wanted=active&&p->hasInfo&&p->info.mapId==mapId&&p->info.levelId==levelId&&m.present&&fresh&&
                 (m.view.states.back().state.flags&proto::StateValid)&&m.view.states.back().state.mapHash==mapHash&&
                 m.view.states.back().state.skeleton==m.view.info.skeleton;
-            if(!wanted) {if(m.actor.entity)dropMember(m);++it;continue;}
+            if(!wanted) {
+                // Briefly absent (hidden by the game, a gap in its poses): keep the
+                // stand-in hidden for a while rather than recreating it.
+                const bool keep=m.actor.entity&&m.actor.started&&active&&p->hasInfo&&p->info.mapId==mapId&&p->info.levelId==levelId&&nowMs()-m.lastWanted<20000;
+                if(keep) {if(!m.hidden)setMemberVisible(m,false);}
+                else if(m.actor.entity)dropMember(m);
+                ++it;continue;
+            }
+            m.lastWanted=nowMs();
+            if(m.hidden)setMemberVisible(m,true);
             auto& actor=m.actor;
             const std::uint64_t id=(0xEFull<<56)|(0x5Aull<<48)|((link.generation()&0xFFFFFF)<<16)|(std::uint64_t(peer&0xFF)<<8)|std::uint64_t(slot);
             if(actor.id!=id||actor.model!=m.model||actor.weapon!=m.weapon||actor.growth!=m.growth) {
@@ -3838,7 +3901,7 @@ public:
     void poseSquad() {
         for(auto& [key,m]:remoteMembers) {
             auto& a=m.avatar;auto& actor=m.actor;
-            if(!actor.entity||!actor.started||m.view.states.empty()||!currentActor(actor)) {a=Avatar{};continue;}
+            if(m.hidden||!actor.entity||!actor.started||m.view.states.empty()||!currentActor(actor)) {a=Avatar{};continue;}
             auto* component=api.call(entityModel,actor.entity);auto* object=component?api.call(modelGo,component):nullptr;
             if(!object||!alive(object))continue;
             if(a.object!=object) {
@@ -3935,6 +3998,41 @@ public:
             }
         } catch(const std::exception& e) {localError=e.what();}
     }
+public:
+    std::function<void(const std::string&)> log; // module host log (game thread)
+private:
+    void note(const std::string& line) {if(log)try {log(line);}catch(...) {}}
+    std::string notedTravel,notedSquadError,notedOutlineError,notedCastError;
+    std::uint64_t notedAt=0,notedMirrored=0,notedRejected=0,notedHeld=0;std::uint32_t notedTcpOnly=0,notedUdp=0;
+    void noteEvents(Net& net) {
+        if(travelState!=notedTravel) {
+            notedTravel=travelState;
+            std::string line="travel: "+travelState;
+            if(travel)line+=" -> "+travel->map+"/"+travel->level+(travel->homeward?" (home)":"");
+            if(travelState=="failed"&&!replicationError.empty())line+=" : "+replicationError;
+            note(line);
+        }
+        const auto now=nowMs();if(now-notedAt<1000)return;
+        if(squadError!=notedSquadError) {notedSquadError=squadError;if(!squadError.empty())note("squad: "+squadError);}
+        if(outlineError!=notedOutlineError) {notedOutlineError=outlineError;if(!outlineError.empty())note("outline: "+outlineError);}
+        const auto view=net.snapshot();
+        if(view.tcpOnlyLinks!=notedTcpOnly||view.udpLinks!=notedUdp) {
+            notedTcpOnly=view.tcpOnlyLinks;notedUdp=view.udpLinks;
+            note("links: udp "+std::to_string(view.udpLinks)+", tcp only "+std::to_string(view.tcpOnlyLinks));
+        }
+        if(now-notedAt<60000)return;
+        notedAt=now;
+        if(playerCastsMirrored==notedMirrored&&playerCastsRejected==notedRejected&&playerCastsHeld==notedHeld)return;
+        std::string line="replay: ok "+std::to_string(playerCastsMirrored-notedMirrored)+", rejected "+std::to_string(playerCastsRejected-notedRejected)+
+            ", held "+std::to_string(playerCastsHeld-notedHeld)+" (last minute)";
+        notedMirrored=playerCastsMirrored;notedRejected=playerCastsRejected;notedHeld=playerCastsHeld;
+        if(!castRejects.empty())line+="; rejects "+nlohmann::json(castRejects).dump();
+        if(!playerCastError.empty()&&playerCastError!=notedCastError) {notedCastError=playerCastError;line+="; last error "+playerCastError;}
+        auto members=0,spawned=0;for(const auto& [key,m]:remoteMembers) {++members;if(m.actor.entity)++spawned;}
+        line+="; squad stand-ins "+std::to_string(spawned)+"/"+std::to_string(members)+", poses in "+std::to_string(squadPosesIn);
+        note(line);
+    }
+public:
     // Called on the game thread every frame.
     void tick(const BE_HostApiV1* host,Net& net,Session& link) {
         crash::mark("world_tick");
@@ -3945,6 +4043,7 @@ public:
             const auto now=nowMs();
             // Bones are only read while in a room; offline the module costs nothing per frame.
             if(net.currentRole()!=Role::Offline&&now-lastSample>=33) {lastSample=now;sample(net);}
+            else if(net.currentRole()==Role::Offline&&(travel||emergencyHomePending)&&now-lastSample>=100) {lastSample=now;refreshOffline();}
             localError.clear();
         } catch(const std::exception& e) {localError=e.what();character=nullptr;if(model) {try {dropLocalModel();} catch(...) {}}}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
@@ -3955,6 +4054,9 @@ public:
             const auto started=std::chrono::steady_clock::now();
             crash::mark("replication");
             try {replication(net,link);}catch(const std::exception& e) {replicationError=e.what();}
+            try {noteEvents(net);}catch(...) {}
+            // Learn the photo mode outline whenever the game has it, also offline.
+            try {if(character)outlineEffect();}catch(...) {}
             crash::mark("world_tick");
             perf.replicationMs=elapsedMs(started);
         }
@@ -4030,7 +4132,7 @@ public:
                 {"combat",{{"guest_hits_sent",guestHitsSent},{"room_hits_applied",roomHitsApplied},{"player_hits_sent",playerHitsSent},
                     {"damage_hook_calls",damageHookCalls},{"guest_hit_candidates",guestHitCandidates},{"guest_zero_damage",guestZeroDamage},{"guest_hit_send_failed",guestHitSendFailed},{"guest_deaths_blocked",guestDeathsBlocked},{"guest_hit_sources",guestHitSources},
                     {"player_hits_taken",playerHitsTaken},{"enemy_casts_sent",enemyCastsSent},{"enemy_casts_mirrored",enemyCastsMirrored},
-                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_effect",outlineFx},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
+                    {"player_casts_sent",playerCastsSent},{"player_casts_mirrored",playerCastsMirrored},{"player_casts_rejected",playerCastsRejected},{"player_casts_held",playerCastsHeld},{"effects_promoted",effectsPromoted},{"cast_options_set",castOptionsSet},{"forced_interrupts",forcedInterrupts},{"teleport_calls",teleportCalls},{"fx_local",fxLocal},{"fx_stand_in",fxStandIn},{"replay_log",replayLog},{"stand_in_effects",standInEffects},{"effects_source_hidden",effectsSourceHidden},{"effects_hidden",effectsHidden},{"effect_promote_error",effectPromoteError},{"outlines_applied",outlinesApplied},{"outline_error",outlineError},{"outline_effect",outlineFx},{"outline_source",outlineSource},{"outline_teammates",outlineTeammates},{"player_casts_hidden",playerCastsHidden},{"cast_rejects",castRejects},{"refused_skills",refusedSkills},
                     {"player_cast_error",playerCastError},{"last_player_cast",lastPlayerCast},{"actor_effects_blocked",actorEffectsBlocked},
                     {"weapon_lookups",weaponLookups},{"local_weapon",localWeapon},{"replay_skills",replaySkills},{"weapon_states_applied",weaponStatesApplied},{"weapon_state_error",weaponStateError},{"cooldowns_reset",cooldownsReset},{"squad",squadStatus()},
                     {"enemy_casts_rejected",enemyCastsRejected},{"overworld",overworldCached},
