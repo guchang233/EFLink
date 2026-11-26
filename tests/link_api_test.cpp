@@ -102,6 +102,12 @@ int main(int argc,char** argv) {
     check(waitFor([&]{for(auto& l:guest.chatSince(0)) if(l.text=="你好"&&l.name=="测试房主") return true;return false;}),"chat from the page reaches the guest");
     status=send({{"action","status"}});
     check(status["peers"].size()==2&&!status["addresses"].empty(),"status lists players and this computer's LAN addresses");
+    check(status.contains("shared_atb")&&status.contains("combat_stats")&&status.contains("vitals"),"status exposes shared_atb, combat_stats, and vitals");
+    auto atbReply=send({{"action","room_shared_atb"},{"enabled",true}});
+    check(atbReply["shared_atb"].value("allowed",false)==true&&send({{"action","status"}})["shared_atb"].value("allowed",false)==true,"host can toggle room_shared_atb via RPC");
+    const auto genBefore=atbReply["combat_stats"].value("generation",std::uint64_t(0));
+    auto rstReply=send({{"action","combat_stats_reset"}});
+    check(rstReply["combat_stats"].value("generation",std::uint64_t(0))>genBefore,"combat_stats_reset increments generation via RPC");
 
     // The shipped SDK consumer links only against the public C ABI.
     if(moduleId=="eflink.core") {

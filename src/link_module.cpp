@@ -250,6 +250,7 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     if(!nextDamage) return 0;
     if(info&&info!=damageMethod.method_info) return nextDamage(ability,modifier,info);
     std::lock_guard lock(worldMutex);
+    eflink::DamageApplicationScope damageScope(ability,modifier);
     if(!cleanupRequested)world.damageHookSeen();
     if(!cleanupRequested&&world.blocksActorEffect(ability,modifier))return 0;
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
@@ -259,9 +260,11 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
     if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
+    auto damageStat=(!cleanupRequested&&damageScope.observe())?world.beforeDamageStat(net,ability,modifier):std::optional<eflink::World::LocalDamageStat>{};
     const auto result=nextDamage(ability,modifier,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
+    if(damageStat)world.afterDamageStat(net,*damageStat);
     if(!cleanupRequested)world.noteDamage("apply",ability,std::to_string(result));
     return result;
 }
@@ -273,13 +276,75 @@ int __fastcall onTransferred(void* ability,void* modifier,bool triggerEvent,void
     if(!nextTransferred) return 0;
     if(info&&info!=transferredMethod.method_info) return nextTransferred(ability,modifier,triggerEvent,info);
     std::lock_guard lock(worldMutex);
+    eflink::DamageApplicationScope damageScope(ability,modifier);
     if(!cleanupRequested&&world.blocksActorEffect(ability,modifier))return 0;
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
+    auto damageStat=(!cleanupRequested&&damageScope.observe())?world.beforeDamageStat(net,ability,modifier):std::optional<eflink::World::LocalDamageStat>{};
     const auto result=nextTransferred(ability,modifier,triggerEvent,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
+    if(damageStat)world.afterDamageStat(net,*damageStat);
     if(!cleanupRequested)world.noteDamage("transferred",ability,std::to_string(result));
     return result;
+}
+// ---- Shared ATB (skill point gauge) hooks on BattleManager ----
+struct DepthGuard {int& depth;explicit DepthGuard(int& d):depth(d){++depth;}~DepthGuard(){--depth;}};
+using AtbUpdateFn=void(__fastcall*)(void*,float,void*);
+AtbUpdateFn nextAtbUpdate=nullptr;BE_ResolvedMethodV1 atbUpdateMethod{};bool atbUpdateHooked=false;
+void __fastcall onAtbUpdate(void* battle,float dt,void* info) {
+    if(!nextAtbUpdate) return;
+    if(info&&info!=atbUpdateMethod.method_info) {nextAtbUpdate(battle,dt,info);return;}
+    std::lock_guard lock(worldMutex);
+    DepthGuard guard(world.atbUpdateDepth);
+    nextAtbUpdate(battle,dt,info);
+}
+using AtbResetFn=void(__fastcall*)(void*,void*);
+AtbResetFn nextAtbReset=nullptr;BE_ResolvedMethodV1 atbResetMethod{};bool atbResetHooked=false;
+void __fastcall onAtbReset(void* battle,void* info) {
+    if(!nextAtbReset) return;
+    if(info&&info!=atbResetMethod.method_info) {nextAtbReset(battle,info);return;}
+    std::lock_guard lock(worldMutex);
+    DepthGuard guard(world.atbResetDepth);
+    nextAtbReset(battle,info);
+}
+using AtbCostFn=bool(__fastcall*)(void*,void*,float,float*,bool,void*);
+AtbCostFn nextAtbCost=nullptr;BE_ResolvedMethodV1 atbCostMethod{};bool atbCostHooked=false;
+bool __fastcall onAtbCost(void* battle,void* source,float cost,float* nonReturned,bool pauseRecover,void* info) {
+    if(!nextAtbCost) return false;
+    if(info&&info!=atbCostMethod.method_info) return nextAtbCost(battle,source,cost,nonReturned,pauseRecover,info);
+    std::lock_guard lock(worldMutex);
+    if(!cleanupRequested&&(world.isReplayingCast()||world.isStandInAbility(source))) {
+        if(nonReturned) *nonReturned=0.f;
+        return true;
+    }
+    const float before=world.readNativeAtb(battle);
+    bool ok=false;
+    {
+        DepthGuard guard(world.atbCostDepth);
+        ok=nextAtbCost(battle,source,cost,nonReturned,pauseRecover,info);
+    }
+    if(ok&&!cleanupRequested) {
+        const float after=world.readNativeAtb(battle);
+        const float spent=before-after;
+        if(spent>0.05f) world.onLocalAtbChange(net,-spent,"cost",pauseRecover);
+    }
+    return ok;
+}
+using AtbSetFn=void(__fastcall*)(void*,float,void*);
+AtbSetFn nextAtbSet=nullptr;BE_ResolvedMethodV1 atbSetMethod{};bool atbSetHooked=false;
+void __fastcall onAtbSet(void* battle,float value,void* info) {
+    if(!nextAtbSet) return;
+    if(info&&info!=atbSetMethod.method_info) {nextAtbSet(battle,value,info);return;}
+    std::lock_guard lock(worldMutex);
+    const bool observe=!cleanupRequested&&!world.syncingAtb&&world.atbUpdateDepth==0&&
+        world.atbCostDepth==0&&world.atbResetDepth==0&&!world.isReplayingCast();
+    const float before=observe?world.readNativeAtb(battle):0.f;
+    nextAtbSet(battle,value,info);
+    if(observe) {
+        const float after=world.readNativeAtb(battle);
+        const float delta=after-before;
+        if(std::abs(delta)>=0.05f) world.onLocalAtbChange(net,delta,delta>0.f?"gain":"cost",false);
+    }
 }
 // Observation only: whether the client considers the target immune.
 using DamageImmune=bool(__fastcall*)(void*,void*,void*);
@@ -597,6 +662,22 @@ BE_Result installHook() {
         if(api->resolve_method(api->context,&transferred,&transferredMethod)==BE_Result_Ok&&transferredMethod.method_pointer) {
             std::uint64_t transferredHandle=0;transferredHooked=host.hooks->create(host.hooks->context,kId,transferredMethod.method_pointer,reinterpret_cast<void*>(onTransferred),reinterpret_cast<void**>(&nextTransferred),&transferredHandle)==BE_Result_Ok;
         }
+        BE_MethodDescriptorV1 atbUpdate{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","_UpdateAtb","System.Single","System.Void",1};
+        if(api->resolve_method(api->context,&atbUpdate,&atbUpdateMethod)==BE_Result_Ok&&atbUpdateMethod.method_pointer) {
+            std::uint64_t h=0;atbUpdateHooked=host.hooks->create(host.hooks->context,kId,atbUpdateMethod.method_pointer,reinterpret_cast<void*>(onAtbUpdate),reinterpret_cast<void**>(&nextAtbUpdate),&h)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 atbReset{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","ResetAtb",nullptr,"System.Void",0};
+        if(api->resolve_method(api->context,&atbReset,&atbResetMethod)==BE_Result_Ok&&atbResetMethod.method_pointer) {
+            std::uint64_t h=0;atbResetHooked=host.hooks->create(host.hooks->context,kId,atbResetMethod.method_pointer,reinterpret_cast<void*>(onAtbReset),reinterpret_cast<void**>(&nextAtbReset),&h)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 atbCost{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","CostAtb","Beyond.Gameplay.Core.AbilitySystem|System.Single|System.Single&|System.Boolean","System.Boolean",4};
+        if(api->resolve_method(api->context,&atbCost,&atbCostMethod)==BE_Result_Ok&&atbCostMethod.method_pointer) {
+            std::uint64_t h=0;atbCostHooked=host.hooks->create(host.hooks->context,kId,atbCostMethod.method_pointer,reinterpret_cast<void*>(onAtbCost),reinterpret_cast<void**>(&nextAtbCost),&h)==BE_Result_Ok;
+        }
+        BE_MethodDescriptorV1 atbSet{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","BattleManager","set_atb","System.Single","System.Void",1};
+        if(api->resolve_method(api->context,&atbSet,&atbSetMethod)==BE_Result_Ok&&atbSetMethod.method_pointer) {
+            std::uint64_t h=0;atbSetHooked=host.hooks->create(host.hooks->context,kId,atbSetMethod.method_pointer,reinterpret_cast<void*>(onAtbSet),reinterpret_cast<void**>(&nextAtbSet),&h)==BE_Result_Ok;
+        }
         BE_MethodDescriptorV1 immune{"Gameplay.Beyond.dll","Beyond.Gameplay.Core","AbilitySystem","_CheckIsDamageImmune","Beyond.Gameplay.Core.AbilitySystem.Modifier&","System.Boolean",1};
         if(api->resolve_method(api->context,&immune,&immuneMethod)==BE_Result_Ok&&immuneMethod.method_pointer) {
             std::uint64_t immuneHandle=0;immuneHooked=host.hooks->create(host.hooks->context,kId,immuneMethod.method_pointer,reinterpret_cast<void*>(onImmune),reinterpret_cast<void**>(&nextImmune),&immuneHandle)==BE_Result_Ok;
@@ -689,6 +770,8 @@ void applyConfiguration(const json& value) {
     world.testingInvincible=configuration.value("testing_invincible",false);
     world.pvpScale=(std::clamp)(configuration.value("room_pvp_scale",1.0),0.1,5.0);
     world.pvpRevive=configuration.value("room_pvp_revive",true);
+    world.sharedAtbAllowed=configuration.value("room_shared_atb",false);
+    world.combatStats.autoReset=configuration.value("damage_auto_reset",false);
     world.showMarkers=configuration.value("show_player_markers",true);
     session.followHost=configuration.value("follow_host_world",true);
     session.combat=configuration.value("sync_combat",true);
@@ -743,13 +826,18 @@ json status(std::uint64_t chatAfter) {
     for(const auto& [ip,adapter]:eflink::localAddresses()) addresses.push_back({{"ip",ip},{"adapter",adapter}});
     json game;
     json worldSession;
-    {std::lock_guard lock(worldMutex);game=world.status();worldSession=session.status();}
+    json sharedAtb,combatStats,vitalsMap,pvpInfo;
+    {std::lock_guard lock(worldMutex);game=world.status();worldSession=session.status();sharedAtb=world.sharedAtbStatus(net);combatStats=world.combatStatsSnapshot();vitalsMap=world.vitalsSnapshot();pvpInfo=world.pvpStatus(net);}
+    for(auto& entry:peers) {
+        const auto key=std::to_string(entry.value("id",0));
+        if(vitalsMap.contains(key)) entry["vitals"]=vitalsMap[key];
+    }
     return {{"module",kId},{"version",kVersion},{"name",playerName()},{"role",roleName(s.role)},{"local_id",s.localId},
         {"room",{{"id",s.roomId},{"name",s.roomName},{"max_players",s.maxPlayers},{"password",s.password},{"port",s.port},{"address",s.address}}},
         {"rtt_ms",s.rttMs},{"peers",peers},{"rooms",rooms},{"chat",chat},{"chat_serial",last},{"last_error",s.lastError},
-        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"render_helper_hook_ready",renderHelperHooked},{"photo_config_hook_ready",photoConfigHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"pvp",world.pvpStatus(net)},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
+        {"addresses",addresses},{"game",game},{"world_session",worldSession},{"shared_atb",sharedAtb},{"combat_stats",combatStats},{"vitals",vitalsMap},{"damage_hook_ready",damageHooked},{"transferred_hook_ready",transferredHooked},{"atb_cost_hook_ready",atbCostHooked},{"atb_set_hook_ready",atbSetHooked},{"atb_update_hook_ready",atbUpdateHooked},{"atb_reset_hook_ready",atbResetHooked},{"immune_hook_ready",immuneHooked},{"death_hook_ready",dieHooked},{"enemy_target_hook_ready",enemyTargetHooked},{"enemy_find_hook_ready",enableEnemyFindHooked},{"skill_hook_ready",castHooked},{"weapon_hook_ready",weaponModelHooked},{"effect_lod_hook_ready",guardLodHooked},{"anim_effect_hook_ready",transformEffectHooked},{"teleport_hook_ready",teleportHooked},{"render_helper_hook_ready",renderHelperHooked},{"photo_config_hook_ready",photoConfigHooked},{"hook_ready",hooked.load()},{"official_filter_ready",officialFilterReady},{"op_filter_ready",opFilterReady},{"op_filter_note",opFilterError},{"outbound",outboundStatus()},{"testing_invincible",world.testingInvincible},{"pvp",pvpInfo},{"invincible_blocked",world.invincibleBlocked},{"hook_error",hookError},
         {"show_remote_players",configuration.value("show_remote_players",true)},{"configuration",configuration},
-        {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","unity_canvas_imgui"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
+        {"gui_ready",gui.ready()},{"gui_visible",gui.visible()},{"gui_error",guiError},{"gui_backend","overlay_dcomp"},{"gui_frames",gui.frames()},{"gui_render",gui.diagnostics()},
         {"traffic",{{"bytes_in",s.bytesIn},{"bytes_out",s.bytesOut},{"states_in",s.statesIn},{"states_out",s.statesOut},{"udp_pongs",s.pongs},{"udp_links",s.udpLinks},{"tcp_only_links",s.tcpOnlyLinks},{"unreliable_over_tcp",s.unreliableOverTcp},{"unreliable_dropped",s.unreliableDropped}}}};
 }
 
@@ -845,10 +933,19 @@ json perform(const json& input) {
         const bool pvp=input.value("pvp",configuration.value("room_pvp",false));
         const double scale=(std::clamp)(input.value("pvp_scale",configuration.value("room_pvp_scale",1.0)),0.1,5.0);
         const bool revive=input.value("pvp_revive",configuration.value("room_pvp_revive",true));
-        {std::lock_guard lock(worldMutex);world.pvpAllowed=pvp;world.pvpScale=scale;world.pvpRevive=revive;}
-        auto changed=configuration;changed["room_pvp"]=pvp;changed["room_pvp_scale"]=scale;changed["room_pvp_revive"]=revive;applyConfiguration(changed);save=true;
+        const bool sharedAtb=input.value("shared_atb",configuration.value("room_shared_atb",false));
+        {std::lock_guard lock(worldMutex);world.pvpAllowed=pvp;world.pvpScale=scale;world.pvpRevive=revive;world.sharedAtbAllowed=sharedAtb;}
+        auto changed=configuration;changed["room_pvp"]=pvp;changed["room_pvp_scale"]=scale;changed["room_pvp_revive"]=revive;changed["room_shared_atb"]=sharedAtb;applyConfiguration(changed);save=true;
         net.host(hostOptions(input));
     }
+    else if(action=="room_shared_atb") {
+        auto changed=configuration;
+        const bool enabled=input.value("enabled",configuration.value("room_shared_atb",false));
+        changed["room_shared_atb"]=enabled;applyConfiguration(changed);save=true;
+        std::lock_guard lock(worldMutex);world.sharedAtbAllowed=enabled;
+    }
+    else if(action=="combat_stats_reset") {std::lock_guard lock(worldMutex);world.resetCombatStats(net);}
+    else if(action=="combat_stats_share") {std::lock_guard lock(worldMutex);world.shareCombatStats(net);}
     else if(action=="pvp_key") {std::lock_guard lock(worldMutex);return world.pvpKey(net);}
     else if(action=="pvp_duel") {std::lock_guard lock(worldMutex);session.duelAction(net,input.at("op").get<std::string>(),input.at("target").get<std::uint16_t>());return json{{"ok",true}};}
     else if(action=="room_pvp") {
@@ -881,7 +978,7 @@ json perform(const json& input) {
     }
     else if(action=="testing_invincible") {auto changed=configuration;changed["testing_invincible"]=input.at("enabled").get<bool>();applyConfiguration(changed);save=true;}
     else if(action=="feed_option") {std::lock_guard lock(worldMutex);world.setFeedOption(input);}
-    else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()}};}
+    else if(action=="hud") {std::lock_guard lock(worldMutex);return {{"markers",world.markerSnapshot()},{"vitals",world.vitalsSnapshot()},{"shared_atb",world.sharedAtbStatus(net)},{"combat_stats",world.combatStatsSnapshot()}};}
     else if(action=="world_state") {std::lock_guard lock(worldMutex);return {{"session",session.status()},{"world",session.snapshot()},{"native",world.status().at("world_replication")}};}
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     else if(action=="native_owner_probe"||action=="native_travel_probe"||action=="native_self_cast_probe"||action=="native_feed_lifecycle_probe"||action=="enemy_census"||action=="native_move_probe"||action=="meta_search"||action=="send_traces"||action=="teleport_marks"||action=="class_info") {
@@ -895,7 +992,7 @@ json perform(const json& input) {
     else if(action=="show_remote") {auto changed=configuration;changed["show_remote_players"]=input.at("enabled");applyConfiguration(changed);save=true;}
     else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);
         // The menu sends player_name only when the player edited the field.
-        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive","pvp_key"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
+        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","hud_opacity","damage_auto_reset","damage_reset_key","pvp_key"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
     else if(action=="save_server"||action=="remove_server") {
         auto address=input.at("address").get<std::string>();if(address.empty()||address.size()>256) throw std::runtime_error("请填写有效地址");
         auto servers=configuration.value("saved_servers",json::array());json updated=json::array();
@@ -975,7 +1072,7 @@ void BE_CALL shutdown() {
         cleanupRequested=true;
         for(int i=0;i<50&&!cleanupDone.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if(host.hooks&&host.hooks->disable_module) host.hooks->disable_module(host.hooks->context,kId);
-        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;teleportHooked=false;renderHelperHooked=false;photoConfigHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;
+        hooked=false;canvasHooked=false;castHooked=false;weaponModelHooked=false;guardLodHooked=false;transformEffectHooked=false;teleportHooked=false;renderHelperHooked=false;photoConfigHooked=false;damageHooked=false;dieHooked=false;enemyTargetHooked=false;enableEnemyFindHooked=false;assignEnemyTargetHooked=false;officialFilterReady=false;opFilterReady=false;outboundObserverReady=false;transferredHooked=false;immuneHooked=false;atbUpdateHooked=false;atbResetHooked=false;atbCostHooked=false;atbSetHooked=false;
     }
     {std::lock_guard lock(registryMutex);channels.clear();listeners.clear();}
     eflink::crash::uninstall();

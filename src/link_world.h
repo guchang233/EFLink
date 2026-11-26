@@ -9,6 +9,9 @@
 #include "link_native_identity.h"
 #include "link_map_consent.h"
 #include "link_settings.h"
+#include "link_combat_stats.h"
+#include "link_damage_scope.h"
+#include "link_operator_names.h"
 #include "authority/link_native_feed.h"
 #include "authority/link_metadata.h"
 #include "authority/link_native_op_policy.h"
@@ -239,7 +242,7 @@ class World {
         m.generation=(std::max)(1u,api.value<std::uint32_t>(gm("Entity","get_serverGeneration","","System.UInt32"),entity));
         return m;
     }
-    std::uint64_t lastGuestDiagnostics=0;double localHp=0,localMaxHp=0;
+    std::uint64_t lastGuestDiagnostics=0;double localHp=0,localMaxHp=0;float localUsp=0.f,localMaxUsp=0.f;
 #ifdef EFLINK_NATIVE_DIAGNOSTICS
     std::map<std::string,std::pair<std::uint16_t,std::uint64_t>> ownerPins; // development: forced owner for 30 s
     // Development commands arrive on the RPC thread but touch the game, so they
@@ -871,9 +874,9 @@ class World {
         const bool current=settled.valid&&settled.key==mapId+"/"+levelId+"/"+hostDungeonId&&settled.pending.empty();
         if(!current) entities=nlohmann::json::array(); // the old level's monsters are gone; the new ones are not settled yet
         if(!settled.valid) return {{"map",mapId},{"level",levelId},{"dungeon",hostDungeonId},{"level_num",api.value<int>(gm("WorldInfo","get_curLevelIdNum","","System.Int32"),info)},
-            {"loading",true},{"position",{position.x,position.y,position.z}},{"entities",entities},{"pvp",pvpAllowed},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive}};
+            {"loading",true},{"position",{position.x,position.y,position.z}},{"entities",entities},{"pvp",pvpAllowed},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive},{"shared_atb",sharedAtbAllowed}};
         return {{"map",settled.map},{"level",settled.level},{"dungeon",settled.dungeon},{"level_num",settled.levelNum},
-            {"loading",!current},{"position",{settled.position.x,settled.position.y,settled.position.z}},{"entities",entities},{"pvp",pvpAllowed},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive}};
+            {"loading",!current},{"position",{settled.position.x,settled.position.y,settled.position.z}},{"entities",entities},{"pvp",pvpAllowed},{"pvp_scale",pvpScale},{"pvp_revive",pvpRevive},{"shared_atb",sharedAtbAllowed}};
     }
     template<class T> void field(void* object,const char* type,const char* name,T value,const char* space="Beyond.Gameplay.Core") {
         auto klass=api.klass(type,"Gameplay.Beyond.dll",space);
@@ -1727,6 +1730,7 @@ private:
         // room is only admitted in the overworld.
         link.setAuthority({roomHost&&privateTargetIsolationReady,roomHost&&character!=nullptr,roomHost&&link.combat,roomHost&&character&&overworldScene()});
         if(role==Role::Offline||role==Role::Connecting||!link.followHost) {
+            if(role==Role::Offline) {vitals.clear();atbRemoteEnabled=false;atbEvents.clear();combatStats.clearMirror();}
             hostMapConsent.reset();hostMapChoiceMap.clear();hostMapChoiceLevel.clear();hostMapChoiceRoom=0;
             if(!enemies.empty()||!privateEnemies.empty()||!spawnedEnemies.empty()) dropEnemies();dropActors();enemyEpoch=0;
             // Leaving the host's world returns this player to where they entered
@@ -1751,7 +1755,7 @@ private:
         if(nowMs()-lastEnemies>(nativeFeedAdapter&&guestRealm?250u:1000u)) {lastEnemies=nowMs();scanEnemies();
             for(auto& [key,s]:spawnedEnemies) if(!roomHost) {auto* created=spawnEntity(s);if(created&&!enemies.contains(key)) enemies[key]=trackEnemy(created);}}
         if(role==Role::Host) {
-            if(roomHost) {updateHostEnemies();applyRoomHits(link);applyEnemyStates(link);assignOwners();mirrorEnemyCasts(net,link);applyPlayerHits(net,link);}
+            if(roomHost) {updateHostEnemies();applyRoomHits(net,link);applyEnemyStates(link);assignOwners();mirrorEnemyCasts(net,link);applyPlayerHits(net,link);}
             for(const auto& command:link.takeCommands()) {
                 try {
                     const auto peer=command.at("from").get<std::uint16_t>();
@@ -1813,6 +1817,8 @@ private:
         try {updateTravel();}catch(const std::exception& e) {travel.reset();travelState="failed";replicationError=e.what();}
         crash::mark("actors");updateActors(net,link);
         crash::mark("pvp");try {updatePvp(net,link);}catch(const std::exception& e) {pvpError=e.what();}
+        crash::mark("shared_atb");try {updateSharedAtb(net,link);}catch(const std::exception& e) {atbError=e.what();}
+        crash::mark("combat_stats");try {updateCombatStats(net,link);}catch(...) {}
         crash::mark("squad_actors");
         try {drainSquad();updateSquadActors(net,link);}catch(const std::exception& e) {squadError=e.what();}
         crash::mark("player_casts");mirrorPlayerCasts(net,link);crash::mark("replication");
@@ -1919,6 +1925,10 @@ private:
         if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),entity)) {
             localHp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             localMaxHp=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
+            try {
+                localUsp=api.value<float>(gm("AbilitySystem","get_ultimateSp","","System.Single"),ability);
+                localMaxUsp=api.value<float>(gm("AbilitySystem","get_maxUltimateSp","","System.Single"),ability);
+            } catch(...) {}
         }
         state.flags=proto::StateValid;
         if(api.value<bool>(entityAlive,entity)) state.flags|=proto::StateAlive;
@@ -2583,7 +2593,11 @@ public:
                 const double amount=observation.hp-hp;
                 double full=observation.hp;bool skip=true;
                 api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),observation.ability,{&full,&skip});
-                if(amount>0&&session&&session->sendPlayerHit(net,observation.peer,amount,observation.key))++playerHitsSent;
+                if(amount>0&&session&&session->sendPlayerHit(net,observation.peer,amount,observation.key)) {
+                    ++playerHitsSent;
+                    if(net.currentRole()==Role::Host)
+                        combatStats.recordTaken(observation.peer,peerName(net,observation.peer),peerOpName(net,observation.peer),amount,nowMs());
+                }
             }
             if(observation.actor) {
                 if(nativeHits.size()>=32)nativeHits.erase(nativeHits.begin());
@@ -3133,7 +3147,7 @@ public:
         if(!states.empty()&&link.sendEnemyStates(net,states))enemyStatesSent+=states.size();
     }
     // Host: settle hits that guests resolved on their own clients.
-    void applyRoomHits(Session& link) {
+    void applyRoomHits(Net& net,Session& link) {
         for(const auto& hit:link.takeHits()) {
             try {
                 if(hit.at("epoch").get<std::uint64_t>()!=link.generation())continue;
@@ -3142,7 +3156,8 @@ public:
                 if(auto seed=hostEnemySeeds.find(key);seed!=hostEnemySeeds.end()&&!seed->second.value("alive",true))continue;
                 auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),e->second.entity);if(!ability)continue;
                 const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
-                double hp=before-hit.at("amount").get<double>();bool skip=true;
+                const double reqAmount=hit.at("amount").get<double>();
+                double hp=before-reqAmount;bool skip=true;
                 // The owner's client already killed it; keeping it at 1 HP left an
                 // unkillable empty-health monster on the host (dungeon waves).
                 if(hp<=0&&ownerOf(key)!=hit.at("from").get<std::uint16_t>()&&api.value<bool>(gm("AbilitySystem","get_isUndeadable","","System.Boolean"),ability))hp=1;
@@ -3150,10 +3165,16 @@ public:
                 api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
                 // Zero health goes through the native death path (OnHpZero, _Die,
                 // Entity.Die); the death hook records the room tombstone.
+                const bool killed=hp<=0&&before>0;
                 if(hp<=0&&!api.value<bool>(gm("Entity","get_markDie","","System.Boolean"),e->second.entity))
                     api.call(gm("AbilitySystem","OnHpZero"),ability);
                 ++roomHitsApplied;
                 const auto from=hit.at("from").get<std::uint16_t>();
+                const double dealt=(std::min)(reqAmount,(std::max)(0.0,before));
+                if(dealt>0.0) {
+                    combatStats.recordHit(from,peerName(net,from),peerOpName(net,from),dealt,
+                        hit.value("crit",false),hit.value("dtype",0),killed,nowMs());
+                }
                 // A guest who hits an enemy claims it, unless the current owner is
                 // already fighting it; its AI then runs against that guest.
                 if(hp>0)hitClaims[key]={from,nowMs()};
@@ -3191,7 +3212,268 @@ private:
     void* pvpDownEntity=nullptr;std::uint64_t pvpDownAt=0;
     std::uint64_t pvpHitsSent=0,pvpHitsTaken=0,pvpHitsIgnored=0,pvpDefeats=0,pvpFactionSwitches=0,pvpRecoverAt=0,pvpImmuneUntil=0,lastVitals=0;
     std::string pvpError,pvpLastDefeat;
-    std::map<std::uint16_t,std::pair<double,double>> vitals; // peer -> real hp, max hp
+    struct PeerVitals {double hp=0,maxHp=0,usp=0,maxUsp=0;std::string op;bool alive=true;std::uint64_t at=0;};
+    std::map<std::uint16_t,PeerVitals> vitals; // peer -> real hp, max hp, ultimate sp, operator name
+    // ---- Shared ATB (skill point) pool: host-authoritative ----
+public:
+    bool sharedAtbAllowed=false; // host: room setting
+    bool syncingAtb=false;
+    int atbUpdateDepth=0,atbCostDepth=0,atbResetDepth=0;
+private:
+    struct AtbEvent {std::uint64_t serial=0;std::uint16_t peer=0;std::string name;float delta=0.f;std::string reason;std::uint64_t at=0;};
+    std::deque<AtbEvent> atbEvents;
+    std::uint64_t atbEventSerial=0,lastAtbPublish=0,atbSyncsSent=0,atbSyncsApplied=0,atbDeltasSent=0,atbDeltasApplied=0;
+    float atbValue=0.f,atbMax=300.f,atbRecover=0.f;
+    bool atbRemoteEnabled=false,lastSentAtbEnabled=false;
+    std::string atbError;
+    // ---- Combat Damage Statistics ----
+public:
+    CombatStats combatStats;
+private:
+    std::uint64_t lastStatsPublish=0,lastPublishedStatsRev=0;
+    int cachedCritFlag=-1;
+    std::string peerOpName(Net& net,std::uint16_t id) const {
+        if(auto v=vitals.find(id);v!=vitals.end()&&!v->second.op.empty()) return v->second.op;
+        for(const auto& p:net.snapshot().peers) if(p.id==id&&p.hasInfo&&!p.info.modelPath.empty()) return operatorDisplayName(p.info.modelPath);
+        return {};
+    }
+    void pushAtbEvent(std::uint16_t peer,const std::string& name,float delta,const std::string& reason) {
+        if(!std::isfinite(delta)||std::abs(delta)<0.05f) return;
+        atbEvents.push_back({++atbEventSerial,peer,name,delta,reason,nowMs()});
+        while(atbEvents.size()>8) atbEvents.pop_front();
+    }
+public:
+    bool isReplayingCast() const {return replayingCast;}
+    bool sharedAtbActive(Net& net) const {
+        const auto role=net.currentRole();
+        if(role==Role::Host) return sharedAtbAllowed;
+        if(role!=Role::Client||!session||!session->ready()) return false;
+        return session->snapshot().value("shared_atb",false)||atbRemoteEnabled;
+    }
+    bool isStandInAbility(void* ability) {
+        if(!ability) return false;
+        try {
+            auto* entity=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
+            if(!entity) return false;
+            for(const auto& [peer,actor]:actors) if(actor.entity==entity) return true;
+            for(const auto& [key,member]:remoteMembers) if(member.actor.entity==entity) return true;
+        } catch(...) {}
+        return false;
+    }
+    float readNativeAtb(void* battle) {
+        if(!battle) return 0.f;
+        try {return api.value<float>(gm("BattleManager","get_atb","","System.Single"),battle);}
+        catch(...) {return 0.f;}
+    }
+    void onLocalAtbChange(Net& net,float delta,const char* reason,bool pauseRecover) {
+        try {
+            if(syncingAtb||atbUpdateDepth>0||atbResetDepth>0||replayingCast||!character||!session) return;
+            if(!std::isfinite(delta)||std::abs(delta)<0.05f||std::abs(delta)>500.f) return;
+            if(!sharedAtbActive(net)) return;
+            const auto role=net.currentRole();
+            if(role==Role::Host) {
+                if(auto* battle=staticObject("battle")) {
+                    atbValue=api.value<float>(gm("BattleManager","get_atb","","System.Single"),battle);
+                    atbMax=api.value<float>(gm("BattleManager","get_atbMax","","System.Single"),battle);
+                    atbRecover=api.value<float>(gm("BattleManager","GetAtbRecover","","System.Single"),battle);
+                }
+                const auto me=net.snapshot().localId;
+                const auto who=peerName(net,me);
+                pushAtbEvent(me,who,delta,reason);
+                if(session->sendAtbState(net,true,atbValue,atbMax>0.f?atbMax:300.f,atbRecover,me,who,delta,reason)) {
+                    ++atbSyncsSent;lastAtbPublish=nowMs();
+                }
+            } else if(role==Role::Client&&session->ready()) {
+                const auto& w=session->snapshot();
+                if(w.value("map",std::string{})!=mapId||w.value("level",std::string{})!=levelId) return;
+                if(session->sendAtbDelta(net,delta,reason,pauseRecover)) ++atbDeltasSent;
+            }
+        } catch(const std::exception& e) {atbError=e.what();}
+    }
+    nlohmann::json sharedAtbStatus(Net& net) const {
+        nlohmann::json events=nlohmann::json::array();
+        const auto now=nowMs();
+        for(const auto& ev:atbEvents) {
+            if(now>ev.at&&now-ev.at>8000) continue;
+            events.push_back({{"serial",ev.serial},{"peer",ev.peer},{"name",ev.name},{"delta",std::round(ev.delta*10.f)/10.f},{"reason",ev.reason},{"age_ms",now>=ev.at?now-ev.at:0}});
+        }
+        return {{"allowed",sharedAtbAllowed},{"active",sharedAtbActive(net)},
+            {"value",std::round(atbValue*10.f)/10.f},{"max",std::round(atbMax*10.f)/10.f},{"recover",std::round(atbRecover*10.f)/10.f},
+            {"events",std::move(events)},{"syncs_sent",atbSyncsSent},{"syncs_applied",atbSyncsApplied},
+            {"deltas_sent",atbDeltasSent},{"deltas_applied",atbDeltasApplied},{"error",atbError}};
+    }
+    nlohmann::json vitalsSnapshot() const {
+        nlohmann::json out=nlohmann::json::object();
+        const auto now=nowMs();
+        for(const auto& [id,v]:vitals) {
+            out[std::to_string(id)]={{"id",id},{"hp",std::round(v.hp)},{"max_hp",std::round(v.maxHp)},
+                {"usp",std::round(v.usp*10.0)/10.0},{"max_usp",std::round(v.maxUsp*10.0)/10.0},
+                {"op",v.op},{"alive",v.alive},{"age_ms",now>=v.at?now-v.at:0}};
+        }
+        return out;
+    }
+    nlohmann::json combatStatsSnapshot() const {return combatStats.snapshot(nowMs());}
+    void resetCombatStats(Net& net) {
+        if(net.currentRole()==Role::Client&&session) {
+            session->requestDamageReset(net);
+        } else {
+            combatStats.reset(nowMs());
+            lastPublishedStatsRev=0;
+            if(net.currentRole()==Role::Host&&session) session->sendDamageStats(net,combatStats.snapshot(nowMs()));
+        }
+    }
+    void shareCombatStats(Net& net) {
+        const auto summary=combatStats.formatChatSummary(nowMs());
+        if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) net.chat(summary);
+    }
+private:
+    void applyNativeAtb(void* battle,float value) {
+        if(!battle||!std::isfinite(value)) return;
+        float clamped=(std::clamp)(value,0.f,atbMax>0.f?atbMax:300.f);
+        syncingAtb=true;
+        try {api.call(gm("BattleManager","set_atb","System.Single"),battle,{&clamped});}
+        catch(...) {syncingAtb=false;throw;}
+        syncingAtb=false;
+    }
+    void updateSharedAtb(Net& net,Session& link) {
+        const auto role=net.currentRole();
+        link.sharedAtb=role==Role::Host&&sharedAtbAllowed;
+        void* battle=nullptr;
+        try {battle=staticObject("battle");} catch(...) {battle=nullptr;}
+        if(battle) {
+            try {
+                const float cur=api.value<float>(gm("BattleManager","get_atb","","System.Single"),battle);
+                const float mx=api.value<float>(gm("BattleManager","get_atbMax","","System.Single"),battle);
+                const float rec=api.value<float>(gm("BattleManager","GetAtbRecover","","System.Single"),battle);
+                if(std::isfinite(mx)&&mx>0.f) atbMax=mx;
+                if(std::isfinite(rec)&&rec>=0.f) atbRecover=rec;
+                if(role!=Role::Client||!sharedAtbActive(net)) if(std::isfinite(cur)) atbValue=cur;
+            } catch(...) {}
+        }
+        if(role==Role::Host) {
+            for(const auto& d:link.takeAtbDeltas()) {
+                if(!sharedAtbAllowed||!battle) continue;
+                const auto from=d.at("from").get<std::uint16_t>();
+                const float delta=float(d.at("delta").get<double>());
+                const auto reason=d.value("reason",std::string("cost"));
+                const float cur=readNativeAtb(battle);
+                const float nextVal=(std::clamp)(cur+delta,0.f,atbMax>0.f?atbMax:300.f);
+                applyNativeAtb(battle,nextVal);
+                atbValue=nextVal;++atbDeltasApplied;
+                const auto who=peerName(net,from);
+                pushAtbEvent(from,who,delta,reason);
+                if(link.sendAtbState(net,true,atbValue,atbMax>0.f?atbMax:300.f,atbRecover,from,who,delta,reason)) {
+                    ++atbSyncsSent;lastAtbPublish=nowMs();
+                }
+            }
+            const auto now=nowMs();
+            if(sharedAtbAllowed!=lastSentAtbEnabled||(sharedAtbAllowed&&now-lastAtbPublish>=150)) {
+                lastSentAtbEnabled=sharedAtbAllowed;lastAtbPublish=now;
+                if(link.sendAtbState(net,sharedAtbAllowed,atbValue,atbMax>0.f?atbMax:300.f,atbRecover)) ++atbSyncsSent;
+            }
+        } else if(role==Role::Client) {
+            const bool sameScene=link.ready()&&link.snapshot().value("map",std::string{})==mapId&&link.snapshot().value("level",std::string{})==levelId;
+            for(const auto& u:link.takeAtbUpdates()) {
+                atbRemoteEnabled=u.value("enabled",false);
+                atbValue=float(u.value("value",double(atbValue)));
+                atbMax=float(u.value("max",double(atbMax)));
+                atbRecover=float(u.value("recover",double(atbRecover)));
+                const auto actor=u.value("actor",std::uint16_t(0));
+                const float delta=float(u.value("delta",0.0));
+                const auto reason=u.value("reason",std::string{});
+                if(actor!=0&&std::abs(delta)>=0.05f) {
+                    auto actorName=u.value("actor_name",std::string{});
+                    if(actorName.empty()) actorName=peerName(net,actor);
+                    pushAtbEvent(actor,actorName,delta,reason);
+                }
+                if(atbRemoteEnabled&&battle&&sameScene&&character) {
+                    const float localCur=readNativeAtb(battle);
+                    if((actor!=0&&std::abs(delta)>=0.05f)||std::abs(localCur-atbValue)>=0.35f) {
+                        applyNativeAtb(battle,atbValue);++atbSyncsApplied;
+                    }
+                }
+            }
+        }
+        atbError.clear();
+    }
+    void updateCombatStats(Net& net,Session& link) {
+        const auto role=net.currentRole();
+        const auto now=nowMs();
+        if(role==Role::Host) {
+            if(link.takeDamageResetRequested()) {combatStats.reset(now);lastPublishedStatsRev=0;}
+            for(const auto& p:net.snapshot().peers) {
+                if(p.hasInfo) combatStats.updatePeerMeta(p.id,p.info.name,peerOpName(net,p.id));
+            }
+            if(now-lastStatsPublish>=300&&combatStats.revision()!=lastPublishedStatsRev) {
+                lastStatsPublish=now;lastPublishedStatsRev=combatStats.revision();
+                link.sendDamageStats(net,combatStats.snapshot(now));
+            }
+        } else if(role==Role::Client) {
+            if(auto remote=link.takeRemoteDamageStats()) combatStats.applyRemoteSnapshot(*remote);
+        }
+    }
+    void extractModifierMeta(void* modifier,bool& isCrit,int& damageType) {
+        isCrit=false;damageType=0;
+        if(!modifier) return;
+        try {
+            if(cachedCritFlag<0) cachedCritFlag=enumValue<int>("AbilitySystem/Modifier/SharedFlagIndex","IsCritical");
+            int flag=cachedCritFlag;
+            isCrit=api.value<bool>(gm("AbilitySystem/Modifier","CheckSharedFlag","Beyond.Gameplay.Core.AbilitySystem.Modifier.SharedFlagIndex","System.Boolean"),modifier,{&flag});
+        } catch(...) {}
+        try {
+            damageType=api.value<int>(gm("AbilitySystem/Modifier","get_damageType","","Beyond.GEnums.DamageType"),modifier);
+        } catch(...) {}
+    }
+public:
+    struct LocalDamageStat {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;double before=0;bool isCrit=false;int damageType=0;bool isEnemy=false;bool isSelf=false;};
+    std::optional<LocalDamageStat> beforeDamageStat(Net& net,void* ability,void* modifier) {
+        try {
+            if(applyingDamage||!ability||!modifier||!character) return {};
+            if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier)) return {};
+            auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
+            if(!target) return {};
+            const auto role=net.currentRole();
+            // Track self damage taken on host or offline.
+            if(target==character&&(role==Role::Host||role==Role::Offline)) {
+                const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+                if(!std::isfinite(before)||before<=0.0) return {};
+                return LocalDamageStat{ability,target,identityOf(target),before,false,0,false,true};
+            }
+            // Only host and offline record local damage dealt to enemies directly here
+            // (guests submit enemy hits to the host, which records them in applyRoomHits).
+            if(role!=Role::Host&&role!=Role::Offline) return {};
+            if(!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),target)) return {};
+            auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
+            auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
+            if(!sourceEntity||api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),sourceEntity)) return {};
+            // Exclude remote players' stand-ins.
+            for(const auto& [peer,actor]:actors) if(actor.entity==sourceEntity) return {};
+            for(const auto& [key,member]:remoteMembers) if(member.actor.entity==sourceEntity) return {};
+            const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+            if(!std::isfinite(before)||before<=0.0) return {};
+            LocalDamageStat stat{ability,target,identityOf(target),before,false,0,true,false};
+            extractModifierMeta(modifier,stat.isCrit,stat.damageType);
+            return stat;
+        } catch(...) {return {};}
+    }
+    void afterDamageStat(Net& net,const LocalDamageStat& stat) {
+        try {
+            if(!currentEntity(stat.target,stat.identity)) return;
+            const double after=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),stat.ability);
+            const double dealt=stat.before-(std::max)(0.0,after);
+            if(!std::isfinite(dealt)||dealt<=0.0) return;
+            const auto view=net.snapshot();
+            const std::uint16_t selfId=view.localId?view.localId:std::uint16_t(1);
+            const std::string selfName=view.localId?peerName(net,view.localId):net.name();
+            const std::string op=operatorDisplayName(localModel);
+            if(stat.isEnemy) {
+                combatStats.recordHit(selfId,selfName,op,dealt,stat.isCrit,stat.damageType,after<=0.0&&stat.before>0.0,nowMs());
+            } else if(stat.isSelf) {
+                combatStats.recordTaken(selfId,selfName,op,dealt,nowMs());
+            }
+        } catch(...) {}
+    }
+private:
     bool pvpActive(Net& net) {
         const auto role=net.currentRole();
         if(role==Role::Host)return pvpAllowed;
@@ -3226,23 +3508,31 @@ private:
     void updatePvp(Net& net,Session& link) {
         const auto role=net.currentRole();
         link.pvp=role==Role::Host&&pvpAllowed;
-        const bool active=(role==Role::Host||role==Role::Client)&&pvpActive(net);
-        for(auto& v:link.takeVitals())vitals[v.at("origin").get<std::uint16_t>()]={v.at("hp").get<double>(),v.at("max").get<double>()};
+        const bool connected=role==Role::Host||role==Role::Client;
+        const bool active=connected&&pvpActive(net);
+        const auto now=nowMs();
+        for(auto& v:link.takeVitals()) {
+            const auto origin=v.at("origin").get<std::uint16_t>();
+            vitals[origin]={v.at("hp").get<double>(),v.at("max").get<double>(),
+                v.value("usp",0.0),v.value("max_usp",0.0),v.value("op",std::string{}),
+                v.value("alive",true),now};
+        }
         const auto setFaction=gm("Entity","OverrideFaction","Beyond.Gameplay.Core.FactionIndex");
         const auto view=net.snapshot();
+        // Prune departed peers from vitals.
+        for(auto it=vitals.begin();it!=vitals.end();) {
+            bool found=false;for(const auto& p:view.peers) if(p.id==it->first) {found=true;break;}
+            if(!found) it=vitals.erase(it);else ++it;
+        }
         for(auto& [peer,a]:actors) {
             if(!a.entity||!a.started||!currentActor(a))continue;
             // A player whose operator has fallen (pose not alive, or zero health
             // reported) cannot be locked or hit until it is up again.
             bool up=true;
             for(const auto& p:view.peers)if(p.id==peer&&!p.states.empty()&&!(p.states.back().state.flags&proto::StateAlive))up=false;
-            if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.first<=0)up=false;
+            if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.hp<=0)up=false;
             const bool hostile=active&&up&&link.duels.contains(peer);
             if(hostile!=a.pvpFaction) {
-                // Neutral is hostile to players (Good) and to monsters (Bad) alike:
-                // this player can lock and hit the stand-in, monsters still attack it.
-                // The battle manager decides lock-on candidates when an entity is
-                // registered (hostile factions only), so register again after it.
                 auto* battle=staticObject("battle");
                 if(hostile) {
                     a.factionOriginal=api.value<int>(gm("Entity","get_factionIndex","","Beyond.Gameplay.Core.FactionIndex"),a.entity);int neutral=4;api.call(setFaction,a.entity,{&neutral});
@@ -3254,23 +3544,33 @@ private:
                 a.pvpFaction=hostile;++pvpFactionSwitches;
             }
             // The stand-in's health bar shows that player's real health.
-            if(active)if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.second>0)
+            if(active)if(auto v=vitals.find(peer);v!=vitals.end()&&v->second.maxHp>0)
                 if(auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),a.entity)) {
                     const double max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
-                    const double hp=(std::clamp)(v->second.first/v->second.second*max,1.,max),now=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
-                    if(std::isfinite(max)&&max>0&&std::abs(now-hp)>.5) {bool skip=true;double value=hp;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&value,&skip});}
+                    const double hp=(std::clamp)(v->second.hp/v->second.maxHp*max,1.,max),curHp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
+                    if(std::isfinite(max)&&max>0&&std::abs(curHp-hp)>.5) {bool skip=true;double value=hp;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&value,&skip});}
                 }
         }
-        if(!active) {vitals.clear();pvpRecoverAt=pvpImmuneUntil=0;return;}
-        if(!usable(character))return;
+        if(!active) {pvpRecoverAt=pvpImmuneUntil=0;}
+        if(!connected||!usable(character))return;
         auto* own=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);if(!own)return;
-        if(pvpRecoverAt&&nowMs()>=pvpRecoverAt) {
+        if(active&&pvpRecoverAt&&now>=pvpRecoverAt) {
             pvpRecoverAt=0;double max=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),own);
             if(std::isfinite(max)&&max>0)setHealth(own,max,true);
         }
-        if(nowMs()-lastVitals>=250) {
-            lastVitals=nowMs();
-            link.sendVitals(net,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),own),api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),own));
+        if(now-lastVitals>=200) {
+            lastVitals=now;
+            const double hp=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),own);
+            const double maxHp=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),own);
+            double usp=localUsp,maxUsp=localMaxUsp;
+            try {
+                usp=api.value<float>(gm("AbilitySystem","get_ultimateSp","","System.Single"),own);
+                maxUsp=api.value<float>(gm("AbilitySystem","get_maxUltimateSp","","System.Single"),own);
+            } catch(...) {}
+            const bool alive_=api.value<bool>(entityAlive,character);
+            const std::string op=operatorDisplayName(localModel);
+            vitals[view.localId]={hp,maxHp,usp,maxUsp,op,alive_,now};
+            link.sendVitals(net,hp,maxHp,usp,maxUsp,op,alive_);
         }
     }
     std::string peerName(Net& net,std::uint16_t id) {
@@ -3396,8 +3696,13 @@ public:
                 if(key.rfind("pvp:",0)==0) {applyPvpHit(net,ability,hit.at("amount").get<double>(),key);continue;}
                 // Health floor of 1: this is the player's real account operator,
                 // and room enemies are not part of the official server's world.
-                double hp=(std::max)(1.,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)-hit.at("amount").get<double>());bool skip=true;
+                const double amt=hit.at("amount").get<double>();
+                double hp=(std::max)(1.,api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability)-amt);bool skip=true;
                 api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
+                if(net.currentRole()==Role::Host&&amt>0.0) {
+                    const auto me=net.snapshot().localId;
+                    combatStats.recordTaken(me,peerName(net,me),operatorDisplayName(localModel),amt,nowMs());
+                }
                 ++playerHitsTaken;
             }catch(const std::exception& ex){replicationError=ex.what();}
         }
@@ -3405,7 +3710,7 @@ public:
     // Guest side: an attack resolved by this player's own client on a room
     // replica. The replica is filled first so it never dies locally (the host owns
     // death and rewards); the measured loss is reported to the host.
-    struct GuestHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::string key;double before=0,full=0;};
+    struct GuestHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::string key;double before=0,full=0;bool isCrit=false;int damageType=0;};
     std::optional<GuestHit> beforeGuestHit(Net& net,void* ability,void* modifier) {
         try {
             if(applyingDamage||!session||!session->combat||!session->followHost||!session->ready()||net.currentRole()!=Role::Client||!ability||!modifier||!character)return {};
@@ -3429,6 +3734,7 @@ public:
                 if(guestHitSources.size()<64||guestHitSources.contains(sourceTemplate))++guestHitSources[sourceTemplate];
             }
             GuestHit hit{ability,target,identity,key};
+            extractModifierMeta(modifier,hit.isCrit,hit.damageType);
             hit.before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
             if(!std::isfinite(hit.before)||!std::isfinite(hit.full)||hit.full<=0)return {};
@@ -3443,7 +3749,7 @@ public:
             const double amount=(std::min)(hit.full,hit.full-after);
             double restore=(std::max)(1.,hit.before-(std::max)(0.,amount));bool skip=true;
             api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),hit.ability,{&restore,&skip});
-            if(amount>0&&session&&session->submitHit(net,hit.key,amount)) {++guestHitsSent;localHitAt[hit.key]=nowMs();}
+            if(amount>0&&session&&session->submitHit(net,hit.key,amount,hit.isCrit,hit.damageType)) {++guestHitsSent;localHitAt[hit.key]=nowMs();}
             else if(amount<=0)++guestZeroDamage;
             else ++guestHitSendFailed;
         }catch(const std::exception& e){replicationError=e.what();}
@@ -4192,7 +4498,7 @@ public:
             {"growth",a.growth},
             {"authorized_teleports",a.teleports},{"error",a.error}});
         nlohmann::json targetStatus=nlohmann::json::array();for(const auto& [key,e]:enemies)targetStatus.push_back({{"key",key},{"queries",e.targetQueries},{"enable_queries",e.enableQueries},{"assignments",e.targetAssignments},{"foreign_targets_rejected",e.foreignTargetsRejected},{"target_actor",e.targetActor},{"range",e.targetRange},{"error",e.targetError}});
-        auto result=nlohmann::json{{"local_model",localModel},{"map_id",mapId},{"level_id",levelId},{"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},
+        auto result=nlohmann::json{{"local_model",localModel},{"local_op",operatorDisplayName(localModel)},{"map_id",mapId},{"level_id",levelId},{"local_valid",character!=nullptr},{"local_hp",localHp},{"local_max_hp",localMaxHp},{"local_usp",localUsp},{"local_max_usp",localMaxUsp},
             {"local_bones",bones.size()},{"samples",samples},{"error",localError},{"avatars",remote},{"markers",markers},
             {"world_replication",{{"native_entities",enemies.size()},{"private_enemies_quarantined",privateEnemies.size()},
                 {"guest_policy",{{"ready",guestGatesReady},{"restricted",guestRestrictionsActive},{"target_isolation_ready",privateTargetIsolationReady},

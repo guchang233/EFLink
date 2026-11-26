@@ -5,6 +5,7 @@
 #include "link_net.h"
 #include "link_entry.h"
 #include "link_realm.h"
+#include "link_combat_stats.h"
 #include <optional>
 #include "nlohmann/json.hpp"
 
@@ -57,6 +58,13 @@ class Session {
     // its attacks; the host bounds them and owns the enemy's HP and death.
     std::deque<Json> hits,playerHits,enemyCasts,enemyStates,playerCasts,vitals;std::map<std::uint16_t,std::pair<std::uint64_t,int>> vitalBudgets;std::map<std::uint16_t,std::pair<std::uint64_t,int>> castBudgets;std::map<std::uint16_t,std::uint64_t> hitSequences;
     std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> hitBudgets;std::uint64_t hitSequence=0,hitsAccepted=0;
+    // Shared ATB pool & combat damage statistics channels.
+    std::deque<Json> atbDeltas,atbUpdates;
+    std::map<std::uint16_t,std::uint64_t> atbPeerSequences;
+    std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> atbBudgets;
+    std::uint64_t atbDeltaSeq=0,atbStateSeq=0,atbLastStateSeq=0;
+    Json remoteDamageStats;bool hasRemoteDamageStats=false;
+    bool damageResetRequested=false;std::map<std::uint16_t,std::uint64_t> damageResetAt;
     std::uint64_t lastGrowthPublish=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
     // ---- PVP duels: two players must agree before they can hurt each other ----
@@ -166,6 +174,7 @@ class Session {
 public:
     bool followHost=true,combat=true;
     bool pvp=false; // host: the room allows players to hurt each other (set by the game adapter)
+    bool sharedAtb=false; // host: the room shares one host-authoritative ATB (skill point) pool
     std::set<std::uint16_t> duels;                       // players this one is in a PVP duel with
     std::map<std::uint16_t,std::uint64_t> duelInvites;   // pending invitations to this player (inviter -> received)
     std::string duelNotice;std::uint64_t duelNoticeSerial=0;
@@ -198,6 +207,9 @@ public:
             realm.reset(room);
             growthRequests.clear();lastGrowthPublish=0;
             duelPairs.clear();duelPending.clear();duelBudgets.clear();duels.clear();duelInvites.clear();
+            atbDeltas.clear();atbUpdates.clear();atbPeerSequences.clear();atbBudgets.clear();
+            atbDeltaSeq=atbStateSeq=atbLastStateSeq=0;
+            remoteDamageStats=Json();hasRemoteDamageStats=false;damageResetRequested=false;damageResetAt.clear();
         }
         self=s.localId;maintainDuels(net,s);
         if(role==Role::Host&&ready()) realm.reconcile(s,epoch,world.value("map",std::string{}),world.value("level",std::string{}));
@@ -304,7 +316,9 @@ public:
                     }
                     if(!target) {++rejected;continue;}
                     ++budget.second;++hitsAccepted;
-                    hits.push_back({{"from",packet.from},{"epoch",epoch},{"key",key},{"amount",amount}});
+                    const bool isCrit=b.value("crit",false);
+                    const int dtype=b.value("dtype",0);
+                    hits.push_back({{"from",packet.from},{"epoch",epoch},{"key",key},{"amount",amount},{"crit",isCrit},{"dtype",dtype}});
                 } else if(kind=="player_hit"&&role==Role::Client&&packet.from==proto::kHostId) {
                     const double amount=b.at("amount").get<double>();
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||playerHits.size()>=64) {++rejected;continue;}
@@ -342,15 +356,54 @@ public:
                     if(role==Role::Host) send(net,{{"kind","player_cast"},{"epoch",epoch},{"origin",origin},{"slot",slot},{"skill",skill},{"target",target}});
                     playerCasts.push_back({{"origin",origin},{"slot",slot},{"skill",skill},{"target",target}});
                 } else if(kind=="vitals"&&(role==Role::Client?packet.from==proto::kHostId:role==Role::Host&&find(s,packet.from)!=nullptr)) {
-                    // A player's own health (PVP: shown on their stand-in elsewhere).
+                    // A player's own health & ultimate SP (shown in teammate HUD and PVP stand-in).
                     const auto origin=role==Role::Host?packet.from:b.at("origin").get<std::uint16_t>();
                     const double hp=b.at("hp").get<double>(),max=b.at("max").get<double>();
-                    if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(hp)||!std::isfinite(max)||max<=0||max>1e9||hp<0||hp>max*1.01) {++rejected;continue;}
+                    const double usp=b.value("usp",0.0),maxUsp=b.value("max_usp",0.0);
+                    const auto op=b.value("op",std::string{}).substr(0,48);
+                    const bool alive_=b.value("alive",hp>0.0);
+                    if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(hp)||!std::isfinite(max)||max<=0||max>1e9||hp<0||hp>max*1.01||
+                       !std::isfinite(usp)||!std::isfinite(maxUsp)||usp<0||maxUsp<0||maxUsp>1e6||(maxUsp>0&&usp>maxUsp*1.05)) {++rejected;continue;}
                     auto& budget=vitalBudgets[origin];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
                     if(budget.second>=10) {++rejected;continue;}
                     ++budget.second;
-                    if(role==Role::Host) send(net,{{"kind","vitals"},{"epoch",epoch},{"origin",origin},{"hp",hp},{"max",max}});
-                    if(vitals.size()<64) vitals.push_back({{"origin",origin},{"hp",hp},{"max",max}});
+                    Json fwd={{"kind","vitals"},{"epoch",epoch},{"origin",origin},{"hp",hp},{"max",max},{"usp",usp},{"max_usp",maxUsp},{"op",op},{"alive",alive_}};
+                    if(role==Role::Host) send(net,fwd);
+                    if(vitals.size()<64) vitals.push_back({{"origin",origin},{"hp",hp},{"max",max},{"usp",usp},{"max_usp",maxUsp},{"op",op},{"alive",alive_}});
+                } else if(kind=="atb_delta"&&role==Role::Host&&sharedAtb) {
+                    const auto seq=b.at("seq").get<std::uint64_t>();
+                    const double delta=b.at("delta").get<double>();
+                    const auto reason=b.value("reason",std::string{});
+                    const bool pauseRecover=b.value("pause",false);
+                    const auto* p=find(s,packet.from);
+                    if(!ready()||b.at("epoch").get<std::uint64_t>()!=epoch||!seq||seq<=atbPeerSequences[packet.from]||
+                       !p||!std::isfinite(delta)||std::abs(delta)<0.01||std::abs(delta)>500.0||
+                       (reason!="cost"&&reason!="gain")||atbDeltas.size()>=128||
+                       p->info.mapId!=world.value("map",std::string{})||p->info.levelId!=world.value("level",std::string{})) {++rejected;continue;}
+                    auto& budget=atbBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
+                    if(budget.second>=30) {++rejected;continue;}
+                    ++budget.second;atbPeerSequences[packet.from]=seq;
+                    atbDeltas.push_back({{"from",packet.from},{"seq",seq},{"delta",delta},{"reason",reason},{"pause",pauseRecover}});
+                } else if(kind=="atb_state"&&role==Role::Client&&packet.from==proto::kHostId) {
+                    const auto seq=b.at("seq").get<std::uint64_t>();
+                    const bool enabled=b.at("enabled").get<bool>();
+                    const double val=b.at("value").get<double>(),maxVal=b.at("max").get<double>(),rec=b.value("recover",0.0);
+                    const double delta=b.value("delta",0.0);
+                    const auto actor=b.value("actor",std::uint16_t(0));
+                    const auto actorName=b.value("actor_name",std::string{}).substr(0,64);
+                    const auto reason=b.value("reason",std::string{}).substr(0,16);
+                    if(!seq||seq<=atbLastStateSeq||!std::isfinite(val)||!std::isfinite(maxVal)||!std::isfinite(rec)||!std::isfinite(delta)||
+                       maxVal<=0.0||maxVal>2000.0||val<-0.01||val>maxVal*1.05||std::abs(delta)>500.0||atbUpdates.size()>=64) {++rejected;continue;}
+                    atbLastStateSeq=seq;
+                    atbUpdates.push_back({{"seq",seq},{"enabled",enabled},{"value",val},{"max",maxVal},{"recover",rec},
+                        {"actor",actor},{"actor_name",actorName},{"delta",delta},{"reason",reason}});
+                } else if(kind=="damage_stats"&&role==Role::Client&&packet.from==proto::kHostId) {
+                    if(!b.contains("stats")||!CombatStats::validRemoteSnapshot(b.at("stats"))) {++rejected;continue;}
+                    remoteDamageStats=b.at("stats");hasRemoteDamageStats=true;
+                } else if(kind=="damage_reset"&&role==Role::Host) {
+                    const auto now=nowMs();
+                    if(now-damageResetAt[packet.from]<500) {++rejected;continue;}
+                    damageResetAt[packet.from]=now;damageResetRequested=true;
                 } else if(kind=="pvp_duel"&&role==Role::Host) {
                     const auto op=b.at("op").get<std::string>();const auto target=b.at("target").get<std::uint16_t>();
                     auto& budget=duelBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
@@ -401,9 +454,9 @@ public:
         return send(net,{{"kind","skill_intent"},{"epoch",epoch},{"seq",++commandSequence},{"actor",playerEntity(net.snapshot().localId)},
             {"key",key},{"skill",skill}},proto::kHostId);
     }
-    bool submitHit(Net& net,const std::string& key,double amount) {
+    bool submitHit(Net& net,const std::string& key,double amount,bool isCrit=false,int damageType=0) {
         if(role!=Role::Client||!combat||!canAct(net.snapshot().localId)||!std::isfinite(amount)||amount<=0) return false;
-        return send(net,{{"kind","hit"},{"epoch",epoch},{"seq",++hitSequence},{"key",key},{"amount",amount}},proto::kHostId);
+        return send(net,{{"kind","hit"},{"epoch",epoch},{"seq",++hitSequence},{"key",key},{"amount",amount},{"crit",isCrit},{"dtype",damageType}},proto::kHostId);
     }
     bool sendPlayerHit(Net& net,std::uint16_t peer,double amount,const std::string& key) {
         if(!ready()||!std::isfinite(amount)||amount<=0) return false;
@@ -427,14 +480,42 @@ public:
         return false;
     }
     std::deque<Json> takePlayerCasts() {std::deque<Json> out;out.swap(playerCasts);return out;}
-    bool sendVitals(Net& net,double hp,double max) {
+    bool sendVitals(Net& net,double hp,double max,double usp=0.0,double maxUsp=0.0,const std::string& op={},bool alive_=true) {
         if(!ready()||!std::isfinite(hp)||!std::isfinite(max)||max<=0) return false;
-        Json body{{"kind","vitals"},{"epoch",epoch},{"origin",net.snapshot().localId},{"hp",hp},{"max",max}};
+        Json body{{"kind","vitals"},{"epoch",epoch},{"origin",net.snapshot().localId},{"hp",hp},{"max",max},
+            {"usp",std::isfinite(usp)?(std::max)(0.0,usp):0.0},{"max_usp",std::isfinite(maxUsp)?(std::max)(0.0,maxUsp):0.0},
+            {"op",op.substr(0,48)},{"alive",alive_}};
         if(role==Role::Host) return send(net,std::move(body));
         if(role==Role::Client) return send(net,std::move(body),proto::kHostId);
         return false;
     }
     std::deque<Json> takeVitals() {std::deque<Json> out;out.swap(vitals);return out;}
+    // Shared ATB pool transport (host-authoritative).
+    bool sendAtbDelta(Net& net,double delta,const std::string& reason,bool pauseRecover=false) {
+        if(role!=Role::Client||!ready()||!std::isfinite(delta)||std::abs(delta)<0.01||std::abs(delta)>500.0) return false;
+        return send(net,{{"kind","atb_delta"},{"epoch",epoch},{"seq",++atbDeltaSeq},{"delta",delta},{"reason",reason},{"pause",pauseRecover}},proto::kHostId);
+    }
+    bool sendAtbState(Net& net,bool enabled,double value,double maxVal,double recover,std::uint16_t actor=0,const std::string& actorName={},double delta=0.0,const std::string& reason={}) {
+        if(role!=Role::Host||!std::isfinite(value)||!std::isfinite(maxVal)||maxVal<=0.0) return false;
+        return send(net,{{"kind","atb_state"},{"epoch",epoch},{"seq",++atbStateSeq},{"enabled",enabled},{"value",value},{"max",maxVal},{"recover",recover},
+            {"actor",actor},{"actor_name",actorName.substr(0,64)},{"delta",delta},{"reason",reason}});
+    }
+    std::deque<Json> takeAtbDeltas() {std::deque<Json> out;out.swap(atbDeltas);return out;}
+    std::deque<Json> takeAtbUpdates() {std::deque<Json> out;out.swap(atbUpdates);return out;}
+    // Combat damage stats sync (host -> all peers; client -> host reset request).
+    bool sendDamageStats(Net& net,const Json& stats) {
+        if(role!=Role::Host||!stats.is_object()) return false;
+        return send(net,{{"kind","damage_stats"},{"epoch",epoch},{"stats",stats}});
+    }
+    std::optional<Json> takeRemoteDamageStats() {
+        if(!hasRemoteDamageStats) return {};
+        hasRemoteDamageStats=false;auto out=std::move(remoteDamageStats);remoteDamageStats=Json();return out;
+    }
+    bool requestDamageReset(Net& net) {
+        if(role!=Role::Client) return false;
+        return send(net,{{"kind","damage_reset"},{"epoch",epoch}},proto::kHostId);
+    }
+    bool takeDamageResetRequested() {const bool v=damageResetRequested;damageResetRequested=false;return v;}
     // Guest: report the room enemies whose AI this player runs.
     bool sendEnemyStates(Net& net,const Json& states) {
         if(role!=Role::Client||!canAct(net.snapshot().localId)||!states.is_array()||states.empty()||states.size()>64) return false;

@@ -23,8 +23,14 @@ int wmain(int argc,wchar_t** argv) {
         else if(arg==L"--tab"&&i+1<argc) tab=_wtoi(argv[++i]);
         else if(arg==L"--host") autoHost=true;
         else if(arg==L"--hud") config["preview_hud"]=true;
+        else if(arg==L"--demo"&&i+1<argc) {
+            std::wstring role=argv[++i];
+            if(role!=L"host"&&role!=L"client"&&role!=L"offline") {std::puts("--demo takes host, client or offline");return 2;}
+            std::string name;for(auto value:role) name.push_back(static_cast<char>(value));
+            config["preview_demo"]=name;
+        }
         else if(arg==L"--module"&&i+1<argc) ++i;
-        else {std::puts("EFLink.Preview.exe [--module eflink.core] [--capture path.bmp] [--tab 0..5] [--host] [--hud]");return 2;}
+        else {std::puts("EFLink.Preview.exe [--module eflink.core] [--capture path.bmp] [--tab 0..5] [--demo host|client|offline] [--host] [--hud]");return 2;}
     }
     config["preview_tab"]=tab;if(autoHost) {config["auto_host"]=true;config["room_name"]="EF Link 测试房间";config["port"]=47735;}
     if(module->initialize(&host,config.dump().c_str())!=BE_Result_Ok) return 1;

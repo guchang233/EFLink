@@ -1,6 +1,9 @@
 // End-to-end world protocol checks over real localhost sockets. No Unity substitutes.
 #include "link_session.h"
 #include "link_native_identity.h"
+#include "link_combat_stats.h"
+#include "link_operator_names.h"
+#include "link_settings.h"
 #include <cstdio>
 using namespace eflink;
 int failures=0;
@@ -126,10 +129,11 @@ int main() {
     rejectIntent({{"amount",999999999}},"client-computed damage is rejected");
     rejectIntent({{"skill","unowned_skill"}},"guest cannot invent a skill absent from the host's catalog");
     rejectIntent(Json::object(),"host enforces its skill cooldown");
-    // Player-resolved hits: the attacker's client reports a bounded result.
-    check(g.submitHit(guest,"map01_lv001:level:100",12.5),"an admitted guest reports a resolved hit");
+    // Player-resolved hits: the attacker's client reports a bounded result (with optional crit & damage type).
+    check(g.submitHit(guest,"map01_lv001:level:100",12.5,true,2),"an admitted guest reports a resolved hit with crit & element metadata");
     std::deque<Json> hits;check(wait([&]{tick();hits=h.takeHits();return !hits.empty();})&&hits.front()["from"]==2&&
-        hits.front()["amount"]==12.5&&hits.front()["key"]=="map01_lv001:level:100","host receives the guest's hit for its own enemy");
+        hits.front()["amount"]==12.5&&hits.front()["key"]=="map01_lv001:level:100"&&
+        hits.front().value("crit",false)==true&&hits.front().value("dtype",0)==2,"host receives the guest's hit and crit/element metadata for its own enemy");
     std::uint64_t hitSeq=1000;
     auto rejectHit=[&](Json extra,const char* name) {
         auto prior=h.status()["rejected"].get<int>();
@@ -209,6 +213,83 @@ int main() {
     g.duelAction(guest,"invite",1);check(wait([&]{tick();return h.duelInvites.contains(2);}),"invite again");
     h.duelAction(host,"accept",2);check(wait([&]{tick();return g.duels.contains(1);}),"duel again");
     h.pvp=false;check(wait([&]{tick();return h.duels.empty()&&g.duels.empty();}),"turning PVP off ends every duel");
+
+    // Keep host world snapshot fresh for extended vitals / shared ATB / combat stats checks.
+    auto tickFresh=[&]{tick();h.publish(host,scene("map02","map02_lv001"),false);};
+    h.setAuthority({true,true,true,true});
+    h.bindPlayer(1,growthModel,skills);h.bindPlayer(2,growthModel,skills);
+    h.publish(host,scene("map02","map02_lv001"),true);
+    check(wait([&]{tickFresh();g.reportEntry(guest,complete);return g.canAct(2);}),"re-admit guest for extended combat protocol checks");
+
+    // Extended vitals (HP + ultimate SP + operator name + alive)
+    check(g.sendVitals(guest,8200,10000,75.5,100.0,"伊冯",true),"guest broadcasts extended vitals");
+    std::deque<Json> vitalsIn;
+    check(wait([&]{tickFresh();vitalsIn=h.takeVitals();return !vitalsIn.empty();})&&
+        vitalsIn.front().value("usp",0.0)==75.5&&vitalsIn.front().value("max_usp",0.0)==100.0&&
+        vitalsIn.front().value("op",std::string{})=="伊冯"&&vitalsIn.front().value("alive",false)==true,"host receives extended teammate vitals");
+
+    // Shared ATB pool: host-authoritative gating, delta validation, replay rejection, state broadcast
+    h.sharedAtb=false;
+    auto atbRejBefore=h.status()["rejected"].get<int>();
+    check(g.sendAtbDelta(guest,-100.f,"cost",false),"guest sends atb delta while disabled");
+    check(wait([&]{tickFresh();return h.status()["rejected"].get<int>()>atbRejBefore;})&&h.takeAtbDeltas().empty(),"host rejects atb_delta when shared ATB is disabled");
+    h.sharedAtb=true;
+    check(g.sendAtbDelta(guest,-100.f,"cost",false),"guest sends valid atb cost delta when shared ATB is enabled");
+    std::deque<Json> deltas;
+    check(wait([&]{tickFresh();deltas=h.takeAtbDeltas();return !deltas.empty();})&&
+        deltas.front().value("from",0)==2&&deltas.front().value("delta",0.0)==-100.0,"host accepts valid guest atb_delta");
+    auto atbRejOob=h.status()["rejected"].get<int>();
+    raw(guest,{{"schema",2},{"room",host.snapshot().roomId},{"kind","atb_delta"},{"epoch",h.generation()},{"seq",999},{"delta",-9999.0},{"reason","cost"},{"pause",false}},1);
+    check(wait([&]{tickFresh();return h.status()["rejected"].get<int>()>atbRejOob;})&&h.takeAtbDeltas().empty(),"host rejects out-of-bounds atb_delta");
+    auto atbRejReplay=h.status()["rejected"].get<int>();
+    raw(guest,{{"schema",2},{"room",host.snapshot().roomId},{"kind","atb_delta"},{"epoch",h.generation()},{"seq",1},{"delta",-50.0},{"reason","cost"},{"pause",false}},1);
+    check(wait([&]{tickFresh();return h.status()["rejected"].get<int>()>atbRejReplay;})&&h.takeAtbDeltas().empty(),"host rejects replayed atb_delta seq");
+    check(h.sendAtbState(host,true,185.5f,300.f,8.0f,2,"guest",-100.f,"cost"),"host broadcasts authoritative shared ATB state");
+    std::deque<Json> atbStates;
+    check(wait([&]{tickFresh();atbStates=g.takeAtbUpdates();return !atbStates.empty();})&&
+        atbStates.front().value("enabled",false)==true&&std::abs(atbStates.front().value("value",0.0)-185.5)<0.1&&
+        atbStates.front().value("actor",0)==2,"guest receives authoritative shared ATB state and actor attribution");
+    check(!g.sendAtbState(guest,true,300.f,300.f,8.f),"guest cannot broadcast authoritative atb_state");
+
+    // CombatStats engine + host->guest sync + guest->host reset
+    CombatStats stats;
+    stats.autoReset=false;
+    stats.recordHit(1,"房主","管理员",1000.0,true,2,false,10000);
+    stats.recordHit(1,"房主","管理员",500.0,false,0,true,12000);
+    stats.recordHit(2,"队友A","伊冯",3000.0,true,4,false,12000);
+    stats.recordTaken(2,"队友A","伊冯",450.0,12000);
+    auto snap=stats.snapshot(14000);
+    check(snap.value("total_damage",0.0)==4500.0&&snap["players"].size()==2&&snap["players"][0]["id"]==2,"CombatStats ranks players by total damage");
+    check(std::abs(snap["players"][0]["share"].get<double>()-(3000.0/4500.0))<0.01&&snap["players"][0]["crit_rate"].get<double>()==1.0,"CombatStats computes share and crit rate");
+    check(snap["players"][1]["kills"].get<std::uint64_t>()==1&&snap["players"][1]["hits"].get<std::uint64_t>()==2,"CombatStats tracks hits and kills");
+    check(snap["players"][0]["taken"].get<double>()==450.0,"CombatStats tracks damage taken");
+    auto snapFrozen=stats.snapshot(25000); // > 6s after last hit (12000): duration freezes at 2s (12000-10000)
+    check(std::abs(snapFrozen.value("duration_s",0.0)-2.0)<0.05,"CombatStats freezes fight duration after 6s out of combat");
+    check(CombatStats::validRemoteSnapshot(snap),"valid CombatStats snapshot passes schema check");
+    auto badSnap=snap;badSnap["total_damage"]=-10.0;
+    check(!CombatStats::validRemoteSnapshot(badSnap),"negative total_damage snapshot is rejected");
+    check(h.sendDamageStats(host,snap),"host broadcasts combat damage stats snapshot");
+    std::optional<Json> remoteStats;
+    check(wait([&]{tick();remoteStats=g.takeRemoteDamageStats();return remoteStats.has_value();})&&
+        remoteStats->value("total_damage",0.0)==4500.0,"guest receives validated combat stats snapshot");
+    check(g.requestDamageReset(guest),"guest requests combat stats reset");
+    check(wait([&]{tick();return h.takeDamageResetRequested();}),"host receives guest combat stats reset request");
+    stats.autoReset=true;
+    stats.recordHit(1,"房主","管理员",200.0,false,0,false,40000); // >15s after 12000 -> auto resets
+    check(stats.snapshot(41000).value("total_damage",0.0)==200.0,"CombatStats auto-resets after 15s idle when enabled");
+    check(operatorDisplayName("Assets/chr_0017_yvonne_postmodel.prefab")=="伊冯"&&!formatDamageNumber(125400.0).empty(),"operator name resolver and damage formatter work");
+
+    // Settings validation for new UI/HUD/ATB keys
+    bool validOk=true;
+    try {validateSettings({{"room_shared_atb",true},{"show_damage_hud",true},{"show_team_hud",true},{"show_atb_hud",true},{"hud_compact",true},{"hud_opacity",0.86},{"damage_auto_reset",true},{"damage_reset_key",VK_F9}});}
+    catch(...) {validOk=false;}
+    check(validOk,"validateSettings accepts valid new HUD and shared ATB settings");
+    bool badOpacity=false;
+    try {validateSettings({{"hud_opacity",0.10}});} catch(...) {badOpacity=true;}
+    bool badResetKey=false;
+    try {validateSettings({{"damage_reset_key",13}});} catch(...) {badResetKey=true;}
+    check(badOpacity&&badResetKey,"validateSettings rejects out-of-range hud_opacity and invalid damage_reset_key");
+
     guest.leave();check(wait([&]{tick();return guest.currentRole()==Role::Offline&&!g.ready()&&!g.canAct(2);}),"leave clears guest world and readiness");
     host.stop();guest.stop();late.stop();
     return failures?1:0;
