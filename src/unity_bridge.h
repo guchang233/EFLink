@@ -54,8 +54,19 @@ public:
     }
     void* call(BE_ResolvedMethodV1 method,void* object=nullptr,std::initializer_list<void*> args={}) {
         void* exception=nullptr;
-        std::vector<void*> parameters(args);
-        auto* result=api->runtime_invoke(api->context,method.method_info,object,parameters.empty()?nullptr:parameters.data(),&exception);
+        void* stackParams[16];
+        void** paramPtr=nullptr;
+        std::vector<void*> heapParams;
+        if(args.size()>0) {
+            if(args.size()<=16) {
+                std::size_t idx=0;for(void* p:args) stackParams[idx++]=p;
+                paramPtr=stackParams;
+            } else {
+                heapParams.assign(args);
+                paramPtr=heapParams.data();
+            }
+        }
+        auto* result=api->runtime_invoke(api->context,method.method_info,object,paramPtr,&exception);
         if(exception) {
             std::string label="managed exception during bridge call";
             auto dll=GetModuleHandleW(L"GameAssembly.dll");

@@ -41,8 +41,8 @@ class Session {
     struct Packet {std::uint16_t from;Json body;std::size_t size;};
     std::mutex inboxMutex;std::deque<Packet> inbox;std::size_t inboxBytes=0;
     std::uint32_t room=0;Role role=Role::Offline;
-    std::uint64_t epoch=0,revision=0,seenAt=0,lastPublish=0,commandSequence=0;
-    std::map<std::uint16_t,std::uint64_t> sequences;
+    std::uint64_t epoch=0,revision=0,seenAt=0,lastPublish=0,commandSequence=0,teleportSequence=0;
+    std::map<std::uint16_t,std::uint64_t> sequences,teleportSequences;
     std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> attackBudgets;
     std::map<std::uint16_t,Json> locations;std::uint64_t lastLocation=0;
     struct MemberEntry {std::uint64_t epoch=0,token=0,seen=0;bool active=false;ReplicaFacts facts;};
@@ -147,26 +147,46 @@ class Session {
         return p&&p->hasInfo&&!p->states.empty()&&(p->states.back().state.flags&proto::StateValid)&&nowMs()-p->states.back().receivedMs<3000;
     }
     void routeTeleport(Net& net,const Snapshot& s,std::uint16_t actor,std::uint16_t target,std::uint64_t seq) {
+        if(actor==target) {error="不能传送到自己";return;}
         const auto* p=find(s,target);
-        if(!fresh(p)||p->info.mapId.empty()||actor==target) {error="目标玩家尚未进入可传送场景";return;}
-        const auto& st=p->states.back().state;
+        const bool toHostWorld=target==proto::kHostId&&!world.empty()&&!world.value("loading",false)&&
+            !world.value("map",std::string{}).empty()&&!world.value("level",std::string{}).empty()&&
+            world.contains("position")&&world["position"].is_array()&&world["position"].size()==3;
+        if((!fresh(p)||p->info.mapId.empty())&&!toHostWorld) {
+            error="目标玩家尚未进入可传送场景";
+            if(actor!=s.localId) send(net,{{"kind","teleport_error"},{"seq",seq},{"message",error}},actor);
+            return;
+        }
+        std::string targetMap,targetLevel;
+        Json targetPos=Json::array();
+        if(toHostWorld&&(!fresh(p)||p->info.mapId!=world.value("map",std::string{})||p->info.levelId!=world.value("level",std::string{}))) {
+            // Host's PlayerInfo mapId refreshes asynchronously; trust the settled world snapshot.
+            targetMap=world.value("map",std::string{});
+            targetLevel=world.value("level",std::string{});
+            targetPos=world.at("position");
+        } else {
+            targetMap=p->info.mapId;targetLevel=p->info.levelId;
+            const auto& st=p->states.back().state;
+            targetPos={st.position[0],st.position[1],st.position[2]};
+        }
         // A hosted guest may only use the host's active world. The host can change the
         // room's map by travelling to another peer; all guests then follow the new epoch.
-        if(actor!=proto::kHostId&&!world.empty()&&(p->info.mapId!=world.value("map",std::string{})||p->info.levelId!=world.value("level",std::string{}))) {
+        if(actor!=proto::kHostId&&!world.empty()&&(targetMap!=world.value("map",std::string{})||targetLevel!=world.value("level",std::string{}))) {
             error="目标还未进入房主世界，请等待地图同步";
             send(net,{{"kind","teleport_error"},{"seq",seq},{"message",error}},actor);return;
         }
         Json request={{"kind","teleport"},{"epoch",epoch},{"seq",seq},{"target",target},
-            {"map",p->info.mapId},{"level",p->info.levelId},{"position",{st.position[0],st.position[1],st.position[2]}},
+            {"map",targetMap},{"level",targetLevel},{"position",targetPos},
             {"issued",nowMs()}};
-        if(auto state=nativeState(target);state&&p->info.mapId==world.value("map",std::string{})&&p->info.levelId==world.value("level",std::string{}))
+        if(auto state=nativeState(target);state&&targetMap==world.value("map",std::string{})&&targetLevel==world.value("level",std::string{}))
             request["position"]=state->position;
         if(target==proto::kHostId&&!world.empty()) request["level_num"]=world.value("level_num",0);
         // The target's dungeon (the room world's, when the target is in it): the
         // traveller enters it through the official dungeon flow.
-        if(!world.empty()&&p->info.mapId==world.value("map",std::string{})&&p->info.levelId==world.value("level",std::string{}))
+        if(!world.empty()&&targetMap==world.value("map",std::string{})&&targetLevel==world.value("level",std::string{})) {
             request["dungeon"]=world.value("dungeon",std::string{});
-        else if(auto it=locations.find(target);it!=locations.end()&&it->second.value("map",std::string{})==p->info.mapId&&it->second.value("level",std::string{})==p->info.levelId) request["level_num"]=it->second.value("level_num",0);
+            if(request.value("level_num",0)<=0) request["level_num"]=world.value("level_num",0);
+        } else if(auto it=locations.find(target);it!=locations.end()&&it->second.value("map",std::string{})==targetMap&&it->second.value("level",std::string{})==targetLevel) request["level_num"]=it->second.value("level_num",0);
         if(actor==s.localId) teleport=request;
         else if(send(net,request,actor)&&role==Role::Host&&request.at("map")==world.value("map",std::string{})&&request.at("level")==world.value("level",std::string{}))
             actorTeleports[actor]=request;
@@ -200,9 +220,9 @@ public:
     void update(Net& net) {
         const auto s=net.snapshot();
         if(s.roomId!=room||s.role!=role) {
-            room=s.roomId;role=s.role;epoch=revision=seenAt=lastPublish=commandSequence=0;world=Json::object();
+            room=s.roomId;role=s.role;epoch=revision=seenAt=lastPublish=commandSequence=teleportSequence=0;world=Json::object();
             hits.clear();playerHits.clear();enemyCasts.clear();enemyStates.clear();hitSequences.clear();hitBudgets.clear();hitSequence=0;vitals.clear();
-            sequences.clear();attackBudgets.clear();locations.clear();lastLocation=0;commands.clear();teleport=Json::object();actorTeleports.clear();error.clear();
+            sequences.clear();teleportSequences.clear();attackBudgets.clear();locations.clear();lastLocation=0;commands.clear();teleport=Json::object();actorTeleports.clear();error.clear();
             entries.clear();replica={};entryToken=lastEntryReport=lastEntryAck=0;admitted=false;entryBlockers=Json::array();
             realm.reset(room);
             growthRequests.clear();lastGrowthPublish=0;
@@ -265,8 +285,8 @@ public:
                     locations[packet.from]=b;
                 } else if(kind=="teleport_request"&&role==Role::Host) {
                     const auto seq=b.at("seq").get<std::uint64_t>();
-                    if(!seq||seq<=sequences[packet.from]) {++rejected;continue;}
-                    sequences[packet.from]=seq;routeTeleport(net,s,packet.from,b.at("target").get<std::uint16_t>(),seq);
+                    if(!seq||seq<=teleportSequences[packet.from]) {++rejected;continue;}
+                    teleportSequences[packet.from]=seq;routeTeleport(net,s,packet.from,b.at("target").get<std::uint16_t>(),seq);
                 } else if(kind=="teleport"&&role==Role::Client&&packet.from==proto::kHostId) {
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!validVector(b.at("position"))||b.at("map").get<std::string>().size()>64||b.at("level").get<std::string>().size()>64) {++rejected;continue;}
                     if(b.contains("dungeon")&&(!b.at("dungeon").is_string()||b.at("dungeon").get<std::string>().size()>96)) {++rejected;continue;}
@@ -431,7 +451,8 @@ public:
     }
     bool publish(Net& net,Json value,bool force=false) {
         if(role!=Role::Host||!validWorld(value)) return false;
-        if(world.empty()||world.value("map",std::string{})!=value.at("map").get<std::string>()||world.value("level",std::string{})!=value.at("level").get<std::string>()) {
+        if(world.empty()||world.value("map",std::string{})!=value.at("map").get<std::string>()||world.value("level",std::string{})!=value.at("level").get<std::string>()||
+           world.value("dungeon",std::string{})!=value.value("dungeon",std::string{})) {
             ++epoch;revision=0;commands.clear();hits.clear();teleport=Json::object();actorTeleports.clear();entries.clear();
         }
         realm.reconcile(net.snapshot(),epoch,value.at("map").get<std::string>(),value.at("level").get<std::string>());
@@ -442,27 +463,29 @@ public:
     }
     void requestTeleport(Net& net,std::uint16_t target) {
         auto s=net.snapshot();if(s.role!=Role::Host&&s.role!=Role::Client) throw std::runtime_error("请先连接房间");
-        ++commandSequence;if(role==Role::Host) routeTeleport(net,s,s.localId,target,commandSequence);
-        else if(!send(net,{{"kind","teleport_request"},{"target",target},{"seq",commandSequence}},proto::kHostId)) throw std::runtime_error("传送请求未发送");
+        ++teleportSequence;if(role==Role::Host) routeTeleport(net,s,s.localId,target,teleportSequence);
+        else if(!send(net,{{"kind","teleport_request"},{"target",target},{"seq",teleportSequence}},proto::kHostId)) throw std::runtime_error("传送请求未发送");
     }
     void publishLocation(Net& net,const std::string& map,const std::string& level,int number) {
         if(role!=Role::Client||number<=0||nowMs()-lastLocation<500) return;
         lastLocation=nowMs();send(net,{{"kind","location"},{"map",map},{"level",level},{"level_num",number}},proto::kHostId);
     }
     bool submitSkill(Net& net,const std::string& key,const std::string& skill) {
-        if(role!=Role::Client||!canAct(net.snapshot().localId)||!combat) return false;
-        return send(net,{{"kind","skill_intent"},{"epoch",epoch},{"seq",++commandSequence},{"actor",playerEntity(net.snapshot().localId)},
+        const auto local=net.localIdFast();
+        if(role!=Role::Client||!canAct(local)||!combat) return false;
+        return send(net,{{"kind","skill_intent"},{"epoch",epoch},{"seq",++commandSequence},{"actor",playerEntity(local)},
             {"key",key},{"skill",skill}},proto::kHostId);
     }
     bool submitHit(Net& net,const std::string& key,double amount,bool isCrit=false,int damageType=0) {
-        if(role!=Role::Client||!combat||!canAct(net.snapshot().localId)||!std::isfinite(amount)||amount<=0) return false;
+        if(role!=Role::Client||!combat||!canAct(net.localIdFast())||!std::isfinite(amount)||amount<=0) return false;
         return send(net,{{"kind","hit"},{"epoch",epoch},{"seq",++hitSequence},{"key",key},{"amount",amount},{"crit",isCrit},{"dtype",damageType}},proto::kHostId);
     }
     bool sendPlayerHit(Net& net,std::uint16_t peer,double amount,const std::string& key) {
         if(!ready()||!std::isfinite(amount)||amount<=0) return false;
         if(role==Role::Host) return peer!=proto::kHostId&&send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key}},peer);
         // A guest forwards through the host, which owns the room's rules.
-        return role==Role::Client&&canAct(net.snapshot().localId)&&peer!=net.snapshot().localId&&
+        const auto local=net.localIdFast();
+        return role==Role::Client&&canAct(local)&&peer!=local&&
             send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key},{"target",peer}},proto::kHostId);
     }
     // Presentation: a host room enemy began a native skill against a player.
@@ -474,7 +497,7 @@ public:
     // Presentation: this player's operator (squad slot) began a native skill.
     bool sendPlayerCast(Net& net,int slot,const std::string& skill,const std::string& target) {
         if(!ready()||skill.empty()||skill.size()>128||target.size()>128||slot<0||slot>4) return false;
-        Json body{{"kind","player_cast"},{"epoch",epoch},{"origin",net.snapshot().localId},{"slot",slot},{"skill",skill},{"target",target}};
+        Json body{{"kind","player_cast"},{"epoch",epoch},{"origin",net.localIdFast()},{"slot",slot},{"skill",skill},{"target",target}};
         if(role==Role::Host) return send(net,std::move(body));
         if(role==Role::Client) return send(net,std::move(body),proto::kHostId);
         return false;
@@ -482,7 +505,7 @@ public:
     std::deque<Json> takePlayerCasts() {std::deque<Json> out;out.swap(playerCasts);return out;}
     bool sendVitals(Net& net,double hp,double max,double usp=0.0,double maxUsp=0.0,const std::string& op={},bool alive_=true) {
         if(!ready()||!std::isfinite(hp)||!std::isfinite(max)||max<=0) return false;
-        Json body{{"kind","vitals"},{"epoch",epoch},{"origin",net.snapshot().localId},{"hp",hp},{"max",max},
+        Json body{{"kind","vitals"},{"epoch",epoch},{"origin",net.localIdFast()},{"hp",hp},{"max",max},
             {"usp",std::isfinite(usp)?(std::max)(0.0,usp):0.0},{"max_usp",std::isfinite(maxUsp)?(std::max)(0.0,maxUsp):0.0},
             {"op",op.substr(0,48)},{"alive",alive_}};
         if(role==Role::Host) return send(net,std::move(body));

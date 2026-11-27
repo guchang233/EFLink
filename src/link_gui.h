@@ -23,6 +23,7 @@ public:
     void start(Request request, const nlohmann::json& options);
     void stop();
     void open() {openRequested=true;}
+    void openToLobby() {openLobbyRequested=true;openRequested=true;}
     bool visible() const {return menuVisible.load();}
     bool ready() const {return uiReady.load();}
     // Game thread, every frame: executes the interface's queued requests.
@@ -39,7 +40,7 @@ private:
     Request request;
     std::jthread thread;
     std::mutex callsMutex;std::deque<std::shared_ptr<Call>> calls;
-    std::atomic<bool> stopping=false,openRequested=false,menuVisible=false,uiReady=false,overlayReady=false,gameThreadSeen=false;
+    std::atomic<bool> stopping=false,openRequested=false,openLobbyRequested=false,menuVisible=false,uiReady=false,overlayReady=false,gameThreadSeen=false;
     std::atomic<std::uint64_t> overlayFrames=0,callsServed=0;
     mutable std::mutex errorMutex;std::string lastError;
     void setError(std::string error) {std::lock_guard lock(errorMutex);lastError=std::move(error);}

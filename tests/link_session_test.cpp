@@ -279,16 +279,40 @@ int main() {
     check(stats.snapshot(41000).value("total_damage",0.0)==200.0,"CombatStats auto-resets after 15s idle when enabled");
     check(operatorDisplayName("Assets/chr_0017_yvonne_postmodel.prefab")=="伊冯"&&!formatDamageNumber(125400.0).empty(),"operator name resolver and damage formatter work");
 
-    // Settings validation for new UI/HUD/ATB keys
+    // Settings validation for new UI/HUD/ATB/auto-follow keys
     bool validOk=true;
-    try {validateSettings({{"room_shared_atb",true},{"show_damage_hud",true},{"show_team_hud",true},{"show_atb_hud",true},{"hud_compact",true},{"hud_opacity",0.86},{"damage_auto_reset",true},{"damage_reset_key",VK_F9}});}
+    try {validateSettings({{"auto_follow_host_map",true},{"room_shared_atb",true},{"show_damage_hud",true},{"show_team_hud",true},{"show_atb_hud",true},{"hud_compact",true},{"hud_opacity",0.86},{"damage_auto_reset",true},{"damage_reset_key",VK_F9}});}
     catch(...) {validOk=false;}
-    check(validOk,"validateSettings accepts valid new HUD and shared ATB settings");
+    check(validOk,"validateSettings accepts valid new HUD, auto-follow, and shared ATB settings");
+    bool badAutoFollow=false;
+    try {validateSettings({{"auto_follow_host_map","yes"}});} catch(...) {badAutoFollow=true;}
     bool badOpacity=false;
     try {validateSettings({{"hud_opacity",0.10}});} catch(...) {badOpacity=true;}
     bool badResetKey=false;
     try {validateSettings({{"damage_reset_key",13}});} catch(...) {badResetKey=true;}
-    check(badOpacity&&badResetKey,"validateSettings rejects out-of-range hud_opacity and invalid damage_reset_key");
+    check(badAutoFollow&&badOpacity&&badResetKey,"validateSettings rejects invalid auto_follow_host_map, hud_opacity, and damage_reset_key");
+
+    // Fast atomic ID/room getters match snapshot
+    check(host.localIdFast()==host.snapshot().localId&&host.roomIdFast()==host.snapshot().roomId&&
+          guest.localIdFast()==guest.snapshot().localId&&guest.roomIdFast()==guest.snapshot().roomId,
+          "fast atomic localId/roomId match network snapshot");
+
+    // Teleport error feedback when target is invalid/stale, and fallback to settled host world snapshot
+    // when host's PlayerInfo mapId momentarily lags behind world["map"].
+    g.requestTeleport(guest,99);
+    check(wait([&]{tickFresh();return g.status().value("error",std::string{}).find("尚未进入")!=std::string::npos;}),
+          "routeTeleport returns teleport_error to guest when target peer is unavailable");
+    proto::PlayerInfo staleHostInfo=info;staleHostInfo.mapId="map01";staleHostInfo.levelId="map01_lv001";
+    host.setLocalInfo(staleHostInfo);
+    check(wait([&]{tickFresh();return host.snapshot().peers[0].info.mapId=="map01";}),"simulate transiently stale host PlayerInfo mapId");
+    Json dungeonScene=scene("map02","map02_lv001");dungeonScene["dungeon"]="dung_test_01";dungeonScene["position"]={12.0,1.5,34.0};
+    h.publish(host,dungeonScene,true);
+    check(wait([&]{tick();return g.snapshot().value("dungeon",std::string{})=="dung_test_01";}),"host publishes settled dungeon world");
+    g.requestTeleport(guest,1);
+    Json hostTp;
+    check(wait([&]{tick();hostTp=g.takeTeleport();return !hostTp.empty();})&&
+          hostTp.value("map",std::string{})=="map02"&&hostTp.value("dungeon",std::string{})=="dung_test_01",
+          "teleport to host succeeds using settled world snapshot even when host PlayerInfo lags");
 
     guest.leave();check(wait([&]{tick();return guest.currentRole()==Role::Offline&&!g.ready()&&!g.canAct(2);}),"leave clears guest world and readiness");
     host.stop();guest.stop();late.stop();

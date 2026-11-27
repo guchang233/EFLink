@@ -238,7 +238,7 @@ struct Ui {
     // Editable fields & preferences
     char name[65]{}, room[65]{}, hostPassword[129]{}, address[257]{}, joinPassword[129]{}, serverName[129]{}, chat[1001]{};
     int port = 47615, limit = 8, key = kDefaultMenuKey, pvpKey = VK_F7, damageResetKey = VK_F9;
-    bool remote = true, squad = true, replay = true, outline = true, markers = true, follow = true, combat = true;
+    bool remote = true, squad = true, replay = true, outline = true, markers = true, follow = true, autoFollowHostMap = false, combat = true;
     bool pvp = false, pvpRevive = true, sharedAtb = false;
     float pvpScale = 1.f;
     // HUD & theme preferences
@@ -295,6 +295,7 @@ struct Ui {
         outline = c.value("outline_teammates", true);
         markers = c.value("show_player_markers", true);
         follow = c.value("follow_host_world", true);
+        autoFollowHostMap = c.value("auto_follow_host_map", false);
         combat = c.value("sync_combat", true);
         pvp = c.value("room_pvp", false);
         pvpScale = c.value("room_pvp_scale", 1.f);
@@ -344,7 +345,8 @@ struct Ui {
             auto r = hudCall.get();
             if (r.contains("markers")) hud = std::move(r);
         } else if (hudCall.valid() && t - hudSent > 5000) hudCall = {};
-        if (!hudCall.valid() && t - hudSent >= 60u) {
+        const std::uint64_t hudInterval = online() ? 80u : (menuOpen ? 200u : 500u);
+        if (!hudCall.valid() && t - hudSent >= hudInterval) {
             hudSent = t;
             hudCall = post({{"action", "hud"}});
         }
@@ -381,6 +383,18 @@ struct Ui {
         static const json empty = json::object();
         return empty;
     }
+    json liveHostMapChange() const {
+        if (hud.contains("host_map_change") && hud["host_map_change"].is_object()) return hud["host_map_change"];
+        return state.value("game", json::object()).value("world_replication", json::object()).value("host_map_change", json::object());
+    }
+    static std::string hostMapDestLabel(const json& change) {
+        const auto dungeon = str(change, "dungeon");
+        const auto level = str(change, "level");
+        const auto map = str(change, "map");
+        if (!dungeon.empty()) return "副本 " + dungeon + (level.empty() ? "" : "（" + level + "）");
+        if (!level.empty()) return level;
+        return map.empty() ? "新区域" : map;
+    }
 
     void saveSettings() {
         json patch = {
@@ -388,7 +402,7 @@ struct Ui {
             {"menu_key", key}, {"pvp_key", pvpKey}, {"damage_reset_key", damageResetKey},
             {"show_remote_players", remote}, {"show_remote_squad", squad},
             {"replay_skills", replay}, {"outline_teammates", outline},
-            {"show_player_markers", markers}, {"follow_host_world", follow}, {"sync_combat", combat},
+            {"show_player_markers", markers}, {"follow_host_world", follow}, {"auto_follow_host_map", autoFollowHostMap}, {"sync_combat", combat},
             {"show_damage_hud", showDamageHud}, {"show_team_hud", showTeamHud},
             {"show_atb_hud", showAtbHud}, {"hud_compact", hudCompact},
             {"hud_opacity", double(hudOpacity)}, {"damage_auto_reset", damageAutoReset},
@@ -404,7 +418,7 @@ struct Ui {
         act({{"action", "settings"}, {"configuration", {
             {"show_remote_players", remote}, {"show_remote_squad", squad},
             {"replay_skills", replay}, {"outline_teammates", outline},
-            {"show_player_markers", markers}, {"follow_host_world", follow}, {"sync_combat", combat},
+            {"show_player_markers", markers}, {"follow_host_world", follow}, {"auto_follow_host_map", autoFollowHostMap}, {"sync_combat", combat},
             {"show_damage_hud", showDamageHud}, {"show_team_hud", showTeamHud},
             {"show_atb_hud", showAtbHud}, {"hud_compact", hudCompact},
             {"hud_opacity", double(hudOpacity)}, {"damage_auto_reset", damageAutoReset},
@@ -486,16 +500,7 @@ struct Ui {
         }
 
         drawDuelInvite(size);
-
-        const auto change = state.value("game", json::object()).value("world_replication", json::object()).value("host_map_change", json::object());
-        if (!open && role() == "client" && change.value("pending", false)) {
-            const std::string text = "房主已前往 " + str(change, "level") + "，按 " + menuKeyName(key) + " 选择是否跟随";
-            const auto ts = ImGui::CalcTextSize(text.c_str());
-            const ImVec2 p{size.x * .5f - ts.x * .5f - 16, 90};
-            d->AddRectFilled(p, {p.x + ts.x + 32, p.y + ts.y + 18}, ui::u32(ui::hud_orig::base, 0.90f), 8);
-            d->AddRect(p, {p.x + ts.x + 32, p.y + ts.y + 18}, ui::u32(ui::hud_orig::accent, 0.80f), 8);
-            d->AddText({p.x + 16, p.y + 9}, ui::u32(ui::hud_orig::accent), text.c_str());
-        }
+        drawHostMapHudCard(size);
     }
 
     // ---- Original v1.6.6 Floating Borderless Roster + Micro Hairline HP/SP -
@@ -819,6 +824,136 @@ struct Ui {
         ImGui::PopStyleColor(2);
     }
 
+    // ---- Floating HUD Prompt for Host Map Change (clickable when closed) ----
+    void drawHostMapHudCard(ImVec2 size) {
+        if (open || role() != "client") return;
+        const auto change = liveHostMapChange();
+        if (!change.value("pending", false)) return;
+        const bool deferred = change.value("deferred", false);
+        const bool supported = change.value("supported", true);
+        const auto token = change.value("token", std::uint64_t(0));
+        const std::string dest = hostMapDestLabel(change);
+
+        if (deferred) {
+            // Subtle unobtrusive reminder pill when user chose "暂不跟随"
+            auto* d = ImGui::GetBackgroundDrawList();
+            const std::string text = "房主位于 " + dest + " · 按 " + menuKeyName(key) + " 可随时跟随";
+            ui::pushNote();
+            const auto ts = ImGui::CalcTextSize(text.c_str());
+            const ImVec2 p{size.x * 0.5f - ts.x * 0.5f - 14, ui::px(76)};
+            d->AddRectFilled(p, {p.x + ts.x + 28, p.y + ts.y + 14}, ui::u32(ui::hud_orig::base, 0.82f), 8);
+            d->AddRect(p, {p.x + ts.x + 28, p.y + ts.y + 14}, ui::u32(ui::hud_orig::accent, 0.65f), 8);
+            d->AddText({p.x + 14, p.y + 7}, ui::u32(ui::hud_orig::accent), text.c_str());
+            ui::popNote();
+            return;
+        }
+
+        const bool duelVisible = !state.value("pvp", json::object()).value("invites", json::array()).empty();
+        const float topY = duelVisible ? size.y * 0.27f : ui::px(82);
+        const float width = (std::min)(ui::px(470), size.x - ui::px(40));
+
+        ImGui::SetNextWindowPos({size.x * 0.5f - width * 0.5f, topY});
+        ImGui::SetNextWindowSize({width, 0.f});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::md.surfaceContainerLowest);
+        ImGui::PushStyleColor(ImGuiCol_Border, ui::md.outlineVariant);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(20), ui::px(16)});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(20));
+        if (ImGui::Begin("##hostmapinvite", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoFocusOnAppearing)) {
+            ui::pushBold();
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::md.primary);
+            ImGui::TextUnformatted("房主切换了地图");
+            ImGui::PopStyleColor();
+            ui::popBold();
+            ui::pushNote();
+            ui::alignRight(ui::px(108));
+            ui::muted("按 %s 也可操作", menuKeyName(key).c_str());
+            ui::popNote();
+            ui::vspace(ui::px(6));
+            ImGui::PushTextWrapPos(0.f);
+            ImGui::TextWrapped("房主已前往 %s。是否跟随前往该区域？", dest.c_str());
+            if (!supported) {
+                ui::vspace(ui::px(4));
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::md.error);
+                ImGui::TextWrapped("房主当前场景尚未开放联机入场，请等待其回到大世界。");
+                ImGui::PopStyleColor();
+            }
+            ImGui::PopTextWrapPos();
+            ui::vspace(ui::px(12));
+            const float avail = ImGui::GetContentRegionAvail().x;
+            const float gap = ui::px(8);
+            const float bw1 = (avail - gap * 2.f) * 0.36f;
+            const float bw2 = (avail - gap * 2.f) * 0.36f;
+            const float bw3 = avail - bw1 - bw2 - gap * 2.f;
+            ImGui::BeginDisabled(!supported);
+            if (ui::filledButton("跟随房主", {bw1, ui::px(36)})) {
+                act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
+            }
+            ImGui::SameLine(0.f, gap);
+            if (ui::tonalButton("总是自动跟随", {bw2, ui::px(36)})) {
+                autoFollowHostMap = true;
+                applySwitches();
+                act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
+                say("已开启房主切图自动跟随", false);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine(0.f, gap);
+            if (ui::outlinedButton("暂不跟随", {bw3, ui::px(36)})) {
+                act({{"action", "host_map_choice"}, {"token", token}, {"follow", false}});
+            }
+            const ImVec2 p0 = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+            hudHitRects.push_back({p0, {p0.x + sz.x, p0.y + sz.y}});
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+    }
+
+    // ---- Cross-Page Menu Banner for Pending Host Map Change -----------------
+    void drawHostMapMenuBanner() {
+        if (role() != "client") return;
+        const auto change = liveHostMapChange();
+        if (!change.value("pending", false)) return;
+        const auto entry = state.value("world_session", json::object()).value("entry", json::object());
+        const auto blockers = entry.value("blockers", json::array());
+        const bool supported = change.value("supported", true) &&
+            std::find(blockers.begin(), blockers.end(), json("host_scene_rules")) == blockers.end();
+        const auto token = change.value("token", std::uint64_t(0));
+        const std::string dest = hostMapDestLabel(change);
+
+        ui::cardBegin("##host_map_banner", nullptr, {0.f, 0.f});
+        ui::pushBold();
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::md.primary);
+        ImGui::Text("房主已前往：%s", dest.c_str());
+        ImGui::PopStyleColor();
+        ui::popBold();
+        if (!supported) {
+            ui::vspace(ui::px(4));
+            ui::hint("房主当前场景尚未开放联机入场，请等待其回到大世界。");
+        }
+        ui::vspace(ui::px(8));
+        ImGui::BeginDisabled(!supported);
+        if (ui::filledButton("跟随房主", {ui::px(116), ui::px(36)})) {
+            act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
+        }
+        ImGui::SameLine(0.f, ui::px(8));
+        if (ui::tonalButton("总是自动跟随", {ui::px(128), ui::px(36)})) {
+            autoFollowHostMap = true;
+            applySwitches();
+            act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
+            say("已开启房主切图自动跟随", false);
+        }
+        ImGui::EndDisabled();
+        if (!change.value("deferred", false)) {
+            ImGui::SameLine(0.f, ui::px(8));
+            if (ui::outlinedButton("暂不跟随", {ui::px(104), ui::px(36)})) {
+                act({{"action", "host_map_choice"}, {"token", token}, {"follow", false}});
+            }
+        }
+        ui::cardEnd();
+        ui::vspace(ui::px(12));
+    }
+
     // ---- In-Game HUD Chat (Exact Original Borderless Style) ----------------
     void drawChat(ImVec2 size) {
         const auto lines = state.value("chat", json::array());
@@ -924,6 +1059,7 @@ struct Ui {
             ImGui::SameLine(0.f, ui::px(14));
 
             ImGui::BeginChild("##eflink_content", {0.f, -footerH}, ImGuiChildFlags_None);
+            drawHostMapMenuBanner();
             switch (page) {
             case 0: pageSession(); break;
             case 1: pagePlayers(); break;
@@ -1412,22 +1548,10 @@ struct Ui {
         if (travel == "failed") { ui::vspace(ui::px(6)); ui::noticeBanner(ui::Tone::Error, ("传送失败：" + str(native, "error")).c_str()); }
         else if (!travel.empty() && travel != "idle" && travel != "complete") { ui::vspace(ui::px(4)); ui::hint("传送状态：%s", travel.c_str()); }
 
-        const auto change = native.value("host_map_change", json::object());
+        const auto change = liveHostMapChange();
         if (role() == "client" && change.value("pending", false)) {
-            ui::vspace(ui::px(10));
-            ui::noticeBanner(ui::Tone::Primary, ("房主已前往：" + str(change, "level")).c_str());
             ui::vspace(ui::px(8));
-            const auto blockers = entry.value("blockers", json::array());
-            const bool supported = std::find(blockers.begin(), blockers.end(), json("host_scene_rules")) == blockers.end();
-            const auto token = change.value("token", std::uint64_t(0));
-            ImGui::BeginDisabled(!supported);
-            if (ui::filledButton("跟随房主", {ui::px(120), ui::px(36)})) act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
-            ImGui::EndDisabled();
-            if (!change.value("deferred", false)) {
-                ImGui::SameLine(0.f, ui::px(10));
-                if (ui::outlinedButton("暂不跟随", {ui::px(110), ui::px(36)})) act({{"action", "host_map_choice"}, {"token", token}, {"follow", false}});
-            }
-            if (!supported) { ui::vspace(ui::px(4)); ui::hint("房主当前场景尚未开放联机入场，请等待其回到大世界。"); }
+            ui::hint("待确认：房主已前往 %s（可在上方横幅点击“跟随房主”或开启“总是自动跟随”）。", hostMapDestLabel(change).c_str());
         }
         ui::cardEnd();
     }
@@ -1841,6 +1965,9 @@ struct Ui {
         ImGui::Separator();
         ui::vspace(ui::px(6));
         changed |= ui::toggleSwitch("sw_follow", &follow, "作为房客时跟随房主地图");
+        ImGui::BeginDisabled(!follow);
+        changed |= ui::toggleSwitch("sw_autofollow", &autoFollowHostMap, "房主切换地图时自动跟随（免弹窗确认）", "开启后房主切图或进副本时自动跟随，不再弹出确认提示。");
+        ImGui::EndDisabled();
         changed |= ui::toggleSwitch("sw_combat", &combat, "同步战斗（共同攻击房主世界敌人）");
         ui::cardEnd();
         ImGui::EndGroup();
@@ -2228,6 +2355,7 @@ void Gui::runOverlay(json) {
             const bool down = (GetAsyncKeyState(ui.key) & 0x8000) != 0;
             if (down && !keyDown && focused && !(ui.open && io.WantTextInput)) ui.open = !ui.open;
             keyDown = down;
+            if (openLobbyRequested.exchange(false)) ui.page = 0;
             if (openRequested.exchange(false)) ui.open = true;
             if (ui.closeRequested) { ui.open = false; ui.closeRequested = false; }
 

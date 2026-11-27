@@ -150,6 +150,8 @@ public:
     // Tests: behave as if this end's UDP were blocked (TCP-only path).
     void simulateTcpOnly(bool value) {tcpOnlyForTest=value;}
     Role currentRole() const {return role.load();}
+    std::uint16_t localIdFast() const {return localIdAtomic.load(std::memory_order_relaxed);}
+    std::uint32_t roomIdFast() const {return roomIdAtomic.load(std::memory_order_relaxed);}
     Snapshot snapshot() {
         std::lock_guard lock(viewMutex);
         Snapshot s=view;s.rooms.clear();
@@ -191,6 +193,8 @@ private:
     std::map<std::string,Room> rooms;
     std::deque<ChatLine> chatLog;std::uint64_t chatSerial=0;
     std::atomic<Role> role=Role::Offline;
+    std::atomic<std::uint16_t> localIdAtomic=0;
+    std::atomic<std::uint32_t> roomIdAtomic=0;
     std::atomic<bool> tcpOnlyForTest=false;
 
     // Network-thread state.
@@ -352,6 +356,8 @@ private:
 
     // ---- session lifecycle ----
     void resetView() {
+        localIdAtomic.store(localId,std::memory_order_relaxed);
+        roomIdAtomic.store(roomId,std::memory_order_relaxed);
         std::lock_guard lock(viewMutex);
         view.role=role.load();view.localId=localId;view.roomId=roomId;view.roomName=options.roomName;view.maxPlayers=options.maxPlayers;
         view.password=!options.password.empty();view.port=options.port;view.address=joinAddress;
