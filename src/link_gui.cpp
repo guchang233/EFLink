@@ -462,26 +462,37 @@ struct Ui {
                     const float k = 1.f / (std::max)(std::abs(dx) / (std::max)(1.f, size.x * .5f - 44), std::abs(dy) / (std::max)(1.f, size.y * .5f - 44));
                     float ex = size.x * .5f + dx * k, ey = size.y * .5f + dy * k;
                     if (showTeamHud) {
-                        const float rosterLeft = size.x - ui::px(308);
+                        const float rosterLeft = size.x - ui::px(320);
                         if (ex > rosterLeft && ey > size.y * 0.24f && ey < size.y * 0.72f) ex = rosterLeft;
                     }
                     d->AddTriangleFilled({ex + ux * 9, ey + uy * 9}, {ex - uy * 7 - ux * 5, ey + ux * 7 - uy * 5}, {ex + uy * 7 - ux * 5, ey - ux * 7 - uy * 5}, accent);
                     char lbl[48]{}; std::snprintf(lbl, sizeof lbl, "%s %s", idText, distText);
                     const auto ts = ImGui::CalcTextSize(lbl);
-                    ui::shadowText(d, {ex - ux * 26 - ts.x * .5f, ey - uy * 26 - ts.y * .5f}, white, lbl);
+                    const ImVec2 tp{ex - ux * 28 - ts.x * .5f, ey - uy * 28 - ts.y * .5f};
+                    d->AddRectFilled({tp.x - ui::px(7), tp.y - ui::px(3)}, {tp.x + ts.x + ui::px(7), tp.y + ts.y + ui::px(3)}, ui::u32(ui::hud_orig::base, 0.72f * hudOpacity), (ts.y + ui::px(6)) * 0.5f);
+                    d->AddRect({tp.x - ui::px(7), tp.y - ui::px(3)}, {tp.x + ts.x + ui::px(7), tp.y + ts.y + ui::px(3)}, ui::u32(ui::hud_orig::rim, hudOpacity), (ts.y + ui::px(6)) * 0.5f);
+                    ui::shadowText(d, tp, white, lbl);
                     continue;
                 }
-                // Exact original v1.6.6 borderless overhead marker: diamond + ID tile + shadow name + distance
+                // Hybrid Endfield × Material 3 overhead marker: diamond + translucent pill scrim + rounded ID chip + name + distance
                 const float r = 4.5f;
                 const ImVec2 c{x, y - 4};
+                d->AddQuadFilled({c.x, c.y - r - 1.f}, {c.x + r + 1.f, c.y}, {c.x, c.y + r + 1.f}, {c.x - r - 1.f, c.y}, IM_COL32(0, 0, 0, 150));
                 d->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, accent);
                 const auto who = str(m, "name");
                 const auto is = ImGui::CalcTextSize(idText), ns = ImGui::CalcTextSize(who.c_str()), ds = ImGui::CalcTextSize(distText);
-                const float w = is.x + 6 + 8 + ns.x + 8 + ds.x, left = x - w * .5f, top = c.y - r - 8 - is.y;
-                d->AddRectFilled({left, top - 1}, {left + is.x + 6, top + is.y + 1}, accent);
-                d->AddText({left + 3, top}, ink, idText);
-                ui::shadowText(d, {left + is.x + 14, top}, white, who.c_str());
-                ui::shadowText(d, {left + is.x + 14 + ns.x + 8, top}, accent, distText);
+                const float idW = is.x + ui::px(8);
+                const float w = idW + ui::px(7) + ns.x + ui::px(8) + ds.x;
+                const float left = x - w * .5f, top = c.y - r - ui::px(11) - is.y;
+                const float padX = ui::px(8), padY = ui::px(3.5f);
+                const ImVec2 pMin{left - padX, top - padY}, pMax{left + w + padX, top + is.y + padY};
+                const float pillR = (pMax.y - pMin.y) * 0.5f;
+                d->AddRectFilled(pMin, pMax, ui::u32(ui::hud_orig::base, 0.72f * hudOpacity), pillR);
+                d->AddRect(pMin, pMax, ui::u32(ui::hud_orig::rim, hudOpacity), pillR);
+                d->AddRectFilled({left, top - 0.5f}, {left + idW, top + is.y + 0.5f}, accent, ui::px(4));
+                d->AddText({left + ui::px(4), top}, ink, idText);
+                ui::shadowText(d, {left + idW + ui::px(7), top}, white, who.c_str());
+                ui::shadowText(d, {left + idW + ui::px(7) + ns.x + ui::px(8), top}, accent, distText);
             }
             ui::popNote();
         }
@@ -494,16 +505,20 @@ struct Ui {
         if (!toast.empty() && now() - toastAt < 4000 && !open) {
             const auto ts = ImGui::CalcTextSize(toast.c_str());
             const float a = (std::clamp)(float(4000 - (now() - toastAt)) / 600.f, 0.f, 1.f);
-            const ImVec2 p{size.x * .5f - ts.x * .5f - 16, size.y - 140};
-            d->AddRectFilled(p, {p.x + ts.x + 32, p.y + ts.y + 18}, ui::u32(ui::hud_orig::base, 0.90f * a), 8);
-            d->AddText({p.x + 16, p.y + 9}, ui::u32(toastError ? ui::hud_orig::bad : ui::hud_orig::accent, a), toast.c_str());
+            const float padX = ui::px(16), padY = ui::px(9), dotR = ui::px(3.5f);
+            const float boxW = ts.x + padX * 2.f + ui::px(14), boxH = ts.y + padY * 2.f;
+            const ImVec2 p{size.x * .5f - boxW * .5f, size.y - ui::px(138)};
+            const ImVec4 tint = toastError ? ui::hud_orig::bad : ui::hud_orig::accent;
+            ui::hudGlassPanel(d, p, {p.x + boxW, p.y + boxH}, a, boxH * 0.5f / ui::gScale, ui::alpha(tint, 0.45f), 0.88f);
+            d->AddCircleFilled({p.x + padX + dotR, p.y + boxH * 0.5f}, dotR, ui::u32(tint, a), 12);
+            ui::shadowText(d, {p.x + padX + ui::px(14), p.y + padY}, ui::u32(ui::hud_orig::text, a), toast.c_str());
         }
 
         drawDuelInvite(size);
         drawHostMapHudCard(size);
     }
 
-    // ---- Original v1.6.6 Floating Borderless Roster + Micro Hairline HP/SP -
+    // ---- Hybrid Endfield × Material 3 Floating Roster + Pill HP/SP ---------
     void drawRoster(ImVec2 size, const std::map<int, float>& distances) {
         const auto peers = state.value("peers", json::array());
         if (peers.empty()) return;
@@ -513,35 +528,56 @@ struct Ui {
 
         const float op = hudOpacity;
         const float line = ImGui::GetTextLineHeight();
-        const float width = hudCompact ? ui::px(230) : ui::px(252);
-        const float x = size.x - width - ui::px(22);
-        float y = size.y * 0.28f;
+        const float padX = ui::px(14), padY = ui::px(11);
+        const float innerW = hudCompact ? ui::px(226) : ui::px(254);
+        const float boxW = innerW + padX * 2.f;
+
+        // Pre-compute total height so the sleek tonal glass panel wraps snugly
+        float contentH = line + ui::px(12);
+        for (const auto& peer : peers) {
+            const std::string idKey = std::to_string(peer.value("id", 0));
+            json v = vitalsMap.contains(idKey) ? vitalsMap[idKey] : peer.value("vitals", json::object());
+            const bool hasBars = !hudCompact && v.value("max_hp", 0.0) > 0.0;
+            contentH += hasBars ? (line + ui::px(15)) : (line + ui::px(8));
+        }
+        contentH -= ui::px(4);
+
+        const float boxX = size.x - boxW - ui::px(20);
+        const float boxY = size.y * 0.27f;
+        ui::hudGlassPanel(d, {boxX, boxY}, {boxX + boxW, boxY + contentH + padY * 2.f}, op, 15.f, ui::hud_orig::rim, 0.64f);
+
+        const float x = boxX + padX;
+        float y = boxY + padY;
+        const float width = innerW;
 
         const auto accent = ui::u32(ui::hud_orig::accent, op);
         const auto white  = ui::u32(ui::hud_orig::text, op);
         const auto dim    = ui::u32(ui::hud_orig::dim, op);
         const auto ink    = ui::u32(ui::hud_orig::ink, op);
 
-        // Exact original header: 3px accent bar + "EF LINK // Room" + subtle accent hairline
+        // Original Endfield header: 3px rounded accent bar + "EF LINK // Room" + MD3 RTT/TCP pill
         auto roomName = str(state.value("room", json::object()), "name");
         if (roomName.empty()) roomName = role() == "host" ? "我的房间" : "房间";
         const std::string head = ui::ellipsize(
-            "EF LINK // " + roomName + (state.value("pvp", json::object()).value("active", false) ? "  // PVP" : ""),
-            width - ui::px(48));
-        d->AddRectFilled({x, y + 2}, {x + 3, y + line - 2}, accent);
-        ui::shadowText(d, {x + 9, y}, accent, head.c_str());
+            "EF LINK // " + roomName + (state.value("pvp", json::object()).value("active", false) ? " // PVP" : ""),
+            width - ui::px(56));
+        d->AddRectFilled({x, y + 2}, {x + ui::px(3), y + line - 2}, accent, ui::px(1.5f));
+        ui::shadowText(d, {x + ui::px(9), y}, accent, head.c_str());
 
         const bool tcpOnly = state.value("traffic", json::object()).value("tcp_only_links", 0u) > 0;
         if (role() == "client" || tcpOnly) {
             char rtt[32]{};
             if (tcpOnly) std::snprintf(rtt, sizeof rtt, "TCP");
             else std::snprintf(rtt, sizeof rtt, "%ums", state.value("rtt_ms", 0u));
-            ui::shadowText(d, {x + width - ImGui::CalcTextSize(rtt).x, y},
-                tcpOnly ? ui::u32(ui::hud_orig::warn, op) : dim, rtt);
+            const float rw = ui::hudChipWidth(rtt);
+            ui::hudChip(d, {x + width - rw, y - 1}, rtt,
+                tcpOnly ? ui::hud_orig::warn : ui::hud_orig::dim,
+                tcpOnly ? ui::alpha(ui::hud_orig::warn, 0.18f) : ui::alpha(ui::hud_orig::well, 0.90f),
+                op, line + 2);
         }
-        y += line + 5;
-        d->AddLine({x, y}, {x + width, y}, ui::u32(ui::hud_orig::accent, 0.40f * op));
-        y += 7;
+        y += line + ui::px(6);
+        d->AddLine({x, y}, {x + width, y}, ui::u32(ui::hud_orig::accent, 0.34f * op));
+        y += ui::px(7);
 
         for (const auto& peer : peers) {
             const int id = peer.value("id", 0);
@@ -558,12 +594,13 @@ struct Ui {
             const double usp = v.value("usp", 0.0), maxUsp = v.value("max_usp", 0.0);
             const bool alive = v.value("alive", true);
 
-            // Original clean ID tile + shadow name + host/PVP + right distance
+            // Original Endfield ID tile with soft Material 3 rounding
             char idText[8]{}; std::snprintf(idText, sizeof idText, "%02d", id);
             const auto is = ImGui::CalcTextSize(idText);
-            d->AddRectFilled({x, y}, {x + is.x + 6, y + line},
-                !valid ? ui::u32(ui::hud_orig::faint, op) : (self ? white : accent));
-            d->AddText({x + 3, y}, ink, idText);
+            const float idW = is.x + ui::px(8);
+            d->AddRectFilled({x, y}, {x + idW, y + line},
+                !valid ? ui::u32(ui::hud_orig::faint, op) : (self ? white : accent), ui::px(4.5f));
+            d->AddText({x + ui::px(4), y}, ink, idText);
 
             char right[24]{};
             if (self) std::snprintf(right, sizeof right, "你");
@@ -574,42 +611,49 @@ struct Ui {
             const float rightW = ImGui::CalcTextSize(right).x;
             ui::shadowText(d, {x + width - rightW, y}, self ? dim : accent, right);
 
-            std::string who = str(peer, "name", "玩家");
-            if (isHost) who += "  房主";
-            const float maxWhoW = width - (is.x + 14) - rightW - (dueling ? ui::px(38) : ui::px(10));
+            const float hostChipW = isHost ? (ui::hudChipWidth("房主") + ui::px(5)) : 0.f;
+            const float pvpChipW  = dueling ? (ui::hudChipWidth("PVP") + ui::px(5)) : 0.f;
+            const std::string who = str(peer, "name", "玩家");
+            const float maxWhoW = (std::max)(ui::px(44), width - (idW + ui::px(10)) - rightW - hostChipW - pvpChipW - ui::px(8));
             const std::string shownWho = ui::ellipsize(who, maxWhoW);
-            ui::shadowText(d, {x + is.x + 14, y}, !alive ? ui::u32(ui::hud_orig::bad, op) : (valid ? white : dim), shownWho.c_str());
+            const float nameX = x + idW + ui::px(9);
+            ui::shadowText(d, {nameX, y}, !alive ? ui::u32(ui::hud_orig::bad, op) : (valid ? white : dim), shownWho.c_str());
+
+            float tagX = nameX + ImGui::CalcTextSize(shownWho.c_str()).x + ui::px(6);
+            if (isHost) {
+                ui::hudChip(d, {tagX, y}, "房主", ui::hud_orig::info, ui::alpha(ui::hud_orig::info, 0.20f), op, line);
+                tagX += ui::hudChipWidth("房主") + ui::px(4);
+            }
             if (dueling) {
-                const auto ws = ImGui::CalcTextSize(shownWho.c_str());
-                ui::shadowText(d, {x + is.x + 14 + ws.x + 7, y}, ui::u32(ui::hud_orig::bad, op), "PVP");
+                ui::hudChip(d, {tagX, y}, "PVP", ui::hud_orig::bad, ui::alpha(ui::hud_orig::bad, 0.24f), op, line);
             }
 
-            // Ultra-slim floating micro-bars underneath (no panel box!) when HP/SP available
+            // Sleek rounded MD3 pill HP/SP bars underneath
             if (!hudCompact && maxHp > 0.0) {
                 const float hpRatio = float((std::clamp)(hp / maxHp, 0.0, 1.0));
                 const float spRatio = maxUsp > 0.0 ? float((std::clamp)(usp / maxUsp, 0.0, 1.0)) : 0.f;
                 const bool spFull = maxUsp > 0.0 && spRatio >= 0.995f;
                 const ImVec4 hpCol = !alive ? ui::hud_orig::bad : (hpRatio > 0.55f ? ui::hud_orig::ok : (hpRatio > 0.25f ? ui::hud_orig::warn : ui::hud_orig::bad));
                 const ImVec4 spCol = spFull ? ui::hud_orig::accent : ui::hud_orig::info;
-                const float bx = x + is.x + 14;
-                const float bw = width - (is.x + 14);
-                const float by = y + line + 3;
-                d->AddRectFilled({bx, by}, {bx + bw, by + 2.5f}, IM_COL32(0, 0, 0, int(115 * op)), 1.5f);
-                if (hpRatio > 0.005f) d->AddRectFilled({bx, by}, {bx + bw * hpRatio, by + 2.5f}, ui::u32(hpCol, op), 1.5f);
+                const float bx = nameX;
+                const float bw = width - (idW + ui::px(9));
+                const float by = y + line + ui::px(4);
+                d->AddRectFilled({bx, by}, {bx + bw, by + ui::px(3.5f)}, ui::u32(ui::hud_orig::well, 0.85f * op), ui::px(2));
+                if (hpRatio > 0.005f) d->AddRectFilled({bx, by}, {bx + bw * hpRatio, by + ui::px(3.5f)}, ui::u32(hpCol, op), ui::px(2));
                 if (maxUsp > 0.0) {
-                    const float sy = by + 4.f;
-                    d->AddRectFilled({bx, sy}, {bx + bw, sy + 2.f}, IM_COL32(0, 0, 0, int(105 * op)), 1.f);
-                    if (spRatio > 0.005f) d->AddRectFilled({bx, sy}, {bx + bw * spRatio, sy + 2.f}, ui::u32(spCol, op), 1.f);
+                    const float sy = by + ui::px(5);
+                    d->AddRectFilled({bx, sy}, {bx + bw, sy + ui::px(2.5f)}, ui::u32(ui::hud_orig::well, 0.80f * op), ui::px(1.5f));
+                    if (spRatio > 0.005f) d->AddRectFilled({bx, sy}, {bx + bw * spRatio, sy + ui::px(2.5f)}, ui::u32(spCol, op), ui::px(1.5f));
                 }
-                y += line + 12;
+                y += line + ui::px(15);
             } else {
-                y += line + 6;
+                y += line + ui::px(8);
             }
         }
         ui::popNote();
     }
 
-    // ---- Shared ATB Pool Top Sync Bar (matches original borderless HUD) ----
+    // ---- Shared ATB Pool Top Sync Bar (Hybrid Endfield × Material 3) -------
     void drawSharedAtbHud(ImVec2 size) {
         const auto& atb = liveSharedAtb();
         if (!atb.value("active", false)) return;
@@ -622,25 +666,32 @@ struct Ui {
 
         ui::pushNote();
         const float lh = ImGui::GetTextLineHeight();
-        const float w = hudCompact ? ui::px(240) : ui::px(300);
-        const float x0 = size.x * 0.5f - w * 0.5f;
-        const float y0 = ui::px(16);
+        const float padX = ui::px(14), padY = ui::px(9);
+        const float w = hudCompact ? ui::px(244) : ui::px(308);
+        const float boxW = w + padX * 2.f;
+        const float boxH = lh + ui::px(14) + padY * 2.f;
+        const float boxX = size.x * 0.5f - boxW * 0.5f;
+        const float boxY = ui::px(14);
+        ui::hudGlassPanel(d, {boxX, boxY}, {boxX + boxW, boxY + boxH}, op, 14.f, ui::hud_orig::rim, 0.66f);
 
-        d->AddRectFilled({x0, y0 + 2}, {x0 + 3, y0 + lh - 2}, ui::u32(ui::hud_orig::accent, op));
-        ui::shadowText(d, {x0 + 9, y0}, ui::u32(ui::hud_orig::accent, op), "共享技力池");
+        const float x0 = boxX + padX;
+        const float y0 = boxY + padY;
+
+        d->AddRectFilled({x0, y0 + 2}, {x0 + ui::px(3), y0 + lh - 2}, ui::u32(ui::hud_orig::accent, op), ui::px(1.5f));
+        ui::shadowText(d, {x0 + ui::px(9), y0}, ui::u32(ui::hud_orig::accent, op), "共享技力池");
         char numBuf[64]{};
         if (rec > 0.05f) std::snprintf(numBuf, sizeof numBuf, "%.0f / %.0f  +%.1f/s", val, mx, rec);
         else std::snprintf(numBuf, sizeof numBuf, "%.0f / %.0f", val, mx);
         const auto nSz = ImGui::CalcTextSize(numBuf);
         ui::shadowText(d, {x0 + w - nSz.x, y0}, ui::u32(ui::hud_orig::text, op), numBuf);
 
-        const float by = y0 + lh + 5;
-        ui::drawProgressBar(d, {x0, by}, {x0 + w, by + 5.5f}, val / mx,
-            ui::u32(ui::hud_orig::accent, op), IM_COL32(0, 0, 0, int(130 * op)), segs);
+        const float by = y0 + lh + ui::px(6);
+        ui::drawProgressBar(d, {x0, by}, {x0 + w, by + ui::px(6.5f)}, val / mx,
+            ui::u32(ui::hud_orig::accent, op), ui::u32(ui::hud_orig::well, 0.90f * op), segs);
 
-        // Floating shadow-text spend/gain event lines
+        // Floating Material 3 pill chips for spend/gain events (always legible over bright sky)
         const auto events = atb.value("events", json::array());
-        float ey = by + 11;
+        float ey = boxY + boxH + ui::px(7);
         int shown = 0;
         for (auto it = events.rbegin(); it != events.rend() && shown < (hudCompact ? 2 : 3); ++it) {
             const auto age = it->value("age_ms", std::uint64_t(9999));
@@ -652,15 +703,21 @@ struct Ui {
             std::snprintf(evBuf, sizeof evBuf, "%s  %s%.0f 技力（%s）",
                 str(*it, "name", "队友").c_str(), gain ? "+" : "", delta, gain ? "回复" : "战技消耗");
             const auto es = ImGui::CalcTextSize(evBuf);
-            ui::shadowText(d, {size.x * 0.5f - es.x * 0.5f, ey},
-                ui::u32(gain ? ui::hud_orig::ok : ui::hud_orig::warn, fade), evBuf);
-            ey += lh + 3;
+            const float chipPadX = ui::px(11), chipPadY = ui::px(3);
+            const float chipW = es.x + chipPadX * 2.f + ui::px(10), chipH = es.y + chipPadY * 2.f;
+            const ImVec2 cp{size.x * 0.5f - chipW * 0.5f, ey};
+            const ImVec4 evCol = gain ? ui::hud_orig::ok : ui::hud_orig::warn;
+            d->AddRectFilled(cp, {cp.x + chipW, cp.y + chipH}, ui::u32(ui::hud_orig::base, 0.72f * fade), chipH * 0.5f);
+            d->AddRect(cp, {cp.x + chipW, cp.y + chipH}, ui::u32(evCol, 0.38f * fade), chipH * 0.5f);
+            d->AddCircleFilled({cp.x + chipPadX + ui::px(2.5f), cp.y + chipH * 0.5f}, ui::px(2.8f), ui::u32(evCol, fade), 10);
+            ui::shadowText(d, {cp.x + chipPadX + ui::px(10), cp.y + chipPadY}, ui::u32(evCol, fade), evBuf);
+            ey += chipH + ui::px(4);
             ++shown;
         }
         ui::popNote();
     }
 
-    // ---- Floating Real-Time Damage Meter (lightweight original HUD style) --
+    // ---- Floating Real-Time Damage Meter (Hybrid Endfield × Material 3) ----
     void drawDamageHud(ImVec2 size) {
         const auto& stats = liveCombatStats();
         const auto players = stats.value("players", json::array());
@@ -668,17 +725,17 @@ struct Ui {
 
         const float op = hudOpacity;
         const bool compact = hudCompact;
-        const float width = compact ? ui::px(252) : ui::px(312);
-        const ImVec2 defaultPos{ui::px(22), size.y * 0.28f};
+        const float width = compact ? ui::px(258) : ui::px(322);
+        const ImVec2 defaultPos{ui::px(20), size.y * 0.27f};
         ImGui::SetNextWindowPos(defaultPos, resetHudPosRequested ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
         resetHudPosRequested = false;
         ImGui::SetNextWindowSize({width, 0.f});
 
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.03f, 0.04f, 0.05f, op * 0.52f});
-        ImGui::PushStyleColor(ImGuiCol_Border, {0, 0, 0, 0});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(10), ui::px(8)});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(6));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::alpha(ui::hud_orig::base, op * 0.68f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ui::alpha(ui::hud_orig::rim, op));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(14), ui::px(11)});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(15));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui::px(1));
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing;
 
@@ -692,44 +749,45 @@ struct Ui {
             const float lh = ImGui::GetTextLineHeight();
             const ImVec2 ho = ImGui::GetCursorScreenPos();
             const float availW = ImGui::GetContentRegionAvail().x;
-            d->AddRectFilled({ho.x, ho.y + 2}, {ho.x + 3, ho.y + lh - 2}, ui::u32(ui::hud_orig::accent, op));
-            ui::shadowText(d, {ho.x + 9, ho.y}, ui::u32(ui::hud_orig::accent, op), "伤害统计");
+            d->AddRectFilled({ho.x, ho.y + 2}, {ho.x + ui::px(3), ho.y + lh - 2}, ui::u32(ui::hud_orig::accent, op), ui::px(1.5f));
+            ui::shadowText(d, {ho.x + ui::px(9), ho.y}, ui::u32(ui::hud_orig::accent, op), "伤害统计");
             char metaBuf[48]{};
             std::snprintf(metaBuf, sizeof metaBuf, "%.1fs · %s/s",
                 stats.value("duration_s", 0.0), formatDamageNumber(stats.value("team_dps", 0.0)).c_str());
             const float titleW = ImGui::CalcTextSize("伤害统计").x;
-            ui::shadowText(d, {ho.x + 16 + titleW, ho.y}, ui::u32(ui::hud_orig::text, op * 0.9f), metaBuf);
+            ui::shadowText(d, {ho.x + ui::px(16) + titleW, ho.y}, ui::u32(ui::hud_orig::dim, op), metaBuf);
 
-            // Compact clickable reset label on right
-            const float rstW = ImGui::CalcTextSize("重置").x + ui::px(12);
-            ImGui::SetCursorScreenPos({ho.x + availW - rstW, ho.y - 1});
-            ImGui::PushStyleColor(ImGuiCol_Button, {1.f, 1.f, 1.f, 0.08f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {1.f, 1.f, 1.f, 0.18f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, {1.f, 1.f, 1.f, 0.28f});
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::dim);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {ui::px(6), 1.f});
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.f);
+            // Material 3 pill reset chip on right
+            const float rstW = ImGui::CalcTextSize("重置").x + ui::px(16);
+            const float rstH = lh + ui::px(3);
+            ImGui::SetCursorScreenPos({ho.x + availW - rstW, ho.y - 1.5f});
+            ImGui::PushStyleColor(ImGuiCol_Button, ui::alpha(ui::hud_orig::well, 0.85f * op));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::alpha(ui::hud_orig::accent, 0.22f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::alpha(ui::hud_orig::accent, 0.34f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::alpha(ui::hud_orig::text, op));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {ui::px(8), 1.f});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, rstH * 0.5f);
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
-            if (ImGui::Button("重置##hudrst", {rstW, lh + 2})) {
+            if (ImGui::Button("重置##hudrst", {rstW, rstH})) {
                 act({{"action", "combat_stats_reset"}});
                 say("伤害统计已重置", false);
             }
             ImGui::PopStyleVar(3);
             ImGui::PopStyleColor(4);
 
-            ImGui::SetCursorScreenPos({ho.x, ho.y + lh + 5});
-            d->AddLine({ho.x, ho.y + lh + 4}, {ho.x + availW, ho.y + lh + 4}, ui::u32(ui::hud_orig::accent, 0.38f * op));
-            ui::vspace(ui::px(5));
+            ImGui::SetCursorScreenPos({ho.x, ho.y + lh + ui::px(6)});
+            d->AddLine({ho.x, ho.y + lh + ui::px(5)}, {ho.x + availW, ho.y + lh + ui::px(5)}, ui::u32(ui::hud_orig::accent, 0.34f * op));
+            ui::vspace(ui::px(6));
 
             if (players.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::dim);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::alpha(ui::hud_orig::dim, op));
                 ImGui::TextUnformatted("等待战斗伤害记录…");
                 ImGui::PopStyleColor();
             } else {
                 const double topDmg = (std::max)(1.0, players[0].value("damage", 1.0));
                 const int maxRows = compact ? 4 : 8;
                 int idx = 0;
-                const float barH = compact ? (lh + 4) : (lh + 6);
+                const float barH = compact ? (lh + ui::px(6)) : (lh + ui::px(8));
                 for (const auto& p : players) {
                     if (idx >= maxRows) break;
                     const double dmg = p.value("damage", 0.0);
@@ -740,10 +798,10 @@ struct Ui {
 
                     const ImVec2 o = ImGui::GetCursorScreenPos();
                     const float rw = ImGui::GetContentRegionAvail().x;
-                    d->AddRectFilled(o, {o.x + rw, o.y + barH}, IM_COL32(0, 0, 0, int(70 * op)), 3.f);
+                    d->AddRectFilled(o, {o.x + rw, o.y + barH}, ui::u32(ui::hud_orig::well, 0.56f * op), ui::px(8));
                     if (ratio > 0.005f) {
-                        d->AddRectFilled(o, {o.x + rw * ratio, o.y + barH}, ui::u32(barCol, op * 0.28f), 3.f);
-                        d->AddRectFilled(o, {o.x + 2.5f, o.y + barH}, ui::u32(barCol, op * 0.95f), 1.f);
+                        d->AddRectFilled(o, {o.x + rw * ratio, o.y + barH}, ui::u32(barCol, op * 0.28f), ui::px(8));
+                        d->AddRectFilled({o.x + ui::px(2), o.y + ui::px(3)}, {o.x + ui::px(5), o.y + barH - ui::px(3)}, ui::u32(barCol, op * 0.95f), ui::px(1.5f));
                     }
                     char rightStr[64]{};
                     if (compact) std::snprintf(rightStr, sizeof rightStr, "%s (%.0f%%)", formatDamageNumber(dmg).c_str(), share * 100.0);
@@ -754,16 +812,17 @@ struct Ui {
                     std::string leftStr = "#" + std::to_string(idx + 1) + " " + str(p, "name", "玩家");
                     const std::string opTag = str(p, "op");
                     if (!compact && !opTag.empty() && opTag != str(p, "name")) leftStr += " [" + opTag + "]";
-                    const float maxLeft = (std::max)(ui::px(40), rw - rSz.x - ui::px(16));
-                    ui::shadowText(d, {o.x + 7, ty}, ui::u32(ui::hud_orig::text, op), ui::ellipsize(leftStr, maxLeft).c_str());
-                    ui::shadowText(d, {o.x + rw - rSz.x - 5, ty}, ui::u32(idx == 0 ? ui::hud_orig::accent : ui::hud_orig::text, op), rightStr);
+                    const float maxLeft = (std::max)(ui::px(40), rw - rSz.x - ui::px(18));
+                    ui::shadowText(d, {o.x + ui::px(10), ty}, ui::u32(ui::hud_orig::text, op), ui::ellipsize(leftStr, maxLeft).c_str());
+                    ui::shadowText(d, {o.x + rw - rSz.x - ui::px(7), ty}, ui::u32(idx == 0 ? ui::hud_orig::accent : ui::hud_orig::text, op), rightStr);
 
                     ImGui::Dummy({rw, barH});
-                    ui::vspace(3.f);
+                    ui::vspace(ui::px(4));
                     ++idx;
                 }
                 if (!compact) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::dim);
+                    ui::vspace(ui::px(1));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::alpha(ui::hud_orig::dim, op));
                     ImGui::Text("总伤 %s · %s 重置 · Alt+拖动",
                         formatDamageNumber(stats.value("total_damage", 0.0)).c_str(), fKeyName(damageResetKey));
                     ImGui::PopStyleColor();
@@ -835,15 +894,17 @@ struct Ui {
         const std::string dest = hostMapDestLabel(change);
 
         if (deferred) {
-            // Subtle unobtrusive reminder pill when user chose "暂不跟随"
+            // Subtle unobtrusive Material 3 pill reminder when user chose "暂不跟随"
             auto* d = ImGui::GetBackgroundDrawList();
             const std::string text = "房主位于 " + dest + " · 按 " + menuKeyName(key) + " 可随时跟随";
             ui::pushNote();
             const auto ts = ImGui::CalcTextSize(text.c_str());
-            const ImVec2 p{size.x * 0.5f - ts.x * 0.5f - 14, ui::px(76)};
-            d->AddRectFilled(p, {p.x + ts.x + 28, p.y + ts.y + 14}, ui::u32(ui::hud_orig::base, 0.82f), 8);
-            d->AddRect(p, {p.x + ts.x + 28, p.y + ts.y + 14}, ui::u32(ui::hud_orig::accent, 0.65f), 8);
-            d->AddText({p.x + 14, p.y + 7}, ui::u32(ui::hud_orig::accent), text.c_str());
+            const float padX = ui::px(14), padY = ui::px(6), dotR = ui::px(3);
+            const float boxW = ts.x + padX * 2.f + ui::px(12), boxH = ts.y + padY * 2.f;
+            const ImVec2 p{size.x * 0.5f - boxW * 0.5f, ui::px(76)};
+            ui::hudGlassPanel(d, p, {p.x + boxW, p.y + boxH}, hudOpacity, boxH * 0.5f / ui::gScale, ui::alpha(ui::hud_orig::accent, 0.50f), 0.80f);
+            d->AddCircleFilled({p.x + padX + dotR, p.y + boxH * 0.5f}, dotR, ui::u32(ui::hud_orig::accent, hudOpacity), 12);
+            ui::shadowText(d, {p.x + padX + ui::px(12), p.y + padY}, ui::u32(ui::hud_orig::text, hudOpacity), text.c_str());
             ui::popNote();
             return;
         }
@@ -954,7 +1015,7 @@ struct Ui {
         ui::vspace(ui::px(12));
     }
 
-    // ---- In-Game HUD Chat (Exact Original Borderless Style) ----------------
+    // ---- In-Game HUD Chat (Hybrid Endfield × Material 3 Tonal Glass) -------
     void drawChat(ImVec2 size) {
         const auto lines = state.value("chat", json::array());
         const auto t = now();
@@ -967,37 +1028,85 @@ struct Ui {
             if (!chatSeen.contains(s)) chatSeen[s] = t;
         }
         std::vector<const json*> show;
+        float maxAlpha = 0.f;
         for (auto it = lines.rbegin(); it != lines.rend() && show.size() < (chatting ? 10u : 6u); ++it) {
             const auto seen = chatSeen[it->value("serial", std::uint64_t(0))];
-            if (chatting || (seen && t - seen < 12000)) show.push_back(&*it);
+            if (chatting || (seen && t - seen < 12000)) {
+                const float a = chatting ? 1.f : (std::clamp)(float(12000 - (t - seen)) / 2000.f, 0.f, 1.f);
+                if (a > maxAlpha) maxAlpha = a;
+                show.push_back(&*it);
+            }
         }
         ui::pushNote();
         auto* d = ImGui::GetBackgroundDrawList();
-        const float line = ImGui::GetTextLineHeight() + 4;
-        const float left = 24, width = (std::min)(560.f, size.x * .42f), bottom = size.y * .78f;
-        float y = bottom - line * float(show.size());
-        if (chatting && !show.empty()) d->AddRectFilled({left - 8, y - 6}, {left + width, bottom + 2}, IM_COL32(0, 0, 0, 110), 4);
-        for (auto it = show.rbegin(); it != show.rend(); ++it, y += line) {
-            const auto& l = **it;
-            const auto seen = chatSeen[l.value("serial", std::uint64_t(0))];
-            const float a = chatting ? 1.f : (std::clamp)(float(12000 - (t - seen)) / 2000.f, 0.f, 1.f);
-            d->PushClipRect({left - 8, y - 2}, {left + width, y + line}, true);
-            if (l.value("system", false)) {
-                ui::shadowText(d, {left, y}, ui::u32(ui::hud_orig::dim, a), ("· " + str(l, "text")).c_str());
-            } else {
-                const auto who = str(l, "name") + "：";
-                ui::shadowText(d, {left, y}, ui::u32(ui::hud_orig::accent, a), who.c_str());
-                ui::shadowText(d, {left + ImGui::CalcTextSize(who.c_str()).x, y}, ui::u32(ui::hud_orig::text, a), str(l, "text").c_str());
+        const float op = hudOpacity;
+        const float lh = ImGui::GetTextLineHeight();
+        const float line = lh + ui::px(7);
+        const float padX = ui::px(14), padY = ui::px(10);
+        const float boxX = ui::px(20);
+        const float boxW = (std::min)(ui::px(500), size.x * .38f);
+        const float left = boxX + padX;
+        const float innerW = boxW - padX * 2.f;
+        const float bottom = size.y * .78f;
+
+        if (!show.empty()) {
+            const float headerH = chatting ? (lh + ui::px(11)) : 0.f;
+            const float msgH = line * float(show.size());
+            const float boxTop = bottom - msgH - headerH - padY;
+            const float boxBot = bottom + padY * 0.6f;
+            const float panelOp = chatting ? op : (op * maxAlpha);
+            ui::hudGlassPanel(d, {boxX, boxTop}, {boxX + boxW, boxBot}, panelOp,
+                chatting ? 16.f : 14.f,
+                chatting ? ui::alpha(ui::hud_orig::accent, 0.36f) : ui::hud_orig::rim,
+                chatting ? 0.78f : 0.58f);
+
+            float y = boxTop + padY;
+            if (chatting) {
+                d->AddRectFilled({left, y + 2}, {left + ui::px(3), y + lh - 2}, ui::u32(ui::hud_orig::accent, op), ui::px(1.5f));
+                ui::shadowText(d, {left + ui::px(9), y}, ui::u32(ui::hud_orig::accent, op), "队伍聊天");
+                const char* hintStr = "Enter 发送 · Esc 取消";
+                const auto hs = ImGui::CalcTextSize(hintStr);
+                ui::shadowText(d, {left + innerW - hs.x, y}, ui::u32(ui::hud_orig::dim, op * 0.9f), hintStr);
+                y += lh + ui::px(5);
+                d->AddLine({left, y}, {left + innerW, y}, ui::u32(ui::hud_orig::accent, 0.30f * op));
+                y += ui::px(6);
             }
-            d->PopClipRect();
+
+            for (auto it = show.rbegin(); it != show.rend(); ++it, y += line) {
+                const auto& l = **it;
+                const auto seen = chatSeen[l.value("serial", std::uint64_t(0))];
+                const float a = (chatting ? 1.f : (std::clamp)(float(12000 - (t - seen)) / 2000.f, 0.f, 1.f)) * op;
+                d->PushClipRect({left - ui::px(2), y - ui::px(2)}, {left + innerW + ui::px(2), y + line}, true);
+                if (l.value("system", false)) {
+                    const float dotY = y + lh * 0.5f;
+                    d->AddCircleFilled({left + ui::px(4), dotY}, ui::px(2.5f), ui::u32(ui::hud_orig::info, a * 0.9f), 10);
+                    ui::shadowText(d, {left + ui::px(12), y}, ui::u32(ui::hud_orig::dim, a), str(l, "text").c_str());
+                } else {
+                    const auto sender = str(l, "name");
+                    const auto msg    = str(l, "text");
+                    const float chipW = ui::hudChipWidth(sender.c_str());
+                    ui::hudChip(d, {left, y - 0.5f}, sender.c_str(), ui::hud_orig::accent, ui::alpha(ui::hud_orig::accent, 0.16f), a, lh + 1.f);
+                    ui::shadowText(d, {left + chipW + ui::px(8), y}, ui::u32(ui::hud_orig::text, a), msg.c_str());
+                }
+                d->PopClipRect();
+            }
         }
         if (chatting) {
-            ImGui::SetNextWindowPos({left - 8, bottom + 6});
-            ImGui::SetNextWindowSize({width + 8, 0});
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.06f, 0.07f, 0.08f, 0.85f});
+            ImGui::SetNextWindowPos({boxX, bottom + padY * 0.6f + ui::px(6)});
+            ImGui::SetNextWindowSize({boxW, 0});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, {0, 0, 0, 0});
             ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::text);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, {0.10f, 0.11f, 0.13f, 0.90f});
-            ImGui::PushStyleColor(ImGuiCol_Border, ui::hud_orig::accent);
+            ImGui::PushStyleColor(ImGuiCol_TextDisabled, ui::hud_orig::dim);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ui::alpha(ui::hud_orig::base, 0.88f * op));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ui::alpha(ui::hud_orig::surface, 0.92f * op));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ui::alpha(ui::hud_orig::surface, 0.95f * op));
+            ImGui::PushStyleColor(ImGuiCol_Border, ui::alpha(ui::hud_orig::accent, 0.75f * op));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.f, 0.f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(18));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {ui::px(16), ui::px(10)});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::px(18));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::px(1.2f));
             if (ImGui::Begin("##hudchat", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
                 if (chatFocus) { ImGui::SetKeyboardFocusHere(); chatFocus = false; }
                 ImGui::SetNextItemWidth(-1);
@@ -1008,7 +1117,8 @@ struct Ui {
                 if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { hudChat[0] = 0; chatting = false; }
             }
             ImGui::End();
-            ImGui::PopStyleColor(4);
+            ImGui::PopStyleVar(6);
+            ImGui::PopStyleColor(7);
         }
         ui::popNote();
     }
@@ -2478,6 +2588,14 @@ void Gui::runPreview(Request handler, json options) {
         ui.page = (std::clamp)(std::atoi(envTab), 0, 5);
     }
     ui.open = !options.value("preview_hud", false);
+    if (options.value("preview_hud", false)) {
+        // Ensure demo chat messages are visible in HUD preview captures
+        ui.chatPrimed = true;
+        if (options.value("preview_chat", false)) {
+            ui.chatting = true;
+            ui.chatFocus = true;
+        }
+    }
 
     const auto capture = str(options, "preview_capture");
     if (capture.empty()) ShowWindow(surface.window, SW_SHOW);

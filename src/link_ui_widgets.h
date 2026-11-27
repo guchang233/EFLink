@@ -26,8 +26,37 @@ inline void vspace(float h) { if (h > 0.f) ImGui::Dummy({0.f, h}); }
 inline void hspace(float w) { ImGui::SameLine(0.f, w); }
 
 inline void shadowText(ImDrawList* d, ImVec2 at, ImU32 tint, const char* text) {
-    d->AddText({at.x + 1.f, at.y + 1.f}, IM_COL32(0, 0, 0, 175), text);
+    const unsigned a = (tint >> IM_COL32_A_SHIFT) & 0xFFu;
+    const unsigned s1 = (a * 195u) / 255u;
+    const unsigned s2 = (a * 95u) / 255u;
+    d->AddText({at.x + 1.f, at.y + 1.f}, IM_COL32(0, 0, 0, s1), text);
+    d->AddText({at.x, at.y + 1.5f}, IM_COL32(0, 0, 0, s2), text);
     d->AddText(at, tint, text);
+}
+
+// Hybrid Endfield × Material 3 translucent dark tonal glass surface for in-game HUD.
+inline void hudGlassPanel(ImDrawList* d, ImVec2 min, ImVec2 max, float opacity, float rounding = 14.f,
+                          ImVec4 rimCol = hud_orig::rim, float fillAlpha = 0.68f) {
+    const float r = px(rounding);
+    // Subtle Material 3 ambient drop shadow
+    d->AddRectFilled({min.x, min.y + px(2)}, {max.x, max.y + px(4)}, IM_COL32(0, 0, 0, int(72 * opacity)), r + px(1));
+    // Translucent dark tonal backdrop
+    d->AddRectFilled(min, max, u32(hud_orig::base, fillAlpha * opacity), r);
+    // Crisp hairline tonal border
+    d->AddRect(min, max, u32(rimCol, opacity), r, 0, px(1));
+}
+
+// Compact Material 3 tonal pill chip drawn directly on an ImDrawList (for HUD tags / events).
+inline float hudChipWidth(const char* text) {
+    return ImGui::CalcTextSize(text).x + px(12);
+}
+inline void hudChip(ImDrawList* d, ImVec2 at, const char* text, ImVec4 fg, ImVec4 bg, float opacity, float height = 0.f) {
+    const ImVec2 ts = ImGui::CalcTextSize(text);
+    const float padX = px(6);
+    const float h = height > 0.f ? height : (ts.y + px(2));
+    const ImVec2 max{at.x + ts.x + padX * 2.f, at.y + h};
+    d->AddRectFilled(at, max, u32(bg, opacity), h * 0.5f);
+    d->AddText({at.x + padX, at.y + (h - ts.y) * 0.5f}, u32(fg, opacity), text);
 }
 
 inline void alignRight(float width) {

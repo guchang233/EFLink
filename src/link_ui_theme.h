@@ -131,18 +131,24 @@ inline Scheme makeDarkScheme() {
 
 inline thread_local Scheme md = makeLightScheme();
 
-// ---- Original v1.6.6 In-Game HUD Palette (clean, borderless Endfield HUD) --
+// ---- Hybrid Endfield × Material 3 In-Game HUD Palette ----------------------
+// Preserves the iconic Endfield lime-yellow tactical accent (#E3F23D) and
+// lightweight dark glass feel, while adding MD3 tonal elevation, soft outlines,
+// and higher-contrast scrims for visibility over bright 3D scenes.
 namespace hud_orig {
-constexpr ImVec4 base     {0.047f, 0.055f, 0.063f, 0.97f};
-constexpr ImVec4 text     {0.930f, 0.945f, 0.960f, 1.00f};
-constexpr ImVec4 dim      {0.620f, 0.660f, 0.700f, 1.00f};
-constexpr ImVec4 faint    {0.360f, 0.390f, 0.420f, 1.00f};
-constexpr ImVec4 accent   {0.890f, 0.950f, 0.240f, 1.00f}; // #E3F23D
+constexpr ImVec4 base     {0.055f, 0.067f, 0.086f, 0.96f}; // MD3-tinted dark tonal slate (#0E1116)
+constexpr ImVec4 surface  {0.082f, 0.098f, 0.122f, 1.00f}; // Elevated HUD container (#15191F)
+constexpr ImVec4 well     {0.114f, 0.133f, 0.165f, 1.00f}; // Input / track well (#1D222A)
+constexpr ImVec4 rim      {0.850f, 0.900f, 0.980f, 0.14f}; // Subtle MD3 tonal hairline border
+constexpr ImVec4 text     {0.955f, 0.965f, 0.980f, 1.00f}; // High-legibility foreground
+constexpr ImVec4 dim      {0.730f, 0.765f, 0.810f, 1.00f}; // Readable secondary metadata
+constexpr ImVec4 faint    {0.420f, 0.455f, 0.500f, 1.00f};
+constexpr ImVec4 accent   {0.890f, 0.950f, 0.240f, 1.00f}; // Iconic Endfield #E3F23D
 constexpr ImVec4 ink      {0.060f, 0.070f, 0.040f, 1.00f};
-constexpr ImVec4 ok       {0.310f, 0.830f, 0.600f, 1.00f};
-constexpr ImVec4 warn     {1.000f, 0.720f, 0.290f, 1.00f};
-constexpr ImVec4 bad      {1.000f, 0.420f, 0.350f, 1.00f};
-constexpr ImVec4 info     {0.360f, 0.720f, 1.000f, 1.00f};
+constexpr ImVec4 ok       {0.427f, 0.835f, 0.549f, 1.00f}; // MD3 Green (#6DD58C)
+constexpr ImVec4 warn     {0.992f, 0.839f, 0.388f, 1.00f}; // MD3 Amber (#FDD663)
+constexpr ImVec4 bad      {0.949f, 0.545f, 0.510f, 1.00f}; // MD3 Coral Red (#F28B82)
+constexpr ImVec4 info     {0.659f, 0.780f, 0.980f, 1.00f}; // MD3 Google Blue (#A8C7FA)
 } // namespace hud_orig
 
 enum class Tone { Primary, Secondary, Success, Warning, Error, Violet, Neutral };
