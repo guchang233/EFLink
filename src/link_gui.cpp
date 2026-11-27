@@ -1,7 +1,8 @@
 // EF Link interface: transparent DirectComposition overlay over the game window.
-// HUD (name tags, teammate vitals, floating damage meter, shared ATB sync bar,
-// chat, PVP duel invitations) is drawn over the game; the menu key turns the
-// overlay interactive and shows the Endfield-styled multiplayer menu.
+// - In-game HUD (markers, teammate roster + micro HP/SP bars, shared ATB bar,
+//   floating damage meter, chat) preserves the original clean borderless Endfield style.
+// - Main menu follows Google's Android Material Design 3 (Material You) design language,
+//   supporting both Light (default) and Dark Material 3 themes with 1-click switching.
 #include "link_version.h"
 #include "link_gui.h"
 #include "link_settings.h"
@@ -72,7 +73,7 @@ const char* blockerText(const std::string& b) {
            b == "host_player_entity" ? "房主侧角色" : b.c_str();
 }
 ui::Tone roleTone(const std::string& r) {
-    if (r == "host") return ui::Tone::Accent;
+    if (r == "host") return ui::Tone::Primary;
     if (r == "client") return ui::Tone::Success;
     if (r == "connecting") return ui::Tone::Warning;
     return ui::Tone::Neutral;
@@ -102,7 +103,7 @@ HWND findGame() {
 }
 
 // ---- demo fixtures for EFLink.Preview.exe ----------------------------------
-json demoStatus(const std::string& role) {
+json demoStatus(const std::string& role, bool darkDefault = false) {
     const bool host = role == "host", client = role == "client";
     const bool offline = !(host || client);
     json peers = json::array();
@@ -183,7 +184,7 @@ json demoStatus(const std::string& role) {
                 {"combat",{{"guest_hits_sent",142},{"room_hits_applied",254},{"player_casts_sent",68},{"player_casts_mirrored",65},{"player_casts_rejected",1},{"local_weapon","wpn_sword_0012"},{"weapon_lookups",12},{"squad",{{"poses_sent",2410},{"poses_in",4820},{"remote",json::array({1,2,3})}}}}}}}}},
         {"world_session",{{"ready",true},{"epoch",12},{"error",""},
             {"entry",{{"active",!offline},{"phase",offline?"offline":"active"},{"blockers",json::array()}}}}},
-        {"pvp",{{"allowed",true},{"active",!offline},{"scale",1.0},{"revive",true},
+        {"pvp",{{"allowed",!offline},{"active",!offline},{"scale",1.0},{"revive",true},
             {"duels",json::array({{{"id",2},{"name","伊冯"}}})},{"invites",json::array()},{"notice",""},{"notice_serial",0}}},
         {"hook_ready",true},{"op_filter_ready",true},{"damage_hook_ready",true},{"transferred_hook_ready",true},
         {"atb_cost_hook_ready",true},{"atb_set_hook_ready",true},{"atb_update_hook_ready",true},{"atb_reset_hook_ready",true},
@@ -195,6 +196,7 @@ json demoStatus(const std::string& role) {
             {"show_player_markers",true},{"follow_host_world",true},{"sync_combat",true},
             {"room_pvp",!offline},{"room_pvp_scale",1.0},{"room_pvp_revive",true},{"room_shared_atb",true},
             {"show_damage_hud",true},{"show_team_hud",true},{"show_atb_hud",true},{"hud_compact",false},{"hud_opacity",0.86},{"damage_auto_reset",false},
+            {"menu_dark_mode",darkDefault},
             {"saved_servers",json::array({{{"address","192.168.2.3:47615"},{"name","宿舍主机"}},{{"address","10.4.0.7:47615"},{"name","异地组网专线"}}})}}},
         {"traffic",{{"bytes_in",184320},{"bytes_out",96256},{"states_in",420},{"states_out",420},{"udp_links",3},{"tcp_only_links",0}}}
     };
@@ -239,9 +241,11 @@ struct Ui {
     bool remote = true, squad = true, replay = true, outline = true, markers = true, follow = true, combat = true;
     bool pvp = false, pvpRevive = true, sharedAtb = false;
     float pvpScale = 1.f;
-    // HUD customization preferences
+    // HUD & theme preferences
     bool showDamageHud = true, showTeamHud = true, showAtbHud = true, hudCompact = false, damageAutoReset = false;
+    bool darkMode = false, appliedDarkMode = false;
     float hudOpacity = 0.86f;
+    float displayScale = 1.0f;
     bool resetHudPosRequested = false;
 
     std::uint64_t lastChat = 0, unreadChat = 0, lastSeenChatSerial = 0;
@@ -266,6 +270,13 @@ struct Ui {
 
     void say(std::string text, bool error) { toast = std::move(text); toastAt = now(); toastError = error; }
     void act(json input) { const auto a = str(input, "action"); actions.push_back({post(input), a, now()}); }
+
+    void syncThemeIfNeeded() {
+        if (darkMode != appliedDarkMode) {
+            ui::applyTheme(displayScale, darkMode);
+            appliedDarkMode = darkMode;
+        }
+    }
 
     void init() {
         if (initialized || state.empty()) return;
@@ -295,6 +306,8 @@ struct Ui {
         hudCompact = c.value("hud_compact", false);
         hudOpacity = (std::clamp)(c.value("hud_opacity", 0.86f), 0.25f, 1.0f);
         damageAutoReset = c.value("damage_auto_reset", false);
+        darkMode = c.value("menu_dark_mode", false);
+        syncThemeIfNeeded();
         lastSeenChatSerial = state.value("chat_serial", std::uint64_t(0));
     }
 
@@ -317,13 +330,9 @@ struct Ui {
                 }
                 pvpNoticeSeen = serial;
                 pvpNoticePrimed = true;
-                const auto chatSerial = state.value("chat_serial", std::uint64_t(0));
-                if (menuOpen && page == 3) {
-                    lastSeenChatSerial = chatSerial;
-                    unreadChat = 0;
-                } else if (chatSerial > lastSeenChatSerial) {
-                    unreadChat = chatSerial - lastSeenChatSerial;
-                }
+                const auto chatSer = state.value("chat_serial", std::uint64_t(0));
+                if (page == 3 && open) { lastSeenChatSerial = chatSer; unreadChat = 0; }
+                else if (chatSer > lastSeenChatSerial) unreadChat = chatSer - lastSeenChatSerial;
             }
         } else if (statusCall.valid() && t - statusSent > 5000) statusCall = {};
         if (!statusCall.valid() && t - statusSent >= (menuOpen ? 250u : 500u)) {
@@ -335,7 +344,7 @@ struct Ui {
             auto r = hudCall.get();
             if (r.contains("markers")) hud = std::move(r);
         } else if (hudCall.valid() && t - hudSent > 5000) hudCall = {};
-        if (!hudCall.valid() && t - hudSent >= 60) {
+        if (!hudCall.valid() && t - hudSent >= 60u) {
             hudSent = t;
             hudCall = post({{"action", "hud"}});
         }
@@ -354,36 +363,36 @@ struct Ui {
     std::string role() const { return str(state, "role", "offline"); }
     bool online() const { const auto r = role(); return r == "host" || r == "client"; }
 
-    const json& liveVitals() const {
-        if (hud.contains("vitals") && hud["vitals"].is_object() && !hud["vitals"].empty()) return hud["vitals"];
+    const json& liveCombatStats() const {
+        if (hud.contains("combat_stats") && hud["combat_stats"].is_object()) return hud["combat_stats"];
+        if (state.contains("combat_stats") && state["combat_stats"].is_object()) return state["combat_stats"];
         static const json empty = json::object();
-        auto it = state.find("vitals");
-        return it != state.end() && it->is_object() ? *it : empty;
+        return empty;
     }
     const json& liveSharedAtb() const {
-        if (hud.contains("shared_atb") && hud["shared_atb"].is_object() && !hud["shared_atb"].empty()) return hud["shared_atb"];
+        if (hud.contains("shared_atb") && hud["shared_atb"].is_object()) return hud["shared_atb"];
+        if (state.contains("shared_atb") && state["shared_atb"].is_object()) return state["shared_atb"];
         static const json empty = json::object();
-        auto it = state.find("shared_atb");
-        return it != state.end() && it->is_object() ? *it : empty;
+        return empty;
     }
-    const json& liveCombatStats() const {
-        if (hud.contains("combat_stats") && hud["combat_stats"].is_object() && !hud["combat_stats"].empty()) return hud["combat_stats"];
+    const json& liveVitals() const {
+        if (hud.contains("vitals") && hud["vitals"].is_object()) return hud["vitals"];
+        if (state.contains("vitals") && state["vitals"].is_object()) return state["vitals"];
         static const json empty = json::object();
-        auto it = state.find("combat_stats");
-        return it != state.end() && it->is_object() ? *it : empty;
+        return empty;
     }
 
     void saveSettings() {
         json patch = {
             {"room_name", room}, {"port", port}, {"max_players", limit},
             {"menu_key", key}, {"pvp_key", pvpKey}, {"damage_reset_key", damageResetKey},
-            {"show_remote_players", remote}, {"show_remote_squad", squad}, {"replay_skills", replay},
-            {"outline_teammates", outline}, {"show_player_markers", markers},
-            {"follow_host_world", follow}, {"sync_combat", combat},
-            {"room_shared_atb", sharedAtb},
+            {"show_remote_players", remote}, {"show_remote_squad", squad},
+            {"replay_skills", replay}, {"outline_teammates", outline},
+            {"show_player_markers", markers}, {"follow_host_world", follow}, {"sync_combat", combat},
             {"show_damage_hud", showDamageHud}, {"show_team_hud", showTeamHud},
             {"show_atb_hud", showAtbHud}, {"hud_compact", hudCompact},
-            {"hud_opacity", double(hudOpacity)}, {"damage_auto_reset", damageAutoReset}
+            {"hud_opacity", double(hudOpacity)}, {"damage_auto_reset", damageAutoReset},
+            {"menu_dark_mode", darkMode}
         };
         if (nameEdited) { patch["player_name"] = name; nameEdited = false; }
         act({{"action", "settings"}, {"configuration", patch}});
@@ -391,13 +400,15 @@ struct Ui {
     }
 
     void applySwitches() {
+        syncThemeIfNeeded();
         act({{"action", "settings"}, {"configuration", {
-            {"show_remote_players", remote}, {"show_remote_squad", squad}, {"replay_skills", replay},
-            {"outline_teammates", outline}, {"show_player_markers", markers},
-            {"follow_host_world", follow}, {"sync_combat", combat},
+            {"show_remote_players", remote}, {"show_remote_squad", squad},
+            {"replay_skills", replay}, {"outline_teammates", outline},
+            {"show_player_markers", markers}, {"follow_host_world", follow}, {"sync_combat", combat},
             {"show_damage_hud", showDamageHud}, {"show_team_hud", showTeamHud},
             {"show_atb_hud", showAtbHud}, {"hud_compact", hudCompact},
-            {"hud_opacity", double(hudOpacity)}, {"damage_auto_reset", damageAutoReset}
+            {"hud_opacity", double(hudOpacity)}, {"damage_auto_reset", damageAutoReset},
+            {"menu_dark_mode", darkMode}
         }}});
     }
 
@@ -407,7 +418,7 @@ struct Ui {
     }
 
     // =========================================================================
-    // IN-GAME TRANSPARENT HUD OVERLAYS
+    // IN-GAME TRANSPARENT HUD (PRESERVES ORIGINAL v1.6.6 CLEAN BORDERLESS LOOK)
     // =========================================================================
     void drawHud(ImVec2 size) {
         hudHitRects.clear();
@@ -416,9 +427,9 @@ struct Ui {
         std::map<int, float> distances;
         if (showTags) {
             ui::pushNote();
-            const auto accent = ui::u32(ui::kAccent);
-            const auto white  = ui::u32(ui::kText);
-            const auto ink    = ui::u32(ui::kAccentInk);
+            const auto accent = ui::u32(ui::hud_orig::accent);
+            const auto white  = ui::u32(ui::hud_orig::text);
+            const auto ink    = ui::u32(ui::hud_orig::ink);
             for (const auto& m : hud.value("markers", json::array())) {
                 if (m.value("other_map", false) || m.value("self", false)) continue;
                 const int id = m.value("id", 0);
@@ -434,121 +445,99 @@ struct Ui {
                     if (behind) { dx = -dx; dy = -dy; }
                     if (std::abs(dx) + std::abs(dy) < .001f) dy = -1;
                     const float len = std::sqrt(dx * dx + dy * dy), ux = dx / len, uy = dy / len;
-                    const float k = 1.f / (std::max)(std::abs(dx) / (std::max)(1.f, size.x * .5f - 46), std::abs(dy) / (std::max)(1.f, size.y * .5f - 46));
+                    const float k = 1.f / (std::max)(std::abs(dx) / (std::max)(1.f, size.x * .5f - 44), std::abs(dy) / (std::max)(1.f, size.y * .5f - 44));
                     float ex = size.x * .5f + dx * k, ey = size.y * .5f + dy * k;
                     if (showTeamHud) {
-                        const float teamLeft = size.x - (hudCompact ? ui::px(256) : ui::px(296)) - ui::px(24);
-                        if (ex > teamLeft && ey > size.y * 0.20f && ey < size.y * 0.78f) ex = teamLeft;
+                        const float rosterLeft = size.x - ui::px(308);
+                        if (ex > rosterLeft && ey > size.y * 0.24f && ey < size.y * 0.72f) ex = rosterLeft;
                     }
-                    d->AddTriangleFilled({ex + ux * 10, ey + uy * 10}, {ex - uy * 7 - ux * 5, ey + ux * 7 - uy * 5}, {ex + uy * 7 - ux * 5, ey - ux * 7 - uy * 5}, accent);
+                    d->AddTriangleFilled({ex + ux * 9, ey + uy * 9}, {ex - uy * 7 - ux * 5, ey + ux * 7 - uy * 5}, {ex + uy * 7 - ux * 5, ey - ux * 7 - uy * 5}, accent);
                     char lbl[48]{}; std::snprintf(lbl, sizeof lbl, "%s %s", idText, distText);
                     const auto ts = ImGui::CalcTextSize(lbl);
-                    const ImVec2 lp{ex - ux * 28 - ts.x * .5f, ey - uy * 28 - ts.y * .5f};
-                    d->AddRectFilled({lp.x - ui::px(5), lp.y - ui::px(2)}, {lp.x + ts.x + ui::px(5), lp.y + ts.y + ui::px(2)}, ui::u32(ui::kCanvas, 0.78f), ui::px(3));
-                    ui::shadowText(d, lp, white, lbl);
+                    ui::shadowText(d, {ex - ux * 26 - ts.x * .5f, ey - uy * 26 - ts.y * .5f}, white, lbl);
                     continue;
                 }
-                const float r = ui::px(5);
-                const ImVec2 c{x, y - ui::px(4)};
-                d->AddQuadFilled({c.x, c.y - r - 1}, {c.x + r + 1, c.y}, {c.x, c.y + r + 1}, {c.x - r - 1, c.y}, IM_COL32(0, 0, 0, 160));
+                // Exact original v1.6.6 borderless overhead marker: diamond + ID tile + shadow name + distance
+                const float r = 4.5f;
+                const ImVec2 c{x, y - 4};
                 d->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, accent);
                 const auto who = str(m, "name");
                 const auto is = ImGui::CalcTextSize(idText), ns = ImGui::CalcTextSize(who.c_str()), ds = ImGui::CalcTextSize(distText);
-                const float padX = ui::px(7), padY = ui::px(3);
-                const float chipW = is.x + ui::px(8) + ns.x + ui::px(8) + ds.x + padX * 2;
-                const float chipH = is.y + padY * 2;
-                const float left = x - chipW * .5f, top = c.y - r - ui::px(8) - chipH;
-                d->AddRectFilled({left, top}, {left + chipW, top + chipH}, ui::u32(ui::kCanvas, 0.78f), ui::px(4));
-                d->AddRect({left, top}, {left + chipW, top + chipH}, ui::u32(ui::kAccent, 0.35f), ui::px(4));
-                d->AddRectFilled({left + padX - 2, top + padY - 1}, {left + padX + is.x + 4, top + padY + is.y + 1}, accent, ui::px(2));
-                d->AddText({left + padX + 1, top + padY}, ink, idText);
-                ui::shadowText(d, {left + padX + is.x + ui::px(8), top + padY}, white, who.c_str());
-                ui::shadowText(d, {left + padX + is.x + ui::px(8) + ns.x + ui::px(6), top + padY}, accent, distText);
+                const float w = is.x + 6 + 8 + ns.x + 8 + ds.x, left = x - w * .5f, top = c.y - r - 8 - is.y;
+                d->AddRectFilled({left, top - 1}, {left + is.x + 6, top + is.y + 1}, accent);
+                d->AddText({left + 3, top}, ink, idText);
+                ui::shadowText(d, {left + is.x + 14, top}, white, who.c_str());
+                ui::shadowText(d, {left + is.x + 14 + ns.x + 8, top}, accent, distText);
             }
             ui::popNote();
         }
-        if (online() && showTeamHud) drawTeamHud(size, distances);
+
+        if (online() && showTeamHud) drawRoster(size, distances);
         if (online() && showAtbHud) drawSharedAtbHud(size);
         if (showDamageHud) drawDamageHud(size);
         if (online()) drawChat(size); else chatting = false;
 
-        // Floating toast notification
         if (!toast.empty() && now() - toastAt < 4000 && !open) {
-            ui::pushBold();
             const auto ts = ImGui::CalcTextSize(toast.c_str());
-            const float alphaF = (std::clamp)(float(4000 - (now() - toastAt)) / 600.f, 0.f, 1.f);
-            const ImVec2 p{size.x * .5f - ts.x * .5f - ui::px(18), size.y - ui::px(140)};
-            const ImVec2 pMax{p.x + ts.x + ui::px(36), p.y + ts.y + ui::px(20)};
-            const ui::Tone tTone = toastError ? ui::Tone::Danger : ui::Tone::Accent;
-            d->AddRectFilled(p, pMax, ui::u32(ui::kCanvas, 0.92f * alphaF), ui::px(7));
-            d->AddRect(p, pMax, ui::u32(tTone, 0.55f * alphaF), ui::px(7));
-            d->AddRectFilled(p, {p.x + ui::px(3), pMax.y}, ui::u32(tTone, alphaF), ui::px(2));
-            d->AddText({p.x + ui::px(18), p.y + ui::px(10)}, ui::u32(tTone, alphaF), toast.c_str());
-            ui::popBold();
+            const float a = (std::clamp)(float(4000 - (now() - toastAt)) / 600.f, 0.f, 1.f);
+            const ImVec2 p{size.x * .5f - ts.x * .5f - 16, size.y - 140};
+            d->AddRectFilled(p, {p.x + ts.x + 32, p.y + ts.y + 18}, ui::u32(ui::hud_orig::base, 0.90f * a), 8);
+            d->AddText({p.x + 16, p.y + 9}, ui::u32(toastError ? ui::hud_orig::bad : ui::hud_orig::accent, a), toast.c_str());
         }
 
         drawDuelInvite(size);
 
-        // Host map change floating banner
         const auto change = state.value("game", json::object()).value("world_replication", json::object()).value("host_map_change", json::object());
         if (!open && role() == "client" && change.value("pending", false)) {
-            ui::pushBold();
             const std::string text = "房主已前往 " + str(change, "level") + "，按 " + menuKeyName(key) + " 选择是否跟随";
             const auto ts = ImGui::CalcTextSize(text.c_str());
-            const ImVec2 p{size.x * .5f - ts.x * .5f - ui::px(18), ui::px(82)};
-            const ImVec2 pMax{p.x + ts.x + ui::px(36), p.y + ts.y + ui::px(20)};
-            d->AddRectFilled(p, pMax, ui::u32(ui::kCanvas, 0.92f), ui::px(7));
-            d->AddRect(p, pMax, ui::u32(ui::kAccent, 0.78f), ui::px(7), 0, ui::px(1.5f));
-            d->AddText({p.x + ui::px(18), p.y + ui::px(10)}, ui::u32(ui::kAccent), text.c_str());
-            ui::popBold();
+            const ImVec2 p{size.x * .5f - ts.x * .5f - 16, 90};
+            d->AddRectFilled(p, {p.x + ts.x + 32, p.y + ts.y + 18}, ui::u32(ui::hud_orig::base, 0.90f), 8);
+            d->AddRect(p, {p.x + ts.x + 32, p.y + ts.y + 18}, ui::u32(ui::hud_orig::accent, 0.80f), 8);
+            d->AddText({p.x + 16, p.y + 9}, ui::u32(ui::hud_orig::accent), text.c_str());
         }
     }
 
-    // ---- Enhanced Right-Side Teammate Status HUD (HP + Ultimate SP + Op + Dist)
-    void drawTeamHud(ImVec2 size, const std::map<int, float>& distances) {
+    // ---- Original v1.6.6 Floating Borderless Roster + Micro Hairline HP/SP -
+    void drawRoster(ImVec2 size, const std::map<int, float>& distances) {
         const auto peers = state.value("peers", json::array());
         if (peers.empty()) return;
         const auto& vitalsMap = liveVitals();
         auto* d = ImGui::GetBackgroundDrawList();
-        const float op = hudOpacity;
-        const bool compact = hudCompact;
-        const float panelW = compact ? ui::px(238) : ui::px(278);
-        const float x = size.x - panelW - ui::px(18);
-        float y = size.y * 0.25f;
-
         ui::pushNote();
-        const float lh = ImGui::GetTextLineHeight();
-        const float rowH = compact ? (lh + ui::px(14)) : (lh * 2.f + ui::px(24));
-        const float headerH = lh + ui::px(16);
-        const float totalH = headerH + float(peers.size()) * (rowH + ui::px(6)) + ui::px(8);
 
-        // Frosted panel backdrop
-        const ImVec2 pMin{x, y}, pMax{x + panelW, y + totalH};
-        d->AddRectFilled(pMin, pMax, ui::u32(ui::kCanvas, op * 0.90f), ui::px(8));
-        d->AddRect(pMin, pMax, ui::u32(ui::kLine, op * 0.95f), ui::px(8));
-        d->AddRectFilledMultiColor({pMin.x + ui::px(6), pMin.y}, {pMax.x - ui::px(6), pMin.y + ui::px(2)},
-            ui::u32(ui::kAccent, op), ui::u32(ui::kInfo, op * 0.6f), ui::u32(ui::kInfo, op * 0.6f), ui::u32(ui::kAccent, op));
+        const float op = hudOpacity;
+        const float line = ImGui::GetTextLineHeight();
+        const float width = hudCompact ? ui::px(230) : ui::px(252);
+        const float x = size.x - width - ui::px(22);
+        float y = size.y * 0.28f;
 
-        // Header line
+        const auto accent = ui::u32(ui::hud_orig::accent, op);
+        const auto white  = ui::u32(ui::hud_orig::text, op);
+        const auto dim    = ui::u32(ui::hud_orig::dim, op);
+        const auto ink    = ui::u32(ui::hud_orig::ink, op);
+
+        // Exact original header: 3px accent bar + "EF LINK // Room" + subtle accent hairline
         auto roomName = str(state.value("room", json::object()), "name");
         if (roomName.empty()) roomName = role() == "host" ? "我的房间" : "房间";
-        const std::string titleStr = ui::ellipsize("EF LINK // " + roomName, panelW - ui::px(82));
-        d->AddRectFilled({x + ui::px(10), y + ui::px(10)}, {x + ui::px(13), y + ui::px(10) + lh - ui::px(2)}, ui::u32(ui::kAccent, op), ui::px(1));
-        ui::shadowText(d, {x + ui::px(18), y + ui::px(9)}, ui::u32(ui::kAccent, op), titleStr.c_str());
+        const std::string head = ui::ellipsize(
+            "EF LINK // " + roomName + (state.value("pvp", json::object()).value("active", false) ? "  // PVP" : ""),
+            width - ui::px(48));
+        d->AddRectFilled({x, y + 2}, {x + 3, y + line - 2}, accent);
+        ui::shadowText(d, {x + 9, y}, accent, head.c_str());
 
         const bool tcpOnly = state.value("traffic", json::object()).value("tcp_only_links", 0u) > 0;
-        char netBuf[32]{};
-        if (tcpOnly) std::snprintf(netBuf, sizeof netBuf, "TCP");
-        else if (role() == "client") std::snprintf(netBuf, sizeof netBuf, "%ums", state.value("rtt_ms", 0u));
-        else std::snprintf(netBuf, sizeof netBuf, "%dP", int(peers.size()));
-        const auto netSz = ImGui::CalcTextSize(netBuf);
-        ui::shadowText(d, {x + panelW - netSz.x - ui::px(10), y + ui::px(9)},
-            ui::u32(tcpOnly ? ui::kWarning : ui::kInfo, op), netBuf);
+        if (role() == "client" || tcpOnly) {
+            char rtt[32]{};
+            if (tcpOnly) std::snprintf(rtt, sizeof rtt, "TCP");
+            else std::snprintf(rtt, sizeof rtt, "%ums", state.value("rtt_ms", 0u));
+            ui::shadowText(d, {x + width - ImGui::CalcTextSize(rtt).x, y},
+                tcpOnly ? ui::u32(ui::hud_orig::warn, op) : dim, rtt);
+        }
+        y += line + 5;
+        d->AddLine({x, y}, {x + width, y}, ui::u32(ui::hud_orig::accent, 0.40f * op));
+        y += 7;
 
-        y += headerH;
-        d->AddLine({x + ui::px(10), y - ui::px(3)}, {x + panelW - ui::px(10), y - ui::px(3)}, ui::u32(ui::kLine, op * 0.85f));
-
-        // Member rows
         for (const auto& peer : peers) {
             const int id = peer.value("id", 0);
             const bool self = peer.value("local", false);
@@ -562,80 +551,60 @@ struct Ui {
             json v = vitalsMap.contains(idKey) ? vitalsMap[idKey] : peer.value("vitals", json::object());
             const double hp = v.value("hp", 0.0), maxHp = v.value("max_hp", 0.0);
             const double usp = v.value("usp", 0.0), maxUsp = v.value("max_usp", 0.0);
-            std::string opName = str(v, "op");
-            if (opName.empty()) opName = operatorDisplayName(str(peer, "model"));
             const bool alive = v.value("alive", true);
-            const float hpRatio = maxHp > 0.0 ? float((std::clamp)(hp / maxHp, 0.0, 1.0)) : (valid ? 1.f : 0.f);
-            const float spRatio = maxUsp > 0.0 ? float((std::clamp)(usp / maxUsp, 0.0, 1.0)) : 0.f;
 
-            const ImVec2 rMin{x + ui::px(8), y};
-            const ImVec2 rMax{x + panelW - ui::px(8), y + rowH};
-            d->AddRectFilled(rMin, rMax, ui::u32(self ? ui::kCardHover : ui::kCard, op * 0.82f), ui::px(5));
-            d->AddRect(rMin, rMax, ui::u32(dueling ? ui::kDanger : (self ? ui::kAccent : ui::kLine), op * (dueling ? 0.65f : 0.45f)), ui::px(5));
+            // Original clean ID tile + shadow name + host/PVP + right distance
+            char idText[8]{}; std::snprintf(idText, sizeof idText, "%02d", id);
+            const auto is = ImGui::CalcTextSize(idText);
+            d->AddRectFilled({x, y}, {x + is.x + 6, y + line},
+                !valid ? ui::u32(ui::hud_orig::faint, op) : (self ? white : accent));
+            d->AddText({x + 3, y}, ink, idText);
 
-            // ID tile
-            char idBuf[8]{}; std::snprintf(idBuf, sizeof idBuf, "%02d", id);
-            const auto idSz = ImGui::CalcTextSize(idBuf);
-            const float rx = rMin.x + ui::px(7), ry = rMin.y + ui::px(5);
-            const ImVec4 tileCol = !valid ? ui::kTextMuted : (self ? ui::kInfo : (isHost ? ui::kAccent : ui::kText));
-            d->AddRectFilled({rx, ry}, {rx + idSz.x + ui::px(6), ry + lh}, ui::u32(tileCol, op), ui::px(3));
-            d->AddText({rx + ui::px(3), ry}, ui::u32(ui::kAccentInk, op), idBuf);
+            char right[24]{};
+            if (self) std::snprintf(right, sizeof right, "你");
+            else if (auto it = distances.find(id); it != distances.end()) std::snprintf(right, sizeof right, "%.0fm", it->second);
+            else if (peer.contains("distance")) std::snprintf(right, sizeof right, "%.0fm", peer.value("distance", 0.f));
+            else if (!peer.value("same_map", true)) std::snprintf(right, sizeof right, "异图");
+            else std::snprintf(right, sizeof right, "—");
+            const float rightW = ImGui::CalcTextSize(right).x;
+            ui::shadowText(d, {x + width - rightW, y}, self ? dim : accent, right);
 
-            // Right distance / self badge
-            char rightBuf[24]{};
-            if (self) std::snprintf(rightBuf, sizeof rightBuf, "你");
-            else if (auto it = distances.find(id); it != distances.end()) std::snprintf(rightBuf, sizeof rightBuf, "%.0fm", it->second);
-            else if (peer.contains("distance")) std::snprintf(rightBuf, sizeof rightBuf, "%.0fm", peer.value("distance", 0.f));
-            else if (!peer.value("same_map", true)) std::snprintf(rightBuf, sizeof rightBuf, "异图");
-            else std::snprintf(rightBuf, sizeof rightBuf, "—");
-            const auto rightSz = ImGui::CalcTextSize(rightBuf);
-            ui::shadowText(d, {rMax.x - rightSz.x - ui::px(7), ry}, ui::u32(self ? ui::kInfo : ui::kAccent, op), rightBuf);
-
-            // Player name + operator tag
-            std::string display = str(peer, "name", "玩家");
-            if (isHost) display += "·房主";
-            if (dueling) display += " [PVP]";
-            const float maxNameW = (rMax.x - rightSz.x - ui::px(14)) - (rx + idSz.x + ui::px(12));
-            ui::shadowText(d, {rx + idSz.x + ui::px(11), ry}, ui::u32(alive ? ui::kText : ui::kDanger, op),
-                ui::ellipsize(display, maxNameW).c_str());
-
-            // HP + Ultimate SP bars
-            const ImVec4 hpCol = !alive ? ui::kDanger : (hpRatio > 0.55f ? ui::kSuccess : (hpRatio > 0.25f ? ui::kWarning : ui::kDanger));
-            const bool spFull = maxUsp > 0.0 && spRatio >= 0.995f;
-            const ImVec4 spCol = spFull ? ui::kAccent : ui::kInfo;
-
-            if (compact) {
-                const float by = ry + lh + ui::px(3);
-                const float barW = (rMax.x - rMin.x) - ui::px(14);
-                ui::drawProgressBar(d, {rx, by}, {rx + barW * 0.68f, by + ui::px(4)}, hpRatio, ui::u32(hpCol, op), ui::u32(ui::kWell, op * 0.9f));
-                ui::drawProgressBar(d, {rx + barW * 0.71f, by}, {rx + barW, by + ui::px(4)}, spRatio, ui::u32(spCol, op), ui::u32(ui::kWell, op * 0.9f));
-            } else {
-                const float subY = ry + lh + ui::px(3);
-                if (!opName.empty()) {
-                    d->AddText({rx, subY}, ui::u32(ui::kTextDim, op), opName.c_str());
-                }
-                char statTxt[48]{};
-                if (maxHp > 0.0) {
-                    if (spFull) std::snprintf(statTxt, sizeof statTxt, "HP %.0f%% · 终结技 MAX", hpRatio * 100.f);
-                    else if (maxUsp > 0.0) std::snprintf(statTxt, sizeof statTxt, "HP %.0f%% · 充能 %.0f%%", hpRatio * 100.f, spRatio * 100.f);
-                    else std::snprintf(statTxt, sizeof statTxt, "HP %.0f%%", hpRatio * 100.f);
-                } else {
-                    std::snprintf(statTxt, sizeof statTxt, "%s", valid ? "状态同步中" : "等待角色");
-                }
-                const auto stSz = ImGui::CalcTextSize(statTxt);
-                d->AddText({rMax.x - stSz.x - ui::px(7), subY}, ui::u32(spFull ? ui::kAccent : ui::kTextDim, op), statTxt);
-
-                const float barY = subY + lh + ui::px(3);
-                const float barW = (rMax.x - rMin.x) - ui::px(14);
-                ui::drawProgressBar(d, {rx, barY}, {rx + barW, barY + ui::px(4.5f)}, hpRatio, ui::u32(hpCol, op), ui::u32(ui::kWell, op * 0.95f));
-                ui::drawProgressBar(d, {rx, barY + ui::px(6.5f)}, {rx + barW, barY + ui::px(9.5f)}, spRatio, ui::u32(spCol, op), ui::u32(ui::kWell, op * 0.95f));
+            std::string who = str(peer, "name", "玩家");
+            if (isHost) who += "  房主";
+            const float maxWhoW = width - (is.x + 14) - rightW - (dueling ? ui::px(38) : ui::px(10));
+            const std::string shownWho = ui::ellipsize(who, maxWhoW);
+            ui::shadowText(d, {x + is.x + 14, y}, !alive ? ui::u32(ui::hud_orig::bad, op) : (valid ? white : dim), shownWho.c_str());
+            if (dueling) {
+                const auto ws = ImGui::CalcTextSize(shownWho.c_str());
+                ui::shadowText(d, {x + is.x + 14 + ws.x + 7, y}, ui::u32(ui::hud_orig::bad, op), "PVP");
             }
-            y += rowH + ui::px(6);
+
+            // Ultra-slim floating micro-bars underneath (no panel box!) when HP/SP available
+            if (!hudCompact && maxHp > 0.0) {
+                const float hpRatio = float((std::clamp)(hp / maxHp, 0.0, 1.0));
+                const float spRatio = maxUsp > 0.0 ? float((std::clamp)(usp / maxUsp, 0.0, 1.0)) : 0.f;
+                const bool spFull = maxUsp > 0.0 && spRatio >= 0.995f;
+                const ImVec4 hpCol = !alive ? ui::hud_orig::bad : (hpRatio > 0.55f ? ui::hud_orig::ok : (hpRatio > 0.25f ? ui::hud_orig::warn : ui::hud_orig::bad));
+                const ImVec4 spCol = spFull ? ui::hud_orig::accent : ui::hud_orig::info;
+                const float bx = x + is.x + 14;
+                const float bw = width - (is.x + 14);
+                const float by = y + line + 3;
+                d->AddRectFilled({bx, by}, {bx + bw, by + 2.5f}, IM_COL32(0, 0, 0, int(115 * op)), 1.5f);
+                if (hpRatio > 0.005f) d->AddRectFilled({bx, by}, {bx + bw * hpRatio, by + 2.5f}, ui::u32(hpCol, op), 1.5f);
+                if (maxUsp > 0.0) {
+                    const float sy = by + 4.f;
+                    d->AddRectFilled({bx, sy}, {bx + bw, sy + 2.f}, IM_COL32(0, 0, 0, int(105 * op)), 1.f);
+                    if (spRatio > 0.005f) d->AddRectFilled({bx, sy}, {bx + bw * spRatio, sy + 2.f}, ui::u32(spCol, op), 1.f);
+                }
+                y += line + 12;
+            } else {
+                y += line + 6;
+            }
         }
         ui::popNote();
     }
 
-    // ---- Shared ATB Pool Sync Bar & Recent Spend/Gain Event Feed -----------
+    // ---- Shared ATB Pool Top Sync Bar (matches original borderless HUD) ----
     void drawSharedAtbHud(ImVec2 size) {
         const auto& atb = liveSharedAtb();
         if (!atb.value("active", false)) return;
@@ -648,29 +617,25 @@ struct Ui {
 
         ui::pushNote();
         const float lh = ImGui::GetTextLineHeight();
-        const float w = hudCompact ? ui::px(260) : ui::px(320);
-        const float h = lh + ui::px(22);
-        const ImVec2 p0{size.x * 0.5f - w * 0.5f, ui::px(14)};
-        const ImVec2 p1{p0.x + w, p0.y + h};
+        const float w = hudCompact ? ui::px(240) : ui::px(300);
+        const float x0 = size.x * 0.5f - w * 0.5f;
+        const float y0 = ui::px(16);
 
-        d->AddRectFilled(p0, p1, ui::u32(ui::kCanvas, op * 0.90f), ui::px(7));
-        d->AddRect(p0, p1, ui::u32(ui::kAccent, op * 0.42f), ui::px(7));
-        d->AddRectFilled({p0.x, p0.y + ui::px(5)}, {p0.x + ui::px(3), p1.y - ui::px(5)}, ui::u32(ui::kAccent, op), ui::px(1.5f));
-
-        ui::shadowText(d, {p0.x + ui::px(11), p0.y + ui::px(5)}, ui::u32(ui::kAccent, op), "共享技力池");
+        d->AddRectFilled({x0, y0 + 2}, {x0 + 3, y0 + lh - 2}, ui::u32(ui::hud_orig::accent, op));
+        ui::shadowText(d, {x0 + 9, y0}, ui::u32(ui::hud_orig::accent, op), "共享技力池");
         char numBuf[64]{};
-        if (rec > 0.05f) std::snprintf(numBuf, sizeof numBuf, "%.0f / %.0f  (+%.1f/s)", val, mx, rec);
+        if (rec > 0.05f) std::snprintf(numBuf, sizeof numBuf, "%.0f / %.0f  +%.1f/s", val, mx, rec);
         else std::snprintf(numBuf, sizeof numBuf, "%.0f / %.0f", val, mx);
         const auto nSz = ImGui::CalcTextSize(numBuf);
-        ui::shadowText(d, {p1.x - nSz.x - ui::px(10), p0.y + ui::px(5)}, ui::u32(ui::kText, op), numBuf);
+        ui::shadowText(d, {x0 + w - nSz.x, y0}, ui::u32(ui::hud_orig::text, op), numBuf);
 
-        const float by = p0.y + lh + ui::px(9);
-        ui::drawProgressBar(d, {p0.x + ui::px(11), by}, {p1.x - ui::px(11), by + ui::px(7)},
-            val / mx, ui::u32(ui::kAccent, op), ui::u32(ui::kWell, op * 0.95f), segs);
+        const float by = y0 + lh + 5;
+        ui::drawProgressBar(d, {x0, by}, {x0 + w, by + 5.5f}, val / mx,
+            ui::u32(ui::hud_orig::accent, op), IM_COL32(0, 0, 0, int(130 * op)), segs);
 
-        // Recent ATB spend/gain event pills beneath the bar
+        // Floating shadow-text spend/gain event lines
         const auto events = atb.value("events", json::array());
-        float ey = p1.y + ui::px(5);
+        float ey = by + 11;
         int shown = 0;
         for (auto it = events.rbegin(); it != events.rend() && shown < (hudCompact ? 2 : 3); ++it) {
             const auto age = it->value("age_ms", std::uint64_t(9999));
@@ -682,19 +647,15 @@ struct Ui {
             std::snprintf(evBuf, sizeof evBuf, "%s  %s%.0f 技力（%s）",
                 str(*it, "name", "队友").c_str(), gain ? "+" : "", delta, gain ? "回复" : "战技消耗");
             const auto es = ImGui::CalcTextSize(evBuf);
-            const float ew = es.x + ui::px(16), eh = es.y + ui::px(6);
-            const ImVec2 e0{size.x * 0.5f - ew * 0.5f, ey};
-            const ui::Tone t = gain ? ui::Tone::Success : ui::Tone::Warning;
-            d->AddRectFilled(e0, {e0.x + ew, e0.y + eh}, ui::u32(ui::kCanvas, fade * 0.88f), eh * 0.5f);
-            d->AddRect(e0, {e0.x + ew, e0.y + eh}, ui::u32(t, fade * 0.55f), eh * 0.5f);
-            d->AddText({e0.x + ui::px(8), e0.y + ui::px(3)}, ui::u32(t, fade), evBuf);
-            ey += eh + ui::px(4);
+            ui::shadowText(d, {size.x * 0.5f - es.x * 0.5f, ey},
+                ui::u32(gain ? ui::hud_orig::ok : ui::hud_orig::warn, fade), evBuf);
+            ey += lh + 3;
             ++shown;
         }
         ui::popNote();
     }
 
-    // ---- Floating Real-Time Damage Meter HUD (Draggable!) ------------------
+    // ---- Floating Real-Time Damage Meter (lightweight original HUD style) --
     void drawDamageHud(ImVec2 size) {
         const auto& stats = liveCombatStats();
         const auto players = stats.value("players", json::array());
@@ -702,17 +663,17 @@ struct Ui {
 
         const float op = hudOpacity;
         const bool compact = hudCompact;
-        const float width = compact ? ui::px(262) : ui::px(332);
-        const ImVec2 defaultPos{ui::px(20), size.y * 0.25f};
+        const float width = compact ? ui::px(252) : ui::px(312);
+        const ImVec2 defaultPos{ui::px(22), size.y * 0.28f};
         ImGui::SetNextWindowPos(defaultPos, resetHudPosRequested ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
         resetHudPosRequested = false;
         ImGui::SetNextWindowSize({width, 0.f});
-        ImGui::SetNextWindowBgAlpha(op * 0.90f);
 
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::alpha(ui::kCanvas, op * 0.92f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ui::alpha(ui::kLineStrong, op * 0.85f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(11), ui::px(9)});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(8));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.03f, 0.04f, 0.05f, op * 0.52f});
+        ImGui::PushStyleColor(ImGuiCol_Border, {0, 0, 0, 0});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(10), ui::px(8)});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(6));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing;
 
@@ -722,81 +683,83 @@ struct Ui {
             hudHitRects.push_back({wPos, {wPos.x + wSz.x, wPos.y + wSz.y}});
 
             ImDrawList* d = ImGui::GetWindowDrawList();
-            const bool inCombat = stats.value("in_combat", false);
-            d->AddRectFilledMultiColor({wPos.x + ui::px(6), wPos.y}, {wPos.x + wSz.x - ui::px(6), wPos.y + ui::px(2)},
-                ui::u32(inCombat ? ui::kAccent : ui::kInfo, op), ui::u32(ui::kInfo, op * 0.4f),
-                ui::u32(ui::kInfo, op * 0.4f), ui::u32(inCombat ? ui::kAccent : ui::kInfo, op));
-
-            // Header bar
-            ui::pushBold();
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::kAccent);
-            ImGui::TextUnformatted("伤害统计");
-            ImGui::PopStyleColor();
-            ui::popBold();
-
             ui::pushNote();
-            ImGui::SameLine();
+            const float lh = ImGui::GetTextLineHeight();
+            const ImVec2 ho = ImGui::GetCursorScreenPos();
+            const float availW = ImGui::GetContentRegionAvail().x;
+            d->AddRectFilled({ho.x, ho.y + 2}, {ho.x + 3, ho.y + lh - 2}, ui::u32(ui::hud_orig::accent, op));
+            ui::shadowText(d, {ho.x + 9, ho.y}, ui::u32(ui::hud_orig::accent, op), "伤害统计");
             char metaBuf[48]{};
             std::snprintf(metaBuf, sizeof metaBuf, "%.1fs · %s/s",
                 stats.value("duration_s", 0.0), formatDamageNumber(stats.value("team_dps", 0.0)).c_str());
-            ImGui::PushStyleColor(ImGuiCol_Text, inCombat ? ui::kText : ui::kTextDim);
-            ImGui::TextUnformatted(metaBuf);
-            ImGui::PopStyleColor();
+            const float titleW = ImGui::CalcTextSize("伤害统计").x;
+            ui::shadowText(d, {ho.x + 16 + titleW, ho.y}, ui::u32(ui::hud_orig::text, op * 0.9f), metaBuf);
 
-            const float resetW = ImGui::CalcTextSize("重置").x + ui::px(14);
-            ui::alignRight(resetW);
-            if (ui::chipButton("重置##hudrst", ui::Tone::Neutral)) {
+            // Compact clickable reset label on right
+            const float rstW = ImGui::CalcTextSize("重置").x + ui::px(12);
+            ImGui::SetCursorScreenPos({ho.x + availW - rstW, ho.y - 1});
+            ImGui::PushStyleColor(ImGuiCol_Button, {1.f, 1.f, 1.f, 0.08f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {1.f, 1.f, 1.f, 0.18f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, {1.f, 1.f, 1.f, 0.28f});
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::dim);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {ui::px(6), 1.f});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
+            if (ImGui::Button("重置##hudrst", {rstW, lh + 2})) {
                 act({{"action", "combat_stats_reset"}});
                 say("伤害统计已重置", false);
             }
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor(4);
 
-            ui::vspace(ui::px(4));
+            ImGui::SetCursorScreenPos({ho.x, ho.y + lh + 5});
+            d->AddLine({ho.x, ho.y + lh + 4}, {ho.x + availW, ho.y + lh + 4}, ui::u32(ui::hud_orig::accent, 0.38f * op));
+            ui::vspace(ui::px(5));
+
             if (players.empty()) {
-                ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextMuted);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::dim);
                 ImGui::TextUnformatted("等待战斗伤害记录…");
                 ImGui::PopStyleColor();
             } else {
                 const double topDmg = (std::max)(1.0, players[0].value("damage", 1.0));
                 const int maxRows = compact ? 4 : 8;
                 int idx = 0;
-                const float barH = compact ? ui::px(22) : ui::px(26);
+                const float barH = compact ? (lh + 4) : (lh + 6);
                 for (const auto& p : players) {
                     if (idx >= maxRows) break;
                     const double dmg = p.value("damage", 0.0);
                     const double dps = p.value("dps", 0.0);
                     const double share = p.value("share", 0.0);
                     const float ratio = float((std::clamp)(dmg / topDmg, 0.0, 1.0));
-                    const ImVec4 barCol = ui::rankColor(idx);
+                    const ImVec4 barCol = ui::hudRankColor(idx);
 
                     const ImVec2 o = ImGui::GetCursorScreenPos();
-                    const float availW = ImGui::GetContentRegionAvail().x;
-                    const ImVec2 bMax{o.x + availW, o.y + barH};
-                    d->AddRectFilled(o, bMax, ui::u32(ui::kWell, op * 0.85f), ui::px(4));
+                    const float rw = ImGui::GetContentRegionAvail().x;
+                    d->AddRectFilled(o, {o.x + rw, o.y + barH}, IM_COL32(0, 0, 0, int(70 * op)), 3.f);
                     if (ratio > 0.005f) {
-                        d->AddRectFilled(o, {o.x + availW * ratio, bMax.y}, ui::u32(barCol, op * 0.28f), ui::px(4));
-                        d->AddRectFilled(o, {o.x + ui::px(3), bMax.y}, ui::u32(barCol, op * 0.95f), ui::px(2));
+                        d->AddRectFilled(o, {o.x + rw * ratio, o.y + barH}, ui::u32(barCol, op * 0.28f), 3.f);
+                        d->AddRectFilled(o, {o.x + 2.5f, o.y + barH}, ui::u32(barCol, op * 0.95f), 1.f);
                     }
-
                     char rightStr[64]{};
                     if (compact) std::snprintf(rightStr, sizeof rightStr, "%s (%.0f%%)", formatDamageNumber(dmg).c_str(), share * 100.0);
                     else std::snprintf(rightStr, sizeof rightStr, "%s · %s/s (%.0f%%)", formatDamageNumber(dmg).c_str(), formatDamageNumber(dps).c_str(), share * 100.0);
                     const auto rSz = ImGui::CalcTextSize(rightStr);
-                    const float ty = o.y + (barH - ImGui::GetTextLineHeight()) * 0.5f;
+                    const float ty = o.y + (barH - lh) * 0.5f;
 
                     std::string leftStr = "#" + std::to_string(idx + 1) + " " + str(p, "name", "玩家");
                     const std::string opTag = str(p, "op");
                     if (!compact && !opTag.empty() && opTag != str(p, "name")) leftStr += " [" + opTag + "]";
-                    const float maxLeft = (std::max)(ui::px(40), availW - rSz.x - ui::px(18));
-                    ui::shadowText(d, {o.x + ui::px(8), ty}, ui::u32(ui::kText, op), ui::ellipsize(leftStr, maxLeft).c_str());
-                    ui::shadowText(d, {bMax.x - rSz.x - ui::px(6), ty}, ui::u32(idx == 0 ? ui::kAccent : ui::kText, op), rightStr);
+                    const float maxLeft = (std::max)(ui::px(40), rw - rSz.x - ui::px(16));
+                    ui::shadowText(d, {o.x + 7, ty}, ui::u32(ui::hud_orig::text, op), ui::ellipsize(leftStr, maxLeft).c_str());
+                    ui::shadowText(d, {o.x + rw - rSz.x - 5, ty}, ui::u32(idx == 0 ? ui::hud_orig::accent : ui::hud_orig::text, op), rightStr);
 
-                    ImGui::Dummy({availW, barH});
-                    ui::vspace(ui::px(3));
+                    ImGui::Dummy({rw, barH});
+                    ui::vspace(3.f);
                     ++idx;
                 }
                 if (!compact) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextMuted);
-                    ImGui::Text("总伤 %s · 按 %s 重置 · Alt+拖动",
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::dim);
+                    ImGui::Text("总伤 %s · %s 重置 · Alt+拖动",
                         formatDamageNumber(stats.value("total_damage", 0.0)).c_str(), fKeyName(damageResetKey));
                     ImGui::PopStyleColor();
                 }
@@ -804,11 +767,11 @@ struct Ui {
             ui::popNote();
         }
         ImGui::End();
-        ImGui::PopStyleVar(2);
+        ImGui::PopStyleVar(3);
         ImGui::PopStyleColor(2);
     }
 
-    // ---- Top PVP Duel Invitation Card --------------------------------------
+    // ---- PVP Duel Invitation Banner ----------------------------------------
     void drawDuelInvite(ImVec2 size) {
         if (open || !online()) return;
         const auto invites = state.value("pvp", json::object()).value("invites", json::array());
@@ -816,41 +779,47 @@ struct Ui {
         const auto& invite = invites.back();
         const int from = invite.value("id", 0);
         const float age = float(invite.value("age_ms", std::uint64_t(0)));
-        const float slide = (std::clamp)(age / 250.f, 0.f, 1.f);
+        const float slide = (std::clamp)(age / 240.f, 0.f, 1.f);
         const float ease = 1.f - (1.f - slide) * (1.f - slide);
         const float left = (std::clamp)(30000.f - age, 0.f, 30000.f) / 1000.f;
-        const float width = (std::min)(ui::px(460), size.x - ui::px(40));
+        const float width = (std::min)(ui::px(440), size.x - ui::px(40));
 
-        ImGui::SetNextWindowPos({size.x * .5f - width * .5f, -80.f + ease * (80.f + size.y * .11f)});
-        ImGui::SetNextWindowSize({width, 0});
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::alpha(ui::kCanvas, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ui::alpha(ui::kAccent, 0.85f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui::px(1.5f));
-        if (ImGui::Begin("##duelinvite", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoFocusOnAppearing)) {
-            const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-            hudHitRects.push_back({wp, {wp.x + ws.x, wp.y + ws.y}});
-            ui::badge("PVP 对战邀请", ui::Tone::Accent, true);
-            ImGui::SameLine();
-            ui::dim("剩余 %.0f 秒", left);
+        ImGui::SetNextWindowPos({size.x * 0.5f - width * 0.5f, -ui::px(90) + ease * (ui::px(90) + size.y * 0.12f)});
+        ImGui::SetNextWindowSize({width, 0.f});
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::md.surfaceContainerLowest);
+        ImGui::PushStyleColor(ImGuiCol_Border, ui::md.outlineVariant);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(20), ui::px(16)});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(20));
+        if (ImGui::Begin("##duelinvite", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoFocusOnAppearing)) {
+            ui::pushBold();
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::md.primary);
+            ImGui::TextUnformatted("PVP 对战邀请");
+            ImGui::PopStyleColor();
+            ui::popBold();
+            ui::pushNote();
+            ui::alignRight(ui::px(46));
+            ui::muted("%.0f 秒", left);
+            ui::popNote();
             ui::vspace(ui::px(6));
-            ImGui::TextWrapped("%s 邀请你进行 PVP 对战。同意后双方可互相锁定与攻击，随时可结束。", str(invite, "name").c_str());
-            ui::vspace(ui::px(6));
-            const ImVec2 bo = ImGui::GetCursorScreenPos();
-            const float bw = ImGui::GetContentRegionAvail().x;
-            ui::drawProgressBar(ImGui::GetWindowDrawList(), bo, {bo.x + bw, bo.y + ui::px(3)}, left / 30.f, ui::u32(ui::kAccent), ui::u32(ui::kWell));
-            ImGui::Dummy({bw, ui::px(6)});
-            const float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * .5f;
-            const std::string accept = std::string("同意（") + fKeyName(pvpKey) + "）";
-            if (ui::primaryButton(accept.c_str(), {btnW, ui::px(32)})) act({{"action", "pvp_duel"}, {"op", "accept"}, {"target", from}});
-            ImGui::SameLine();
-            if (ui::secondaryButton("拒绝", {btnW, ui::px(32)})) act({{"action", "pvp_duel"}, {"op", "decline"}, {"target", from}});
+            ImGui::PushTextWrapPos(0.f);
+            ImGui::TextWrapped("%s 邀请你进行 PVP 切磋。同意后可互相锁定和攻击，随时可结束对战。", str(invite, "name").c_str());
+            ImGui::PopTextWrapPos();
+            ui::vspace(ui::px(12));
+            const float bw = (ImGui::GetContentRegionAvail().x - ui::px(10)) * 0.5f;
+            const std::string acc = std::string("同意（") + fKeyName(pvpKey) + "）";
+            if (ui::filledButton(acc.c_str(), {bw, ui::px(36)})) act({{"action", "pvp_duel"}, {"op", "accept"}, {"target", from}});
+            ImGui::SameLine(0.f, ui::px(10));
+            if (ui::outlinedButton("拒绝", {bw, ui::px(36)})) act({{"action", "pvp_duel"}, {"op", "decline"}, {"target", from}});
+            const ImVec2 p0 = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+            hudHitRects.push_back({p0, {p0.x + sz.x, p0.y + sz.y}});
         }
         ImGui::End();
-        ImGui::PopStyleVar();
+        ImGui::PopStyleVar(2);
         ImGui::PopStyleColor(2);
     }
 
-    // ---- Bottom-Left In-Game Chat Overlay ----------------------------------
+    // ---- In-Game HUD Chat (Exact Original Borderless Style) ----------------
     void drawChat(ImVec2 size) {
         const auto lines = state.value("chat", json::array());
         const auto t = now();
@@ -869,61 +838,60 @@ struct Ui {
         }
         ui::pushNote();
         auto* d = ImGui::GetBackgroundDrawList();
-        const float lineH = ImGui::GetTextLineHeight() + ui::px(5);
-        const float left = ui::px(22), width = (std::min)(ui::px(540), size.x * .40f), bottom = size.y * .78f;
-        float y = bottom - lineH * float(show.size());
-        if (!show.empty()) {
-            const float bgA = chatting ? (hudOpacity * 0.86f) : (hudOpacity * 0.42f);
-            d->AddRectFilled({left - ui::px(10), y - ui::px(6)}, {left + width, bottom + ui::px(4)}, ui::u32(ui::kCanvas, bgA), ui::px(6));
-            if (chatting) d->AddRect({left - ui::px(10), y - ui::px(6)}, {left + width, bottom + ui::px(4)}, ui::u32(ui::kLine, hudOpacity), ui::px(6));
-        }
-        for (auto it = show.rbegin(); it != show.rend(); ++it, y += lineH) {
+        const float line = ImGui::GetTextLineHeight() + 4;
+        const float left = 24, width = (std::min)(560.f, size.x * .42f), bottom = size.y * .78f;
+        float y = bottom - line * float(show.size());
+        if (chatting && !show.empty()) d->AddRectFilled({left - 8, y - 6}, {left + width, bottom + 2}, IM_COL32(0, 0, 0, 110), 4);
+        for (auto it = show.rbegin(); it != show.rend(); ++it, y += line) {
             const auto& l = **it;
             const auto seen = chatSeen[l.value("serial", std::uint64_t(0))];
             const float a = chatting ? 1.f : (std::clamp)(float(12000 - (t - seen)) / 2000.f, 0.f, 1.f);
-            d->PushClipRect({left - ui::px(6), y - 2}, {left + width - ui::px(6), y + lineH}, true);
+            d->PushClipRect({left - 8, y - 2}, {left + width, y + line}, true);
             if (l.value("system", false)) {
-                ui::shadowText(d, {left, y}, ui::u32(ui::kTextDim, a), ("· " + str(l, "text")).c_str());
+                ui::shadowText(d, {left, y}, ui::u32(ui::hud_orig::dim, a), ("· " + str(l, "text")).c_str());
             } else {
                 const auto who = str(l, "name") + "：";
-                ui::shadowText(d, {left, y}, ui::u32(ui::kAccent, a), who.c_str());
-                ui::shadowText(d, {left + ImGui::CalcTextSize(who.c_str()).x, y}, ui::u32(ui::kText, a), str(l, "text").c_str());
+                ui::shadowText(d, {left, y}, ui::u32(ui::hud_orig::accent, a), who.c_str());
+                ui::shadowText(d, {left + ImGui::CalcTextSize(who.c_str()).x, y}, ui::u32(ui::hud_orig::text, a), str(l, "text").c_str());
             }
             d->PopClipRect();
         }
         if (chatting) {
-            ImGui::SetNextWindowPos({left - ui::px(10), bottom + ui::px(8)});
-            ImGui::SetNextWindowSize({width + ui::px(10), 0});
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ui::alpha(ui::kCanvas, 0.92f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ui::alpha(ui::kAccent, 0.65f));
+            ImGui::SetNextWindowPos({left - 8, bottom + 6});
+            ImGui::SetNextWindowSize({width + 8, 0});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.06f, 0.07f, 0.08f, 0.85f});
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::hud_orig::text);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, {0.10f, 0.11f, 0.13f, 0.90f});
+            ImGui::PushStyleColor(ImGuiCol_Border, ui::hud_orig::accent);
             if (ImGui::Begin("##hudchat", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
                 if (chatFocus) { ImGui::SetKeyboardFocusHere(); chatFocus = false; }
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputTextWithHint("##hudchatinput", "输入消息，Enter 发送，Esc 取消", hudChat, sizeof hudChat, ImGuiInputTextFlags_EnterReturnsTrue)) {
                     if (*hudChat) act({{"action", "chat"}, {"text", hudChat}});
-                    hudChat[0] = 0;
-                    chatting = false;
+                    hudChat[0] = 0; chatting = false;
                 }
                 if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { hudChat[0] = 0; chatting = false; }
             }
             ImGui::End();
-            ImGui::PopStyleColor(2);
+            ImGui::PopStyleColor(4);
         }
         ui::popNote();
     }
 
     // =========================================================================
-    // MAIN MENU (ENDFIELD INDUSTRIAL-TACTICAL DESIGN)
+    // MAIN MENU — GOOGLE ANDROID MATERIAL DESIGN 3 (MATERIAL YOU)
     // =========================================================================
     void drawMenu(ImVec2 display) {
-        const float maxW = (std::max)(400.f, display.x - ui::px(28));
-        const float maxH = (std::max)(320.f, display.y - ui::px(28));
-        const float minW = (std::min)(ui::px(900), maxW);
-        const float minH = (std::min)(ui::px(560), maxH);
+        syncThemeIfNeeded();
+
+        const float maxW = (std::max)(480.f, display.x - ui::px(32));
+        const float maxH = (std::max)(360.f, display.y - ui::px(32));
+        const float minW = (std::min)(ui::px(920), maxW);
+        const float minH = (std::min)(ui::px(580), maxH);
         const bool displayChanged = display.x != lastDisplay.x || display.y != lastDisplay.y;
         if (!menuLayoutReady || displayChanged) {
             if (!menuLayoutReady) {
-                menuSize = {(std::min)(ui::px(1130), maxW), (std::min)(ui::px(744), maxH)};
+                menuSize = {(std::min)(ui::px(1136), maxW), (std::min)(ui::px(748), maxH)};
                 menuPos = {(display.x - menuSize.x) * 0.5f, (display.y - menuSize.y) * 0.5f};
                 menuLayoutReady = true;
             }
@@ -949,12 +917,11 @@ struct Ui {
             menuSize = ImGui::GetWindowSize();
             dragActive = false;
 
-            ui::drawWindowChrome(ImGui::GetWindowDrawList(), menuPos, {menuPos.x + menuSize.x, menuPos.y + menuSize.y});
-            drawMenuHeader();
+            drawTopAppBar();
 
-            const float footerH = ui::px(60);
-            drawMenuSidebar(-footerH);
-            ImGui::SameLine(0.f, ui::px(12));
+            const float footerH = ui::px(64);
+            drawNavDrawer(-footerH);
+            ImGui::SameLine(0.f, ui::px(14));
 
             ImGui::BeginChild("##eflink_content", {0.f, -footerH}, ImGuiChildFlags_None);
             switch (page) {
@@ -967,7 +934,7 @@ struct Ui {
             }
             ImGui::EndChild();
 
-            drawMenuFooter();
+            drawBottomBar();
             popups();
         }
         ImGui::End();
@@ -977,93 +944,108 @@ struct Ui {
         }
     }
 
-    void drawMenuHeader() {
+    // ---- Material 3 Top App Bar (flat, clean, circular icon actions) -------
+    void drawTopAppBar() {
         const auto r = role();
         const auto roomInfo = state.value("room", json::object());
         const auto pvpInfo = state.value("pvp", json::object());
         const auto& atbInfo = liveSharedAtb();
 
-        constexpr const char* closeLbl = "返回游戏  ×";
-        const float closeW = ui::buttonWidth(closeLbl) + ui::px(6);
-
-        // Top row: draggable brand strip + live status pills + Close button
-        ui::pushTitle();
-        const float titleH = ImGui::GetTextLineHeight();
+        const float barH = ui::px(42);
+        const float rightClusterW = ui::px(38) * 2 + ui::px(10);
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         const float availW = ImGui::GetContentRegionAvail().x;
-        const float dragW = (std::max)(ui::px(220), availW - closeW - ui::px(12));
-        ImGui::InvisibleButton("##header_drag", {dragW, titleH + ui::px(4)});
+        const float dragW = (std::max)(ui::px(220), availW - rightClusterW - ui::px(12));
+
+        ImGui::InvisibleButton("##topbar_drag", {dragW, barH});
         const bool dragHov = ImGui::IsItemHovered();
         dragActive = ImGui::IsItemActive();
         if (dragHov || dragActive) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
 
         ImDrawList* d = ImGui::GetWindowDrawList();
-        ui::drawEndfieldLogo(d, {origin.x, origin.y + ui::px(1)}, titleH);
-        d->AddText(ImGui::GetFont(), ImGui::GetFontSize(), {origin.x + ui::px(22), origin.y}, ui::u32(ui::kText), "EF LINK");
-        const float brandEnd = origin.x + ui::px(22) + ImGui::CalcTextSize("EF LINK").x + ui::px(10);
+        const float midY = origin.y + barH * 0.5f;
+        ui::drawAppMark(d, {origin.x + ui::px(18), midY}, ui::px(16));
+
+        ui::pushTitle();
+        const float titleH = ImGui::GetTextLineHeight();
+        d->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            {origin.x + ui::px(44), midY - titleH * 0.5f}, ui::u32(ui::md.onSurface), "EF Link");
+        const float titleEnd = origin.x + ui::px(44) + ImGui::CalcTextSize("EF Link").x;
         ui::popTitle();
 
-        // Version badge & subtitle right on the title line
-        ui::pushNote();
-        const std::string verStr = std::string("v") + EFLINK_VERSION;
-        const auto vs = ImGui::CalcTextSize(verStr.c_str());
-        const ImVec2 v0{brandEnd, origin.y + (titleH - vs.y - ui::px(4)) * 0.5f};
-        d->AddRectFilled(v0, {v0.x + vs.x + ui::px(10), v0.y + vs.y + ui::px(4)}, ui::u32(ui::kAccent, 0.14f), ui::px(4));
-        d->AddRect(v0, {v0.x + vs.x + ui::px(10), v0.y + vs.y + ui::px(4)}, ui::u32(ui::kAccent, 0.42f), ui::px(4));
-        d->AddText({v0.x + ui::px(5), v0.y + ui::px(2)}, ui::u32(ui::kAccent), verStr.c_str());
+        // Compact Material 3 status chips right on the Top App Bar
+        float cx = titleEnd + ui::px(14);
+        auto drawChipInline = [&](const char* text, ui::Tone tone, bool dot) {
+            ui::pushNote();
+            const ImVec2 ts = ImGui::CalcTextSize(text);
+            const float dotS = dot ? ui::px(12) : 0.f;
+            const float ch = ts.y + ui::px(8), cw = ts.x + ui::px(20) + dotS;
+            if (cx + cw < origin.x + dragW - ui::px(8)) {
+                const ImVec2 p0{cx, midY - ch * 0.5f}, p1{cx + cw, midY + ch * 0.5f};
+                d->AddRectFilled(p0, p1, ui::u32(ui::toneContainer(tone)), ch * 0.5f);
+                if (dot) d->AddCircleFilled({p0.x + ui::px(11), midY}, ui::px(3.2f), ui::u32(ui::toneFg(tone)), 12);
+                d->AddText({p0.x + ui::px(10) + dotS, midY - ts.y * 0.5f}, ui::u32(ui::toneOnContainer(tone)), text);
+                cx += cw + ui::px(8);
+            }
+            ui::popNote();
+        };
 
-        const std::string sub = online()
-            ? ("终末地联机  ·  " + str(roomInfo, "name", "未命名房间") + "  ·  " + str(state, "name", "管理员"))
-            : ("终末地联机  ·  " + str(state, "name", "管理员") + "  ·  拖动标题栏移动");
-        const float subX = v0.x + vs.x + ui::px(22);
-        const float subMaxW = (origin.x + dragW) - subX - ui::px(12);
-        if (subMaxW > ui::px(80)) {
-            d->AddText({subX, origin.y + (titleH - vs.y) * 0.5f}, ui::u32(ui::kTextDim), ui::ellipsize(sub, subMaxW).c_str());
-        }
-        ui::popNote();
-
-        ui::alignRight(closeW);
-        if (ui::ghostButton(closeLbl, {closeW, ui::px(30)})) closeRequested = true;
-
-        // Second strip: live telemetry pills
-        ui::vspace(ui::px(6));
-        ui::statusPill(roleLabel(r), roleTone(r), true);
+        drawChipInline(roleLabel(r), roleTone(r), true);
         if (online()) {
             char pBuf[32]{};
             std::snprintf(pBuf, sizeof pBuf, "%d / %d 人", int(state.value("peers", json::array()).size()), roomInfo.value("max_players", 8));
-            ui::hspace(ui::px(6)); ui::statusPill(pBuf, ui::Tone::Neutral, false);
-            const bool tcpOnly = state.value("traffic", json::object()).value("tcp_only_links", 0u) > 0;
-            if (tcpOnly) { ui::hspace(ui::px(6)); ui::statusPill("TCP 备用通道", ui::Tone::Warning, true); }
-            else if (r == "client") {
-                char rttBuf[24]{}; std::snprintf(rttBuf, sizeof rttBuf, "%u ms", state.value("rtt_ms", 0u));
-                ui::hspace(ui::px(6)); ui::statusPill(rttBuf, ui::Tone::Info, false);
-            }
-            if (pvpInfo.value("active", false)) { ui::hspace(ui::px(6)); ui::statusPill("PVP 已开放", ui::Tone::Danger, true); }
-            if (atbInfo.value("active", false)) { ui::hspace(ui::px(6)); ui::statusPill("共享技力池", ui::Tone::Accent, true); }
+            drawChipInline(pBuf, ui::Tone::Neutral, false);
+            if (atbInfo.value("active", false)) drawChipInline("共享技力池", ui::Tone::Primary, false);
+            if (pvpInfo.value("active", false)) drawChipInline("PVP 已开启", ui::Tone::Error, false);
         } else {
-            ui::hspace(ui::px(8));
             ui::pushNote();
-            ui::muted("按 %s 开关菜单 · Esc 关闭 · 进房后按 Enter 快速聊天", menuKeyName(key).c_str());
+            const std::string sub = str(state, "name", "管理员") + " · 按 " + menuKeyName(key) + " 开关菜单";
+            const float subMax = (origin.x + dragW) - cx - ui::px(8);
+            if (subMax > ui::px(80)) {
+                const ImVec2 ss = ImGui::CalcTextSize(sub.c_str());
+                d->AddText({cx + ui::px(4), midY - ss.y * 0.5f}, ui::u32(ui::md.onSurfaceVariant), ui::ellipsize(sub, subMax).c_str());
+            }
             ui::popNote();
         }
 
-        // Inline toast inside menu if active
+        // Inline toast snackbar pill (if active)
         if (!toast.empty() && now() - toastAt < 4000) {
-            const float tw = ui::pillWidth(toast.c_str(), false);
-            ui::alignRight(tw);
-            ui::statusPill(toast.c_str(), toastError ? ui::Tone::Danger : ui::Tone::Success, false);
+            drawChipInline(toast.c_str(), toastError ? ui::Tone::Error : ui::Tone::Success, false);
         }
 
-        ui::vspace(ui::px(8));
-        ImGui::Separator();
+        // Trailing Material 3 Circular Icon Buttons: Theme Toggle (Light/Dark) + Close
+        ui::alignRight(rightClusterW);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (barH - ui::px(38)) * 0.5f);
+        if (ui::iconButton("theme_toggle", darkMode ? ui::Icon::Sun : ui::Icon::Moon,
+            darkMode ? "切换浅色主题（Material 3 Light）" : "切换深色主题（Material 3 Dark）")) {
+            darkMode = !darkMode;
+            applySwitches();
+        }
+        ImGui::SameLine(0.f, ui::px(6));
+        if (ui::iconButton("close_menu", ui::Icon::Close, "返回游戏（Esc）")) {
+            closeRequested = true;
+        }
         ui::vspace(ui::px(8));
     }
 
-    void drawMenuSidebar(float height) {
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::kSidebar);
-        ImGui::PushStyleColor(ImGuiCol_Border, ui::kLine);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(8), ui::px(10)});
-        ImGui::BeginChild("##eflink_sidebar", {ui::px(196), height}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    // ---- Material 3 Permanent Navigation Drawer (borderless, full-pill) ----
+    void drawNavDrawer(float height) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, {0, 0, 0, 0});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(4), ui::px(4)});
+        ImGui::BeginChild("##m3_drawer", {ui::px(214), height}, ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+
+        // Iconic Material 3 Extended FAB (like Gmail Compose / Drive New)
+        if (!online()) {
+            if (ui::extendedFab("开放房间", ui::Icon::Plus, ui::Tone::Primary)) {
+                page = 0;
+            }
+        } else {
+            if (ui::extendedFab("重置伤害统计", ui::Icon::Reset, ui::Tone::Primary)) {
+                act({{"action", "combat_stats_reset"}});
+                say("伤害统计已重置", false);
+            }
+        }
+        ui::vspace(ui::px(10));
 
         char roomBadge[16]{}, peerBadge[16]{}, chatBadge[16]{};
         const int roomCnt = int(state.value("rooms", json::array()).size());
@@ -1073,74 +1055,75 @@ struct Ui {
         if (unreadChat > 0) std::snprintf(chatBadge, sizeof chatBadge, "%llu", static_cast<unsigned long long>(unreadChat));
 
         const auto& cStats = liveCombatStats();
-        const bool inCombat = cStats.value("in_combat", false);
-        const char* combatBadge = inCombat ? "战斗" : (!cStats.value("players", json::array()).empty() ? "数据" : nullptr);
+        const char* combatBadge = cStats.value("in_combat", false) ? "进行中" : nullptr;
 
-        const float rowH = ui::px(38);
-        if (ui::navItem(ui::NavIcon::Lobby,       "联机大厅",   page == 0, *roomBadge ? roomBadge : nullptr, ui::Tone::Accent, rowH)) page = 0;
-        ui::vspace(ui::px(3));
-        if (ui::navItem(ui::NavIcon::Players,     "房间玩家",   page == 1, *peerBadge ? peerBadge : nullptr, ui::Tone::Info, rowH)) page = 1;
-        ui::vspace(ui::px(3));
-        if (ui::navItem(ui::NavIcon::Combat,      "战斗统计",   page == 2, combatBadge, inCombat ? ui::Tone::Accent : ui::Tone::Neutral, rowH)) page = 2;
-        ui::vspace(ui::px(3));
-        if (ui::navItem(ui::NavIcon::Chat,        "房间聊天",   page == 3, *chatBadge ? chatBadge : nullptr, ui::Tone::Warning, rowH)) {
+        if (ui::navDrawerItem(ui::Icon::Lobby,       "联机大厅",   page == 0, *roomBadge ? roomBadge : nullptr)) page = 0;
+        ui::vspace(ui::px(2));
+        if (ui::navDrawerItem(ui::Icon::Players,     "房间玩家",   page == 1, *peerBadge ? peerBadge : nullptr)) page = 1;
+        ui::vspace(ui::px(2));
+        if (ui::navDrawerItem(ui::Icon::Combat,      "战斗统计",   page == 2, combatBadge)) page = 2;
+        ui::vspace(ui::px(2));
+        if (ui::navDrawerItem(ui::Icon::Chat,        "房间聊天",   page == 3, *chatBadge ? chatBadge : nullptr)) {
             page = 3; unreadChat = 0; lastSeenChatSerial = state.value("chat_serial", std::uint64_t(0));
         }
-        ui::vspace(ui::px(3));
-        if (ui::navItem(ui::NavIcon::Settings,    "外观与设置", page == 4, nullptr, ui::Tone::Neutral, rowH)) page = 4;
-        ui::vspace(ui::px(3));
-        if (ui::navItem(ui::NavIcon::Diagnostics, "运行诊断",   page == 5, nullptr, ui::Tone::Neutral, rowH)) page = 5;
+        ui::vspace(ui::px(2));
+        if (ui::navDrawerItem(ui::Icon::Settings,    "外观与设置", page == 4, nullptr)) page = 4;
+        ui::vspace(ui::px(2));
+        if (ui::navDrawerItem(ui::Icon::Diagnostics, "运行诊断",   page == 5, nullptr)) page = 5;
 
-        // Bottom pinned compact hotkey legend (measured so it never triggers a scrollbar)
-        const float legendH = ui::px(134);
+        // Subtle pinned hotkey reference at bottom of drawer
+        const float legendH = ui::px(154);
         const float slack = ImGui::GetContentRegionAvail().y - legendH;
-        if (slack > ui::px(8)) {
+        if (slack > ui::px(4)) {
             ImGui::Dummy({0.f, slack});
             ImGui::Separator();
             ui::vspace(ui::px(6));
+            ImGui::Indent(ui::px(12));
             ui::pushNote();
-            ui::muted("快捷操作");
-            ui::vspace(ui::px(2));
-            ui::dim(" %s  开关菜单", menuKeyName(key).c_str());
-            ui::dim(" %s  PVP 邀请", fKeyName(pvpKey));
-            ui::dim(" %s  重置伤害统计", fKeyName(damageResetKey));
-            ui::dim(" Enter  快捷聊天");
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {ui::px(6), ui::px(4)});
+            ui::muted("快捷键");
+            ui::muted("%s  开关菜单", menuKeyName(key).c_str());
+            ui::muted("%s  PVP 邀请", fKeyName(pvpKey));
+            ui::muted("%s  重置伤害统计", fKeyName(damageResetKey));
+            ui::muted("Enter  快捷聊天");
+            ImGui::PopStyleVar();
             ui::popNote();
+            ImGui::Unindent(ui::px(12));
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor();
     }
 
-    void drawMenuFooter() {
-        ui::vspace(ui::px(6));
+    // ---- Material 3 Bottom Filter-Chip Quick Bar ---------------------------
+    void drawBottomBar() {
+        ui::vspace(ui::px(4));
         ImGui::Separator();
-        ui::vspace(ui::px(8));
+        ui::vspace(ui::px(9));
         const auto r = role();
         if (online() || r == "connecting") {
             const char* lbl = r == "host" ? "关闭房间" : (r == "client" ? "离开房间" : "取消连接");
-            if (ui::chipButton(lbl, ui::Tone::Danger)) leaveConfirm = true;
+            if (ui::dangerButton(lbl, {0.f, ui::px(30)})) leaveConfirm = true;
             ui::hspace(ui::px(10));
         }
-        // Quick HUD visibility toggle chips right in footer
-        if (ui::chipButton(showDamageHud ? "悬浮伤害: 开" : "悬浮伤害: 关", showDamageHud ? ui::Tone::Accent : ui::Tone::Neutral)) {
+        if (ui::filterChip("悬浮伤害", showDamageHud, ui::Tone::Secondary)) {
             showDamageHud = !showDamageHud; applySwitches();
         }
-        ui::hspace(ui::px(6));
-        if (ui::chipButton(showTeamHud ? "队友HUD: 开" : "队友HUD: 关", showTeamHud ? ui::Tone::Info : ui::Tone::Neutral)) {
+        ui::hspace(ui::px(8));
+        if (ui::filterChip("队友状态", showTeamHud, ui::Tone::Secondary)) {
             showTeamHud = !showTeamHud; applySwitches();
         }
-        ui::hspace(ui::px(6));
-        if (ui::chipButton(showAtbHud ? "技力提示: 开" : "技力提示: 关", showAtbHud ? ui::Tone::Success : ui::Tone::Neutral)) {
+        ui::hspace(ui::px(8));
+        if (ui::filterChip("共享技力提示", showAtbHud, ui::Tone::Secondary)) {
             showAtbHud = !showAtbHud; applySwitches();
         }
 
         char rightMeta[96]{};
-        if (online()) std::snprintf(rightMeta, sizeof rightMeta, "延迟 %u ms  ·  EF Link %s", state.value("rtt_ms", 0u), EFLINK_VERSION);
-        else std::snprintf(rightMeta, sizeof rightMeta, "就绪  ·  EF Link %s", EFLINK_VERSION);
+        if (online()) std::snprintf(rightMeta, sizeof rightMeta, "延迟 %u ms · EF Link %s", state.value("rtt_ms", 0u), EFLINK_VERSION);
+        else std::snprintf(rightMeta, sizeof rightMeta, "就绪 · EF Link %s", EFLINK_VERSION);
         ui::pushNote();
-        ui::alignRight(ImGui::CalcTextSize(rightMeta).x);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ui::px(4));
+        ui::alignRight(ImGui::CalcTextSize(rightMeta).x + ui::px(4));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ui::px(6));
         ui::muted("%s", rightMeta);
         ui::popNote();
     }
@@ -1149,18 +1132,18 @@ struct Ui {
     void pageSession() {
         const auto r = role();
         if (!online() && r != "connecting") {
-            const float half = (ImGui::GetContentRegionAvail().x - ui::px(12)) * 0.5f;
+            const float half = (ImGui::GetContentRegionAvail().x - ui::px(14)) * 0.5f;
 
-            // Left column: Host Room
+            // Left Column: Host Room
             ImGui::BeginGroup();
-            ui::cardBegin("##host_card", "开放房间", {half, 0.f}, ui::Tone::Accent);
+            ui::cardBegin("##host_card", "开放房间", {half, 0.f}, "创建主机房间并邀请好友加入");
             ui::fieldLabel("房间名称", "好友在列表里看到的名字");
             ImGui::SetNextItemWidth(-1);
             ImGui::InputTextWithHint("##room", "例如：四号谷地一起刷本", room, sizeof room);
             ui::vspace(ui::px(6));
-            ui::fieldLabel("房间密码", "可留空");
+            ui::fieldLabel("房间密码", "留空为公开房间");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##hostpw", "留空为公开房间", hostPassword, sizeof hostPassword, ImGuiInputTextFlags_Password);
+            ImGui::InputTextWithHint("##hostpw", "输入密码（可选）", hostPassword, sizeof hostPassword, ImGuiInputTextFlags_Password);
             ui::vspace(ui::px(6));
             ui::fieldLabel("人数上限与端口", "2–16 人 · 默认 47615");
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.56f);
@@ -1169,12 +1152,14 @@ struct Ui {
             ImGui::SetNextItemWidth(-1);
             ImGui::InputInt("##port", &port, 0);
             port = (std::clamp)(port, 1024, 65535);
+            ui::vspace(ui::px(10));
+            ImGui::Separator();
             ui::vspace(ui::px(8));
 
             ui::toggleSwitch("host_shared_atb", &sharedAtb, "所有人共用技力条（ATB 共享池）",
-                "全队共用房主技力条与自然回复，任意玩家释放战技或回复技力实时同步。");
+                "全队共用房主技力条与自然回复，任意玩家消耗或回复技力实时同步。");
             ui::toggleSwitch("host_pvp", &pvp, "允许 PVP 对战邀请",
-                "房内玩家可互相邀请进行 PVP 切磋，不会误伤未对战队友。");
+                "房内玩家可互相邀请切磋，不会误伤未对战队友。");
             if (pvp) {
                 ImGui::Indent(ui::px(10));
                 ui::fieldLabel("PVP 伤害倍率");
@@ -1185,10 +1170,10 @@ struct Ui {
                 ImGui::SameLine();
                 if (ImGui::RadioButton("真正倒下", mode == 1)) pvpRevive = false;
                 ImGui::Unindent(ui::px(10));
-                ui::vspace(ui::px(4));
+                ui::vspace(ui::px(6));
             }
-            ui::vspace(ui::px(6));
-            if (ui::primaryButton("开放房间", {-1.f, ui::px(36)})) {
+            ui::vspace(ui::px(4));
+            if (ui::filledButton("开放房间", {-1.f, ui::px(40)})) {
                 saveSettings();
                 act({{"action", "host"}, {"room_name", room}, {"password", hostPassword},
                      {"port", port}, {"max_players", limit}, {"pvp", pvp},
@@ -1198,27 +1183,27 @@ struct Ui {
             ui::cardEnd();
             ImGui::EndGroup();
 
-            ImGui::SameLine(0.f, ui::px(12));
+            ImGui::SameLine(0.f, ui::px(14));
 
-            // Right column: Direct Join + Saved Servers
+            // Right Column: Direct Join + Saved Servers
             ImGui::BeginGroup();
-            ui::cardBegin("##join_card", "直接连接好友", {half, 0.f}, ui::Tone::Info);
+            ui::cardBegin("##join_card", "直接连接好友", {half, 0.f}, "输入房主局域网或异地组网 IP");
             ui::fieldLabel("房主地址", "例：192.168.1.20:47615");
             ImGui::SetNextItemWidth(-1);
             ImGui::InputTextWithHint("##address", "输入 IP 或 IP:端口", address, sizeof address);
             ui::vspace(ui::px(6));
             ui::fieldLabel("房间密码", "无密码留空");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##joinpw", "房间密码（可留空）", joinPassword, sizeof joinPassword, ImGuiInputTextFlags_Password);
+            ImGui::InputTextWithHint("##joinpw", "房间密码（可选）", joinPassword, sizeof joinPassword, ImGuiInputTextFlags_Password);
             ui::vspace(ui::px(6));
             ui::fieldLabel("收藏备注名", "可选，便于下次识别");
             ImGui::SetNextItemWidth(-1);
             ImGui::InputTextWithHint("##srvname", "例如：好友的电脑", serverName, sizeof serverName);
             ui::vspace(ui::px(10));
-            const float btnHalf = (ImGui::GetContentRegionAvail().x - ui::px(8)) * 0.5f;
-            if (ui::primaryButton("连接房间", {btnHalf, ui::px(36)})) join();
-            ImGui::SameLine(0.f, ui::px(8));
-            if (ui::secondaryButton("收藏此地址", {-1.f, ui::px(36)})) {
+            const float btnHalf = (ImGui::GetContentRegionAvail().x - ui::px(10)) * 0.5f;
+            if (ui::filledButton("连接房间", {btnHalf, ui::px(40)})) join();
+            ImGui::SameLine(0.f, ui::px(10));
+            if (ui::tonalButton("收藏此地址", {-1.f, ui::px(40)})) {
                 if (*address) {
                     act({{"action", "save_server"}, {"address", address}, {"name", *serverName ? serverName : address}});
                     say("已添加到收藏", false);
@@ -1226,71 +1211,65 @@ struct Ui {
             }
             ui::cardEnd();
 
-            ui::vspace(ui::px(10));
+            ui::vspace(ui::px(12));
             const auto saved = state.value("configuration", json::object()).value("saved_servers", json::array());
-            ui::cardBegin("##saved_card", "收藏服务器", {half, 0.f}, ui::Tone::Neutral);
+            ui::cardBegin("##saved_card", "收藏地址", {half, 0.f});
             if (saved.empty()) {
-                ui::hint("暂无收藏地址。填入好友地址后点击“收藏此地址”即可一键填入。");
+                ui::hint("暂无收藏地址。填入好友地址后点击“收藏此地址”即可保存。");
             } else {
-                for (const auto& s : saved) {
+                for (std::size_t i = 0; i < saved.size(); ++i) {
+                    const auto& s = saved[i];
                     const auto ep = str(s, "address");
                     const auto lb = str(s, "name", ep);
                     ImGui::PushID(ep.c_str());
+                    if (i > 0) { ui::vspace(ui::px(4)); ImGui::Separator(); ui::vspace(ui::px(6)); }
                     ui::pushBold();
-                    ImGui::TextUnformatted(ui::ellipsize(lb, half - ui::px(155)).c_str());
+                    ImGui::TextUnformatted(ui::ellipsize(lb, half - ui::px(170)).c_str());
                     ui::popBold();
-                    const float fillW = ui::px(58), remW = ui::px(48);
-                    ui::alignRight(fillW + remW + ui::px(6));
-                    if (ui::chipButton("填入", ui::Tone::Accent)) { copyText(address, sizeof address, ep); joinPassword[0] = 0; }
+                    ui::alignRight(ui::px(116));
+                    if (ui::actionChip("填入", ui::Tone::Secondary)) { copyText(address, sizeof address, ep); joinPassword[0] = 0; }
                     ImGui::SameLine(0.f, ui::px(6));
-                    if (ui::chipButton("移除", ui::Tone::Danger)) act({{"action", "remove_server"}, {"address", ep}});
+                    if (ui::actionChip("移除", ui::Tone::Error)) act({{"action", "remove_server"}, {"address", ep}});
                     ui::pushMono();
                     ui::muted("%s", ep.c_str());
                     ui::popMono();
-                    ImGui::Separator();
                     ImGui::PopID();
                 }
             }
             ui::cardEnd();
             ImGui::EndGroup();
 
-            ui::vspace(ui::px(12));
+            ui::vspace(ui::px(14));
 
-            // Bottom full-width LAN Discovery card
-            ui::cardBegin("##lan_card", "局域网房间自动发现", {0.f, 0.f}, ui::Tone::Success);
-            if (ui::secondaryButton("刷新列表", {ui::px(110), ui::px(30)})) act({{"action", "refresh"}});
-            ImGui::SameLine();
-            ui::dim(" 自动扫描同一局域网内开放的终末地联机房间");
+            // Bottom LAN Discovery Card
+            ui::cardBegin("##lan_card", "局域网房间发现", {0.f, 0.f}, "自动扫描同一局域网内开放的终末地房间");
+            if (ui::outlinedButton("刷新列表", {ui::px(108), ui::px(34)})) act({{"action", "refresh"}});
             ui::vspace(ui::px(8));
             const auto rooms = state.value("rooms", json::array());
             if (rooms.empty()) {
                 ui::emptyState("暂未发现局域网房间", "让好友先开放房间，或在上方直接输入 IP:端口 加入。");
             } else {
-                for (const auto& item : rooms) {
+                for (std::size_t i = 0; i < rooms.size(); ++i) {
+                    const auto& item = rooms[i];
                     const auto ep = str(item, "address");
                     const bool locked = item.value("password", false);
                     ImGui::PushID(ep.c_str());
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::kWell);
-                    ImGui::BeginChild("##lanrow", {0.f, 0.f}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                    if (i > 0) { ui::vspace(ui::px(6)); ImGui::Separator(); ui::vspace(ui::px(8)); }
                     ui::pushBold();
                     ImGui::TextUnformatted(str(item, "name", "未命名房间").c_str());
                     ui::popBold();
                     if (locked) { ImGui::SameLine(); ui::badge("需密码", ui::Tone::Warning); }
-                    const float joinW = ui::px(88);
-                    ui::alignRight(joinW);
-                    if (ui::primaryButton("加入房间", {joinW, ui::px(30)})) {
+                    ui::alignRight(ui::px(94));
+                    if (ui::tonalButton("加入房间", {ui::px(94), ui::px(34)})) {
                         copyText(address, sizeof address, ep);
                         if (locked) say("该房间需要密码，请在上方输入密码后连接", false);
                         else join();
                     }
                     ui::pushNote();
-                    ui::muted("房主 %s  ·  %d/%d 人  ·  地图 %s  ·  %s",
+                    ui::muted("房主 %s · %d/%d 人 · 地图 %s · %s",
                         str(item, "host").c_str(), item.value("players", 0), item.value("max_players", 0),
                         str(item, "map", "—").c_str(), ep.c_str());
                     ui::popNote();
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
-                    ui::vspace(ui::px(6));
                     ImGui::PopID();
                 }
             }
@@ -1298,52 +1277,55 @@ struct Ui {
             return;
         }
 
-        // ---- ONLINE ROOM VIEW ----
+        // ---- ONLINE ROOM VIEW (MATERIAL 3) ----
         const auto roomInfo = state.value("room", json::object());
         const auto pvpState = state.value("pvp", json::object());
         const auto& atbState = liveSharedAtb();
 
-        // Top Overview + Live Shared ATB & World Sync
-        ui::cardBegin("##room_overview", r == "host" ? "我的房间（房主控制）" : (r == "client" ? "已加入房间" : "正在连接房间"), {0.f, 0.f}, roleTone(r));
+        ui::cardBegin("##room_overview", nullptr, {0.f, 0.f});
         ui::pushTitle();
-        ImGui::TextUnformatted(str(roomInfo, "name", r == "connecting" ? "连接中…" : "未命名房间").c_str());
+        ImGui::TextUnformatted(str(roomInfo, "name", r == "connecting" ? "正在连接…" : "未命名房间").c_str());
         ui::popTitle();
-        ui::vspace(ui::px(4));
+        ui::vspace(ui::px(6));
         ui::statusPill(roleLabel(r), roleTone(r), true);
         char pCnt[32]{}; std::snprintf(pCnt, sizeof pCnt, "%d / %d 人", int(state.value("peers", json::array()).size()), roomInfo.value("max_players", 8));
-        ui::hspace(ui::px(6)); ui::statusPill(pCnt, ui::Tone::Neutral, false);
+        ui::hspace(ui::px(8)); ui::statusPill(pCnt, ui::Tone::Neutral, false);
+        if (atbState.value("active", false)) {
+            ui::hspace(ui::px(8)); ui::statusPill("共用技力池已启用", ui::Tone::Primary, false);
+        }
         if (pvpState.value("active", false)) {
             char pvpRule[64]{}; std::snprintf(pvpRule, sizeof pvpRule, "PVP %.1fx · %s", pvpState.value("scale", 1.0), pvpState.value("revive", true) ? "回满" : "倒下");
-            ui::hspace(ui::px(6)); ui::statusPill(pvpRule, ui::Tone::Danger, true);
-        }
-        if (atbState.value("active", false)) {
-            ui::hspace(ui::px(6)); ui::statusPill("共用技力池已启用", ui::Tone::Accent, true);
+            ui::hspace(ui::px(8)); ui::statusPill(pvpRule, ui::Tone::Error, false);
         }
 
-        // Live Shared ATB gauge bar inside room card when enabled
+        // Live Shared ATB Segmented Material 3 Progress Indicator
         if (atbState.value("active", false)) {
-            ui::vspace(ui::px(10));
+            ui::vspace(ui::px(14));
             const float val = float(atbState.value("value", 0.0));
             const float mx = (std::max)(1.f, float(atbState.value("max", 300.0)));
             const float rec = float(atbState.value("recover", 0.0));
             const int segs = (std::clamp)(int(std::round(mx / 100.f)), 1, 6);
-            ui::dim("共享技力池实时状态：%.0f / %.0f  （自然回复 +%.1f/s）", val, mx, rec);
+            ui::pushNote();
+            ui::muted("共享技力池实时状态：%.0f / %.0f  （自然回复 +%.1f/s）", val, mx, rec);
+            ui::popNote();
+            ui::vspace(ui::px(4));
             const ImVec2 bo = ImGui::GetCursorScreenPos();
             const float bw = ImGui::GetContentRegionAvail().x;
             ui::drawProgressBar(ImGui::GetWindowDrawList(), bo, {bo.x + bw, bo.y + ui::px(10)},
-                val / mx, ui::u32(ui::kAccent), ui::u32(ui::kWell), segs);
+                val / mx, ui::u32(ui::md.primary), ui::u32(ui::md.surfaceContainerHighest), segs);
             ImGui::Dummy({bw, ui::px(12)});
         }
 
         if (r == "host") {
-            ui::vspace(ui::px(8));
+            ui::vspace(ui::px(10));
             ImGui::Separator();
-            ui::vspace(ui::px(8));
-            const float half = (ImGui::GetContentRegionAvail().x - ui::px(14)) * 0.5f;
+            ui::vspace(ui::px(12));
+            const float half = (ImGui::GetContentRegionAvail().x - ui::px(18)) * 0.5f;
 
-            // Left: Room Gameplay Rules (Shared ATB + PVP)
+            // Left: Room Gameplay Switches
             ImGui::BeginGroup();
             ImGui::BeginChild("##host_rules", {half, 0.f}, ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+            ui::sectionLabel("房间规则");
             bool roomAtb = atbState.value("allowed", false);
             if (ui::toggleSwitch("live_shared_atb", &roomAtb, "所有人共用技力条（ATB）",
                 "房主权威共享池：任何队友消耗或回复技力实时同步给所有人。")) {
@@ -1371,30 +1353,34 @@ struct Ui {
             ImGui::EndChild();
             ImGui::EndGroup();
 
-            ImGui::SameLine(0.f, ui::px(14));
+            ImGui::SameLine(0.f, ui::px(18));
 
             // Right: Shareable Host IP Addresses
             ImGui::BeginGroup();
             ImGui::BeginChild("##host_addrs", {half, 0.f}, ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
-            ui::fieldLabel("房间地址", "发给好友直接连接");
+            ui::sectionLabel("房间地址", "发给好友直接连接");
             const auto addrs = state.value("addresses", json::array());
             if (addrs.empty()) ui::hint("正在读取本机网卡地址…");
             for (const auto& a : addrs) {
                 const auto ep = str(a, "ip") + ":" + std::to_string(roomInfo.value("port", 47615));
                 ImGui::PushID(ep.c_str());
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::kWell);
-                ImGui::BeginChild("##addrrow", {0.f, 0.f}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::md.surfaceContainer);
+                ImGui::PushStyleColor(ImGuiCol_Border, {0, 0, 0, 0});
+                ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui::px(14));
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(14), ui::px(10)});
+                ImGui::BeginChild("##addrrow", {0.f, 0.f}, ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY, ImGuiWindowFlags_NoScrollbar);
                 ui::pushMono();
                 ImGui::TextUnformatted(ep.c_str());
                 ui::popMono();
-                ui::alignRight(ui::px(60));
-                if (ui::chipButton("复制", ui::Tone::Accent)) { ImGui::SetClipboardText(ep.c_str()); say("地址已复制：" + ep, false); }
+                ui::alignRight(ui::px(58));
+                if (ui::actionChip("复制", ui::Tone::Secondary)) { ImGui::SetClipboardText(ep.c_str()); say("地址已复制：" + ep, false); }
                 ui::pushNote();
                 ui::muted("%s", str(a, "adapter").c_str());
                 ui::popNote();
                 ImGui::EndChild();
-                ImGui::PopStyleColor();
-                ui::vspace(ui::px(5));
+                ImGui::PopStyleVar(2);
+                ImGui::PopStyleColor(2);
+                ui::vspace(ui::px(8));
                 ImGui::PopID();
             }
             ImGui::EndChild();
@@ -1402,228 +1388,239 @@ struct Ui {
         }
         ui::cardEnd();
 
-        ui::vspace(ui::px(12));
-        drawWorldSyncCard();
+        ui::vspace(ui::px(14));
+        drawSyncCard();
     }
 
-    void drawWorldSyncCard() {
+    void drawSyncCard() {
         const auto world = state.value("world_session", json::object());
         const auto entry = world.value("entry", json::object());
         const auto native = state.value("game", json::object()).value("world_replication", json::object());
+        ui::cardBegin("##sync_card", "世界同步与传送", {0.f, 0.f});
         const bool active = entry.value("active", false);
-
-        ui::cardBegin("##sync_card", "世界同步与传送", {0.f, 0.f}, active ? ui::Tone::Success : ui::Tone::Warning);
         ui::statusPill(active ? "已进入共享世界" : "正在准备共享世界", active ? ui::Tone::Success : ui::Tone::Warning, true);
-        ui::hspace(ui::px(8));
-        ui::statusPill(("已同步敌人 " + std::to_string(native.value("matched", 0u))).c_str(), ui::Tone::Info, false);
+        char enBuf[48]{}; std::snprintf(enBuf, sizeof enBuf, "敌人 %u 已同步", native.value("matched", 0u));
+        ui::hspace(ui::px(8)); ui::statusPill(enBuf, ui::Tone::Neutral, false);
         if (native.value("missing", 0u) > 0) {
-            ui::hspace(ui::px(8));
-            ui::statusPill(("待补全 " + std::to_string(native.value("missing", 0u))).c_str(), ui::Tone::Danger, false);
+            char msBuf[32]{}; std::snprintf(msBuf, sizeof msBuf, "缺失 %u", native.value("missing", 0u));
+            ui::hspace(ui::px(8)); ui::statusPill(msBuf, ui::Tone::Error, false);
         }
-        const auto blockers = entry.value("blockers", json::array());
-        if (!blockers.empty()) {
-            ui::vspace(ui::px(8));
-            for (const auto& b : blockers) {
-                if (b.is_string()) { ui::badge(blockerText(b.get<std::string>()), ui::Tone::Warning); ui::hspace(ui::px(6)); }
-            }
-            ImGui::NewLine();
+        for (const auto& b : entry.value("blockers", json::array())) {
+            if (b.is_string()) { ui::vspace(ui::px(4)); ui::hint("· 等待：%s", blockerText(b.get<std::string>())); }
         }
         const auto travel = str(native, "teleport");
-        if (travel == "failed") {
-            ui::vspace(ui::px(6));
-            ui::noticeBanner(ui::Tone::Danger, ("传送失败：" + str(native, "error")).c_str());
-        } else if (!travel.empty() && travel != "idle" && travel != "complete") {
-            ui::vspace(ui::px(6));
-            ui::dim("传送进度：%s", travel.c_str());
-        }
+        if (travel == "failed") { ui::vspace(ui::px(6)); ui::noticeBanner(ui::Tone::Error, ("传送失败：" + str(native, "error")).c_str()); }
+        else if (!travel.empty() && travel != "idle" && travel != "complete") { ui::vspace(ui::px(4)); ui::hint("传送状态：%s", travel.c_str()); }
+
         const auto change = native.value("host_map_change", json::object());
         if (role() == "client" && change.value("pending", false)) {
             ui::vspace(ui::px(10));
-            ui::noticeBanner(ui::Tone::Accent, ("房主已切换地图至：" + str(change, "level")).c_str());
+            ui::noticeBanner(ui::Tone::Primary, ("房主已前往：" + str(change, "level")).c_str());
             ui::vspace(ui::px(8));
+            const auto blockers = entry.value("blockers", json::array());
             const bool supported = std::find(blockers.begin(), blockers.end(), json("host_scene_rules")) == blockers.end();
             const auto token = change.value("token", std::uint64_t(0));
             ImGui::BeginDisabled(!supported);
-            if (ui::primaryButton("跟随房主", {ui::px(130), ui::px(32)})) act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
+            if (ui::filledButton("跟随房主", {ui::px(120), ui::px(36)})) act({{"action", "host_map_choice"}, {"token", token}, {"follow", true}});
             ImGui::EndDisabled();
             if (!change.value("deferred", false)) {
-                ui::hspace(ui::px(8));
-                if (ui::secondaryButton("暂不跟随", {ui::px(110), ui::px(32)})) act({{"action", "host_map_choice"}, {"token", token}, {"follow", false}});
+                ImGui::SameLine(0.f, ui::px(10));
+                if (ui::outlinedButton("暂不跟随", {ui::px(110), ui::px(36)})) act({{"action", "host_map_choice"}, {"token", token}, {"follow", false}});
             }
             if (!supported) { ui::vspace(ui::px(4)); ui::hint("房主当前场景尚未开放联机入场，请等待其回到大世界。"); }
         }
         ui::cardEnd();
     }
 
-    // ---- PAGE 1: 房间玩家 --------------------------------------------------
+    // ---- PAGE 1: 房间玩家 (Google Contacts / Devices Material 3 Cards) -----
     void pagePlayers() {
         const auto peers = state.value("peers", json::array());
         if (peers.empty()) {
-            ui::emptyState("房间内暂无玩家", "开放或加入房间后，这里会实时展示队友干员、血量、终结技充能、距离与快捷操作。");
+            ui::cardBegin("##players_empty", "房间成员", {0.f, 0.f});
+            ui::emptyState("当前还没有在线队友", "在“联机大厅”开放房间或加入好友房间后，这里将展示每位成员的干员、实时血量、终结技充能和传送入口。");
+            ui::cardEnd();
             return;
         }
+        const bool isRoomHost = role() == "host";
         const auto& vitalsMap = liveVitals();
         const auto pvpInfo = state.value("pvp", json::object());
-        const bool isHost = role() == "host";
-        const bool pvpAllowed = pvpInfo.value("active", false);
+        const bool pvpOn = pvpInfo.value("active", false);
 
-        ui::sectionHeader("房间成员与实时状态", (std::to_string(peers.size()) + " 位在线").c_str(), ui::Tone::Info);
+        char cntBuf[32]{}; std::snprintf(cntBuf, sizeof cntBuf, "共 %d 位在线", int(peers.size()));
+        ui::sectionLabel("房间成员", cntBuf);
+        ui::vspace(ui::px(4));
+
         for (const auto& p : peers) {
             const int id = p.value("id", 0);
             const bool self = p.value("local", false);
-            const bool peerHost = p.value("host", false);
+            const bool isHost = p.value("host", false);
             const bool valid = p.value("valid", false);
-            const bool stale = p.value("state_age_ms", 4000) > 3000;
+            const bool stale = p.value("state_age_ms", 4000u) > 3000u;
             bool dueling = false;
-            for (const auto& duel : pvpInfo.value("duels", json::array())) if (duel.value("id", -1) == id) dueling = true;
-
+            for (const auto& duel : pvpInfo.value("duels", json::array())) {
+                if (duel.value("id", -1) == id) dueling = true;
+            }
             const std::string idKey = std::to_string(id);
-            const json v = vitalsMap.contains(idKey) ? vitalsMap[idKey] : p.value("vitals", json::object());
+            json v = vitalsMap.contains(idKey) ? vitalsMap[idKey] : p.value("vitals", json::object());
             const double hp = v.value("hp", 0.0), maxHp = v.value("max_hp", 0.0);
             const double usp = v.value("usp", 0.0), maxUsp = v.value("max_usp", 0.0);
             std::string opName = str(v, "op");
             if (opName.empty()) opName = operatorDisplayName(str(p, "model"));
-            const float hpRatio = maxHp > 0.0 ? float((std::clamp)(hp / maxHp, 0.0, 1.0)) : 0.f;
-            const float spRatio = maxUsp > 0.0 ? float((std::clamp)(usp / maxUsp, 0.0, 1.0)) : 0.f;
+            const bool alive = v.value("alive", true);
 
             ImGui::PushID(id);
-            ui::cardBegin("##peer_card", nullptr, {0.f, 0.f});
+            ui::cardBegin("##pcard", nullptr, {0.f, 0.f});
 
-            // Top row: ID tile + Name + Badges + Action buttons
-            char idBuf[8]{}; std::snprintf(idBuf, sizeof idBuf, "#%02d", id);
-            ui::badge(idBuf, self ? ui::Tone::Info : (peerHost ? ui::Tone::Accent : ui::Tone::Neutral), true);
-            ImGui::SameLine();
+            // Header row: circular M3 tonal avatar + name + badges + right pill actions
+            char idStr[8]{}; std::snprintf(idStr, sizeof idStr, "%02d", id);
+            ui::avatarCircle(idStr, self ? ui::Tone::Primary : (isHost ? ui::Tone::Secondary : ui::Tone::Neutral), ui::px(36));
+            ImGui::SameLine(0.f, ui::px(12));
+
+            ImGui::BeginGroup();
             ui::pushBold();
-            ImGui::TextUnformatted(str(p, "name", "未命名玩家").c_str());
+            ImGui::TextUnformatted(str(p, "name", "玩家").c_str());
             ui::popBold();
-            if (peerHost) { ImGui::SameLine(); ui::badge("房主", ui::Tone::Accent); }
-            if (self) { ImGui::SameLine(); ui::badge("你", ui::Tone::Info); }
+            if (isHost) { ImGui::SameLine(); ui::badge("房主", ui::Tone::Primary); }
+            if (self) { ImGui::SameLine(); ui::badge("本机", ui::Tone::Secondary); }
             if (!opName.empty()) { ImGui::SameLine(); ui::badge(opName.c_str(), ui::Tone::Violet); }
-            if (dueling) { ImGui::SameLine(); ui::badge("PVP 对战中", ui::Tone::Danger, true); }
+            if (dueling) { ImGui::SameLine(); ui::badge("PVP 对战中", ui::Tone::Error, true); }
 
-            if (!self && online()) {
-                const float tpW = ui::buttonWidth("传送到TA");
-                const float pvpW = pvpAllowed ? (ui::buttonWidth(dueling ? "结束PVP" : "邀请PVP") + ui::px(6)) : 0.f;
-                const float kickW = isHost ? (ui::buttonWidth("移出") + ui::px(6)) : 0.f;
-                ui::alignRight(tpW + pvpW + kickW);
-                ImGui::BeginDisabled(!valid || stale);
-                if (ui::secondaryButton("传送到TA", {tpW, ui::px(28)})) act({{"action", "teleport_to_player"}, {"id", id}});
+            ui::pushNote();
+            const std::string loc = str(p, "level", str(p, "map", "—"));
+            const std::string posStr = valid ? formatPosition(p.value("position", json::array())) : "—";
+            const char* mapRel = self ? "本机位置" : ((!valid || stale) ? "等待同步" : (p.value("same_map", false) ? "同地图" : "其他地图"));
+            char subLine[192]{};
+            if (!self && p.contains("distance")) {
+                std::snprintf(subLine, sizeof subLine, "%s · %s · 坐标 %s · 距离 %.1f m · %u ms",
+                    loc.c_str(), mapRel, posStr.c_str(), p.value("distance", 0.f), p.value("rtt_ms", 0u));
+            } else {
+                std::snprintf(subLine, sizeof subLine, "%s · %s · 坐标 %s", loc.c_str(), mapRel, posStr.c_str());
+            }
+            ui::muted("%s", subLine);
+            ui::popNote();
+            ImGui::EndGroup();
+
+            if (!self) {
+                const float tpW = ui::px(88), pvpW = pvpOn ? ui::px(82) : 0.f, kickW = isRoomHost ? ui::px(64) : 0.f;
+                const float totalBtnW = tpW + (pvpOn ? pvpW + ui::px(8) : 0.f) + (isRoomHost ? kickW + ui::px(8) : 0.f);
+                ui::alignRight(totalBtnW);
+                ImGui::BeginDisabled(!online() || !valid || stale);
+                if (ui::tonalButton("传送到TA", {tpW, ui::px(32)})) act({{"action", "teleport_to_player"}, {"id", id}});
                 ImGui::EndDisabled();
-                if (pvpAllowed) {
-                    ImGui::SameLine(0.f, ui::px(6));
+                if (pvpOn) {
+                    ImGui::SameLine(0.f, ui::px(8));
                     if (dueling) {
-                        if (ui::dangerButton("结束PVP", {0.f, ui::px(28)})) act({{"action", "pvp_duel"}, {"op", "end"}, {"target", id}});
+                        if (ui::dangerButton("结束PVP", {pvpW, ui::px(32)})) act({{"action", "pvp_duel"}, {"op", "end"}, {"target", id}});
                     } else {
-                        if (ui::secondaryButton("邀请PVP", {0.f, ui::px(28)})) act({{"action", "pvp_duel"}, {"op", "invite"}, {"target", id}});
+                        if (ui::outlinedButton("邀请PVP", {pvpW, ui::px(32)})) act({{"action", "pvp_duel"}, {"op", "invite"}, {"target", id}});
                     }
                 }
-                if (isHost) {
-                    ImGui::SameLine(0.f, ui::px(6));
-                    if (ui::dangerButton("移出", {0.f, ui::px(28)})) { kickId = id; kickName = str(p, "name", "玩家"); kickPending = true; }
+                if (isRoomHost) {
+                    ImGui::SameLine(0.f, ui::px(8));
+                    if (ui::dangerButton("移出", {kickW, ui::px(32)})) { kickId = id; kickName = str(p, "name"); kickPending = true; }
                 }
             }
 
-            // Middle row: HP & Ultimate SP live bars
-            ui::vspace(ui::px(6));
-            const float halfBar = (ImGui::GetContentRegionAvail().x - ui::px(16)) * 0.5f;
-            ImDrawList* d = ImGui::GetWindowDrawList();
-            const ImVec2 barStart = ImGui::GetCursorScreenPos();
-            ui::pushNote();
-            char hpLabel[64]{}, spLabel[64]{};
-            if (maxHp > 0.0) std::snprintf(hpLabel, sizeof hpLabel, "生命  %.0f / %.0f (%.0f%%)", hp, maxHp, hpRatio * 100.f);
-            else std::snprintf(hpLabel, sizeof hpLabel, "生命  等待同步");
-            if (maxUsp > 0.0) std::snprintf(spLabel, sizeof spLabel, "终结技能量  %.0f / %.0f%s", usp, maxUsp, spRatio >= 0.995f ? "  [就绪]" : "");
-            else std::snprintf(spLabel, sizeof spLabel, "终结技能量  —");
+            // Vitals bars (HP + Ultimate SP) in clean Material 3 Linear Progress style
+            if (maxHp > 0.0) {
+                ui::vspace(ui::px(10));
+                const float hpFrac = float((std::clamp)(hp / maxHp, 0.0, 1.0));
+                const float spFrac = maxUsp > 0.0 ? float((std::clamp)(usp / maxUsp, 0.0, 1.0)) : 0.f;
+                const bool spReady = maxUsp > 0.0 && spFrac >= 0.995f;
+                const ImVec4 hpCol = !alive ? ui::md.error : (hpFrac > 0.55f ? ui::md.tertiary : (hpFrac > 0.25f ? ui::md.warning : ui::md.error));
+                const ImVec4 spCol = spReady ? ui::md.primary : ui::md.secondary;
 
-            const ImVec4 hpCol = hpRatio > 0.55f ? ui::kSuccess : (hpRatio > 0.25f ? ui::kWarning : ui::kDanger);
-            const ImVec4 spCol = spRatio >= 0.995f ? ui::kAccent : ui::kInfo;
-            d->AddText(barStart, ui::u32(ui::kTextDim), hpLabel);
-            d->AddText({barStart.x + halfBar + ui::px(16), barStart.y}, ui::u32(spRatio >= 0.995f ? ui::kAccent : ui::kTextDim), spLabel);
-            const float by = barStart.y + ImGui::GetTextLineHeight() + ui::px(4);
-            ui::drawProgressBar(d, {barStart.x, by}, {barStart.x + halfBar, by + ui::px(6)}, hpRatio, ui::u32(hpCol), ui::u32(ui::kWell));
-            ui::drawProgressBar(d, {barStart.x + halfBar + ui::px(16), by}, {barStart.x + halfBar * 2.f + ui::px(16), by + ui::px(6)}, spRatio, ui::u32(spCol), ui::u32(ui::kWell));
-            ImGui::Dummy({ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight() + ui::px(12)});
-
-            // Bottom metadata line
-            const char* syncTxt = self ? "本机" : ((!valid || stale) ? "等待状态" : (p.value("same_map", false) ? "同地图" : "其他地图"));
-            ui::muted("地图 %s  ·  %s  ·  坐标 %s",
-                str(p, "level", str(p, "map", "—")).c_str(), syncTxt,
-                valid ? formatPosition(p.value("position", json::array())).c_str() : "—");
-            if (!self) {
-                ImGui::SameLine();
-                if (p.contains("distance")) ui::muted("  ·  距离 %.1f m  ·  延迟 %u ms", p.value("distance", 0.f), p.value("rtt_ms", 0u));
-                else ui::muted("  ·  延迟 %u ms", p.value("rtt_ms", 0u));
+                const float barPairW = (ImGui::GetContentRegionAvail().x - ui::px(18)) * 0.5f;
+                ImDrawList* d = ImGui::GetWindowDrawList();
+                const ImVec2 bo = ImGui::GetCursorScreenPos();
+                ui::pushNote();
+                char hpLbl[64]{}, spLbl[64]{};
+                std::snprintf(hpLbl, sizeof hpLbl, "生命  %.0f / %.0f  (%.0f%%)", hp, maxHp, hpFrac * 100.f);
+                if (maxUsp > 0.0) std::snprintf(spLbl, sizeof spLbl, "终结技能量  %.0f / %.0f%s", usp, maxUsp, spReady ? "  已就绪" : "");
+                else std::snprintf(spLbl, sizeof spLbl, "终结技能量  —");
+                d->AddText(bo, ui::u32(ui::md.onSurfaceVariant), hpLbl);
+                d->AddText({bo.x + barPairW + ui::px(18), bo.y}, ui::u32(spReady ? ui::md.primary : ui::md.onSurfaceVariant), spLbl);
+                const float barY = bo.y + ImGui::GetTextLineHeight() + ui::px(5);
+                ui::drawProgressBar(d, {bo.x, barY}, {bo.x + barPairW, barY + ui::px(7)}, hpFrac,
+                    ui::u32(hpCol), ui::u32(ui::md.surfaceContainerHighest));
+                ui::drawProgressBar(d, {bo.x + barPairW + ui::px(18), barY}, {bo.x + barPairW * 2.f + ui::px(18), barY + ui::px(7)}, spFrac,
+                    ui::u32(spCol), ui::u32(ui::md.surfaceContainerHighest));
+                ImGui::Dummy({ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight() + ui::px(13)});
+                ui::popNote();
             }
-            ui::popNote();
+
             ui::cardEnd();
-            ui::vspace(ui::px(8));
+            ui::vspace(ui::px(10));
             ImGui::PopID();
         }
     }
 
-    // ---- PAGE 2: 战斗统计 (DAMAGE METER & ANALYTICS) -----------------------
+    // ---- PAGE 2: 战斗统计 (Google Fit / Material You Analytics) ------------
     void pageCombatStats() {
         const auto& stats = liveCombatStats();
-        const bool inCombat = stats.value("in_combat", false);
         const auto players = stats.value("players", json::array());
+        const bool inCombat = stats.value("in_combat", false);
+        const double totalDmg = stats.value("total_damage", 0.0);
+        const double teamDps  = stats.value("team_dps", 0.0);
+        const double durS     = stats.value("duration_s", 0.0);
+        const auto totalHits  = stats.value("total_hits", std::uint64_t(0));
+        const auto totalKills = stats.value("total_kills", std::uint64_t(0));
 
-        // Toolbar row
-        ui::statusPill(inCombat ? "战斗统计进行中" : (players.empty() ? "待机" : "战斗已结算（DPS 已冻结）"),
-            inCombat ? ui::Tone::Accent : (players.empty() ? ui::Tone::Neutral : ui::Tone::Info), true);
+        // Top actions strip
+        ui::statusPill(inCombat ? "战斗统计进行中" : (players.empty() ? "等待进入战斗" : "统计已暂停（脱战）"),
+            inCombat ? ui::Tone::Primary : (players.empty() ? ui::Tone::Neutral : ui::Tone::Success), true);
 
-        const float shareW = ui::buttonWidth("发送到聊天");
-        const float rstW = ui::buttonWidth("重置统计 (F9)");
+        const std::string rstLbl = std::string("重置统计 (") + fKeyName(damageResetKey) + ")";
+        const float shareW = ui::px(108), rstW = ui::buttonWidth(rstLbl.c_str());
         ui::alignRight(shareW + rstW + ui::px(10));
         ImGui::BeginDisabled(!online() || players.empty());
-        if (ui::secondaryButton("发送到聊天", {shareW, ui::px(30)})) {
+        if (ui::outlinedButton("发送到聊天", {shareW, ui::px(34)})) {
             act({{"action", "combat_stats_share"}});
             say("已将伤害统计发送到房间聊天", false);
         }
         ImGui::EndDisabled();
         ImGui::SameLine(0.f, ui::px(10));
-        char rstLabel[32]{}; std::snprintf(rstLabel, sizeof rstLabel, "重置统计 (%s)", fKeyName(damageResetKey));
-        if (ui::dangerButton(rstLabel, {rstW, ui::px(30)})) {
+        if (ui::dangerButton(rstLbl.c_str(), {rstW, ui::px(34)})) {
             act({{"action", "combat_stats_reset"}});
             say("伤害统计已重置", false);
         }
 
-        ui::vspace(ui::px(10));
+        ui::vspace(ui::px(12));
 
-        // 4 Hero KPI Cards
-        const float gap = ui::px(10);
-        const float cardW = (ImGui::GetContentRegionAvail().x - gap * 3.f) * 0.25f;
-        char durBuf[32]{}, hkBuf[48]{}, hitSub[48]{};
-        std::snprintf(durBuf, sizeof durBuf, "%.1f s", stats.value("duration_s", 0.0));
-        std::snprintf(hkBuf, sizeof hkBuf, "%llu", static_cast<unsigned long long>(stats.value("total_hits", std::uint64_t(0))));
-        std::snprintf(hitSub, sizeof hitSub, "击杀 %llu 名敌人", static_cast<unsigned long long>(stats.value("total_kills", std::uint64_t(0))));
+        // 4 Harmonized Material You Tonal KPI Cards
+        const float kpiW = (ImGui::GetContentRegionAvail().x - ui::px(12) * 3.f) * 0.25f;
+        char v1[32]{}, v2[32]{}, v3[32]{}, v4[32]{}, s1[48]{}, s4[48]{};
+        std::snprintf(v1, sizeof v1, "%s", formatDamageNumber(totalDmg).c_str());
+        std::snprintf(s1, sizeof s1, "%d 位参战玩家", int(players.size()));
+        std::snprintf(v2, sizeof v2, "%s/s", formatDamageNumber(teamDps).c_str());
+        std::snprintf(v3, sizeof v3, "%.1f s", durS);
+        std::snprintf(v4, sizeof v4, "%llu", static_cast<unsigned long long>(totalHits));
+        std::snprintf(s4, sizeof s4, "击杀 %llu 名敌人", static_cast<unsigned long long>(totalKills));
 
-        ui::kpiCard("##kpi_total", "团队总伤害", formatDamageNumber(stats.value("total_damage", 0.0)).c_str(),
-            (std::to_string(players.size()) + " 位参战玩家").c_str(), ui::Tone::Accent, cardW);
-        ImGui::SameLine(0.f, gap);
-        ui::kpiCard("##kpi_dps", "团队平均 DPS", (formatDamageNumber(stats.value("team_dps", 0.0)) + "/s").c_str(),
-            inCombat ? "实时采样中" : "已停表保留峰值", ui::Tone::Info, cardW);
-        ImGui::SameLine(0.f, gap);
-        ui::kpiCard("##kpi_dur", "有效战斗时长", durBuf,
-            damageAutoReset ? "脱战15秒自动新开" : "手动重置分段", ui::Tone::Success, cardW);
-        ImGui::SameLine(0.f, gap);
-        ui::kpiCard("##kpi_hits", "累计命中次数", hkBuf, hitSub, ui::Tone::Violet, cardW);
+        ui::kpiCard("##kpi1", "团队总伤害", v1, s1, ui::Tone::Primary, kpiW);
+        ImGui::SameLine(0.f, ui::px(12));
+        ui::kpiCard("##kpi2", "团队平均 DPS", v2, inCombat ? "实时采样中" : "已按有效时长结算", ui::Tone::Secondary, kpiW);
+        ImGui::SameLine(0.f, ui::px(12));
+        ui::kpiCard("##kpi3", "有效战斗时长", v3, damageAutoReset ? "脱战 15s 自动重置" : "手动重置分段", ui::Tone::Success, kpiW);
+        ImGui::SameLine(0.f, ui::px(12));
+        ui::kpiCard("##kpi4", "累计命中次数", v4, s4, ui::Tone::Violet, kpiW);
 
-        ui::vspace(ui::px(10));
+        ui::vspace(ui::px(14));
 
-        // 30s Real-Time Team DPS Sparkline
-        ui::cardBegin("##dps_graph", "最近 30 秒团队秒伤曲线", {0.f, 0.f}, ui::Tone::Info);
-        std::vector<float> curve;
-        for (const auto& v : stats.value("timeline", json::array())) {
-            curve.push_back(v.is_number() ? v.get<float>() : 0.f);
+        // 30-second Rolling DPS Bar Chart (Google Fit style)
+        ui::cardBegin("##dps_curve", "最近 30 秒团队秒伤趋势", {0.f, 0.f});
+        std::vector<double> tl;
+        if (stats.contains("timeline") && stats["timeline"].is_array()) {
+            for (const auto& pt : stats["timeline"]) if (pt.is_number()) tl.push_back(pt.get<double>());
         }
-        if (curve.empty()) curve.assign(30, 0.f);
-        ui::dpsSparkline(curve, {ImGui::GetContentRegionAvail().x, ui::px(76)}, inCombat ? ui::Tone::Accent : ui::Tone::Info);
+        if (tl.empty()) tl.assign(30, 0.0);
+        ui::dpsSparkline(tl, ui::px(82));
         ui::cardEnd();
 
-        ui::vspace(ui::px(10));
+        ui::vspace(ui::px(14));
 
-        // Ranked Player Breakdown
-        ui::cardBegin("##dmg_rank", "全队伤害贡献排行", {0.f, 0.f}, ui::Tone::Accent);
+        // Player Breakdown Table / Cards
+        ui::cardBegin("##dmg_rank", "全队伤害贡献排行", {0.f, 0.f});
         if (players.empty()) {
             ui::emptyState("暂无战斗伤害数据", "攻击敌人后将自动统计房主与全队成员的总伤、DPS、暴击率、最高单次伤害及元素占比。");
         } else {
@@ -1642,58 +1639,52 @@ struct Ui {
                 const ImVec4 rCol = ui::rankColor(idx);
 
                 ImGui::PushID(p.value("id", idx));
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::kWell);
-                ImGui::BeginChild("##dmg_player", {0.f, 0.f}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+                if (idx > 0) { ui::vspace(ui::px(8)); ImGui::Separator(); ui::vspace(ui::px(10)); }
 
-                // Bar background behind header row
-                ImDrawList* d = ImGui::GetWindowDrawList();
-                const ImVec2 barMin = ImGui::GetCursorScreenPos();
-                const float barW = ImGui::GetContentRegionAvail().x;
-                const float barH = ui::px(30);
-                d->AddRectFilled(barMin, {barMin.x + barW, barMin.y + barH}, ui::u32(ui::kCard, 0.85f), ui::px(5));
-                if (ratio > 0.005f) {
-                    d->AddRectFilled(barMin, {barMin.x + barW * ratio, barMin.y + barH}, ui::u32(rCol, 0.24f), ui::px(5));
-                    d->AddRectFilled(barMin, {barMin.x + ui::px(3.5f), barMin.y + barH}, ui::u32(rCol, 0.95f), ui::px(2));
-                }
-
-                // Rank badge + Name + Operator
+                // Top header strip: rank pill + name + op + right metrics
                 char rankBuf[16]{}; std::snprintf(rankBuf, sizeof rankBuf, idx == 0 ? "MVP #1" : "#%d", idx + 1);
-                ImGui::SetCursorScreenPos({barMin.x + ui::px(10), barMin.y + ui::px(5)});
-                ui::badge(rankBuf, idx == 0 ? ui::Tone::Accent : (idx == 1 ? ui::Tone::Info : ui::Tone::Neutral), idx == 0);
-                ImGui::SameLine();
+                ui::badge(rankBuf, idx == 0 ? ui::Tone::Primary : (idx == 1 ? ui::Tone::Secondary : ui::Tone::Neutral), idx == 0);
+                ImGui::SameLine(0.f, ui::px(8));
                 ui::pushBold();
                 ImGui::TextUnformatted(str(p, "name", "玩家").c_str());
                 ui::popBold();
                 const std::string opTag = str(p, "op");
-                if (!opTag.empty()) { ImGui::SameLine(); ui::badge(opTag.c_str(), ui::Tone::Violet); }
+                if (!opTag.empty()) { ImGui::SameLine(0.f, ui::px(6)); ui::badge(opTag.c_str(), ui::Tone::Violet); }
 
                 char rightMetrics[96]{};
-                std::snprintf(rightMetrics, sizeof rightMetrics, "%s  ·  %s/s  ·  %.1f%%",
+                std::snprintf(rightMetrics, sizeof rightMetrics, "%s · %s/s · %.1f%%",
                     formatDamageNumber(dmg).c_str(), formatDamageNumber(dps).c_str(), share * 100.0);
                 ui::pushBold();
-                const float rmW = ImGui::CalcTextSize(rightMetrics).x;
-                ImGui::SetCursorScreenPos({barMin.x + barW - rmW - ui::px(10), barMin.y + (barH - ImGui::GetTextLineHeight()) * 0.5f});
-                ImGui::PushStyleColor(ImGuiCol_Text, idx == 0 ? ui::kAccent : ui::kText);
+                ui::alignRight(ImGui::CalcTextSize(rightMetrics).x);
+                ImGui::PushStyleColor(ImGuiCol_Text, idx == 0 ? ui::md.primary : ui::md.onSurface);
                 ImGui::TextUnformatted(rightMetrics);
                 ImGui::PopStyleColor();
                 ui::popBold();
 
-                ImGui::SetCursorScreenPos({barMin.x, barMin.y + barH + ui::px(6)});
+                // Clean Material 3 linear contribution bar
+                ui::vspace(ui::px(5));
+                const ImVec2 bo = ImGui::GetCursorScreenPos();
+                const float bw = ImGui::GetContentRegionAvail().x;
+                ui::drawProgressBar(ImGui::GetWindowDrawList(), bo, {bo.x + bw, bo.y + ui::px(7)},
+                    ratio, ui::u32(rCol), ui::u32(ui::md.surfaceContainerHighest));
+                ImGui::Dummy({bw, ui::px(9)});
+
                 ui::pushNote();
-                ui::dim("命中 %llu  ·  暴击率 %.1f%%  ·  最高单次 %s  ·  击杀 %llu  ·  承伤 %s",
+                ui::muted("命中 %llu · 暴击率 %.1f%% · 最高单次 %s · 击杀 %llu · 承伤 %s",
                     static_cast<unsigned long long>(hits), critRate * 100.0,
                     formatDamageNumber(maxHit).c_str(), static_cast<unsigned long long>(kills),
                     formatDamageNumber(taken).c_str());
 
-                // Element damage breakdown pills
+                // Clean Material 3 element breakdown pills
                 const auto byType = p.value("by_type", json::object());
                 if (byType.is_object() && !byType.empty() && dmg > 0.0) {
-                    ui::vspace(ui::px(4));
+                    ui::vspace(ui::px(5));
                     std::vector<std::pair<std::string, double>> elems;
                     for (auto it = byType.begin(); it != byType.end(); ++it) {
                         if (it.value().is_number() && it.value().get<double>() > 0.0) elems.emplace_back(it.key(), it.value().get<double>());
                     }
                     std::sort(elems.begin(), elems.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                    ImDrawList* d = ImGui::GetWindowDrawList();
                     bool first = true;
                     for (const auto& [ek, ev] : elems) {
                         if (!first) ImGui::SameLine(0.f, ui::px(6));
@@ -1703,17 +1694,14 @@ struct Ui {
                         const ImVec4 ec = ui::damageElementColor(ek);
                         const ImVec2 eo = ImGui::GetCursorScreenPos();
                         const ImVec2 es = ImGui::CalcTextSize(elBuf);
-                        const ImVec2 em{eo.x + es.x + ui::px(12), eo.y + es.y + ui::px(4)};
-                        d->AddRectFilled(eo, em, ui::u32(ec, 0.14f), ui::px(4));
-                        d->AddRect(eo, em, ui::u32(ec, 0.40f), ui::px(4));
-                        d->AddText({eo.x + ui::px(6), eo.y + ui::px(2)}, ui::u32(ec), elBuf);
-                        ImGui::Dummy({em.x - eo.x, em.y - eo.y});
+                        const float eh = es.y + ui::px(5);
+                        const ImVec2 em{eo.x + es.x + ui::px(14), eo.y + eh};
+                        d->AddRectFilled(eo, em, ui::u32(ec, ui::md.dark ? 0.18f : 0.11f), eh * 0.5f);
+                        d->AddText({eo.x + ui::px(7), eo.y + ui::px(2.5f)}, ui::u32(ec), elBuf);
+                        ImGui::Dummy({em.x - eo.x, eh});
                     }
                 }
                 ui::popNote();
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
-                ui::vspace(ui::px(7));
                 ImGui::PopID();
                 ++idx;
             }
@@ -1721,13 +1709,10 @@ struct Ui {
         ui::cardEnd();
     }
 
-    // ---- PAGE 3: 房间聊天 --------------------------------------------------
+    // ---- PAGE 3: 房间聊天 (Google Messages / Chat Material 3 Style) --------
     void pageChat() {
-        ui::sectionHeader("房间聊天", online() ? "Enter 快捷发送" : "离线不可发送", ui::Tone::Accent);
-        const float bottomReserve = ui::px(98);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::kWell);
-        ImGui::PushStyleColor(ImGuiCol_Border, ui::kLine);
-        ImGui::BeginChild("##messages", {0.f, -bottomReserve}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+        const float bottomReserve = ui::px(116);
+        ui::cardBegin("##chat_surface", "房间聊天", {0.f, -bottomReserve}, online() ? "Enter 快捷发送" : "离线时不可发送消息");
         const auto lines = state.value("chat", json::array());
         if (lines.empty()) {
             ui::emptyState("还没有聊天记录", "加入房间后可以和队友沟通，或在游戏内直接按 Enter 打字。");
@@ -1739,40 +1724,39 @@ struct Ui {
                 ui::pushNote();
                 ui::muted("·  %s", str(line, "text").c_str());
                 ui::popNote();
-                ui::vspace(ui::px(2));
+                ui::vspace(ui::px(4));
                 continue;
             }
             ui::pushBold();
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::kAccent);
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::md.primary);
             ImGui::TextUnformatted((str(line, "name", "玩家") + "：").c_str());
             ImGui::PopStyleColor();
             ui::popBold();
-            ImGui::SameLine(0.f, ui::px(2));
+            ImGui::SameLine(0.f, ui::px(4));
             ImGui::PushTextWrapPos(0.f);
             ImGui::TextWrapped("%s", str(line, "text").c_str());
             ImGui::PopTextWrapPos();
-            ui::vspace(ui::px(3));
+            ui::vspace(ui::px(5));
         }
         if (newest != lastChat) { ImGui::SetScrollHereY(1.0f); lastChat = newest; }
-        ImGui::EndChild();
-        ImGui::PopStyleColor(2);
+        ui::cardEnd();
 
-        // Quick tactical phrases
-        ui::vspace(ui::px(6));
+        // Quick tactical phrases (Material 3 Assist Chips)
+        ui::vspace(ui::px(10));
         ImGui::BeginDisabled(!online());
         static const char* phrases[] = {"准备开怪", "等一下技力", "终结技已就绪", "传送过来集合"};
         for (int i = 0; i < 4; ++i) {
-            if (i > 0) ImGui::SameLine(0.f, ui::px(6));
-            if (ui::chipButton(phrases[i], ui::Tone::Neutral)) act({{"action", "chat"}, {"text", phrases[i]}});
+            if (i > 0) ImGui::SameLine(0.f, ui::px(8));
+            if (ui::actionChip(phrases[i], ui::Tone::Neutral)) act({{"action", "chat"}, {"text", phrases[i]}});
         }
-        ImGui::SameLine(0.f, ui::px(6));
-        if (ui::chipButton("播报伤害统计", ui::Tone::Accent)) act({{"action", "combat_stats_share"}});
-
-        ui::vspace(ui::px(6));
-        ImGui::SetNextItemWidth(-ui::px(98));
-        bool send = ImGui::InputTextWithHint("##chat", "输入消息，按 Enter 发送…", chat, sizeof chat, ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine(0.f, ui::px(8));
-        send |= ui::primaryButton("发送", {-1.f, ui::px(32)});
+        if (ui::actionChip("播报伤害统计", ui::Tone::Primary)) act({{"action", "combat_stats_share"}});
+
+        ui::vspace(ui::px(8));
+        ImGui::SetNextItemWidth(-ui::px(104));
+        bool send = ImGui::InputTextWithHint("##chat", "输入消息，按 Enter 发送…", chat, sizeof chat, ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine(0.f, ui::px(10));
+        send |= ui::filledButton("发送", {-1.f, ui::px(36)});
         if (send && *chat) {
             act({{"action", "chat"}, {"text", chat}});
             chat[0] = 0;
@@ -1781,13 +1765,13 @@ struct Ui {
         ImGui::EndDisabled();
     }
 
-    // ---- PAGE 4: 外观与设置 ------------------------------------------------
+    // ---- PAGE 4: 外观与设置 (Pixel / Android Settings Material 3 Cards) ----
     void pageSettings() {
-        const float half = (ImGui::GetContentRegionAvail().x - ui::px(12)) * 0.5f;
+        const float half = (ImGui::GetContentRegionAvail().x - ui::px(14)) * 0.5f;
 
-        // Top 2-column row: Identity/Keys + HUD Appearance
+        // Top 2-column row: Identity/Keys + Appearance & HUD
         ImGui::BeginGroup();
-        ui::cardBegin("##set_player", "玩家身份与快捷键", {half, 0.f}, ui::Tone::Accent);
+        ui::cardBegin("##set_player", "玩家身份与快捷键", {half, 0.f});
         ui::fieldLabel("显示名称", "默认读取游戏昵称");
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##name", name, sizeof name)) nameEdited = true;
@@ -1811,71 +1795,73 @@ struct Ui {
         ImGui::SetNextItemWidth(ui::px(150));
         if (ImGui::Combo("##dmgkey", &rstIdx, keys + 1, 12)) damageResetKey = VK_F1 + rstIdx;
 
-        ui::vspace(ui::px(10));
-        if (ui::primaryButton("保存名称与快捷键", {-1.f, ui::px(34)})) saveSettings();
+        ui::vspace(ui::px(12));
+        if (ui::filledButton("保存名称与快捷键", {-1.f, ui::px(38)})) saveSettings();
         ui::cardEnd();
         ImGui::EndGroup();
 
-        ImGui::SameLine(0.f, ui::px(12));
+        ImGui::SameLine(0.f, ui::px(14));
 
         ImGui::BeginGroup();
-        ui::cardBegin("##set_hud", "悬浮窗与 HUD 外观", {half, 0.f}, ui::Tone::Info);
+        ui::cardBegin("##set_hud", "外观与悬浮 HUD", {half, 0.f});
         bool changed = false;
+        changed |= ui::toggleSwitch("sw_darkmode", &darkMode, "菜单深色主题（Material 3 Dark）", "也可以点击右上角月亮/太阳图标一键切换。");
         changed |= ui::toggleSwitch("sw_markers", &markers, "显示玩家头顶标记与边缘箭头");
-        changed |= ui::toggleSwitch("sw_teamhud", &showTeamHud, "显示右侧队友状态 HUD", "展示队友血量条、终结技能量、当前干员与距离。");
+        changed |= ui::toggleSwitch("sw_teamhud", &showTeamHud, "显示右侧队友信息列表", "沿用清爽无框浮动样式，附带极细血量与终结技能量条。");
         changed |= ui::toggleSwitch("sw_dmghud", &showDamageHud, "显示实时悬浮伤害小窗", "按住 Alt 可拖动窗口位置或点击重置。");
-        changed |= ui::toggleSwitch("sw_atbhud", &showAtbHud, "显示共享技力条同步提示", "开启共用技力池时在顶部展示同步条与消耗/回复播报。");
-        changed |= ui::toggleSwitch("sw_compact", &hudCompact, "HUD 紧凑模式", "缩小悬浮窗与队友栏尺寸，减少画面遮挡。");
+        changed |= ui::toggleSwitch("sw_atbhud", &showAtbHud, "显示共享技力条同步提示", "开启共用技力池时在顶部展示分段技力条与消耗/回复播报。");
+        changed |= ui::toggleSwitch("sw_compact", &hudCompact, "HUD 紧凑模式", "隐藏附加微条、缩窄悬浮小窗以减少遮挡。");
         changed |= ui::toggleSwitch("sw_autorst", &damageAutoReset, "脱战 15 秒后自动开启新一轮伤害统计");
-        ui::fieldLabel("HUD 背景透明度");
+        ui::fieldLabel("HUD 透明度");
         ImGui::SetNextItemWidth(-1);
         int opPct = int(std::round(hudOpacity * 100.f));
         if (ImGui::SliderInt("##hudop", &opPct, 30, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) {
             hudOpacity = float(opPct) / 100.f;
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) changed = true;
-        ui::vspace(ui::px(4));
-        if (ui::secondaryButton("重置悬浮伤害小窗位置", {-1.f, ui::px(30)})) {
+        ui::vspace(ui::px(8));
+        if (ui::outlinedButton("重置悬浮伤害小窗位置", {-1.f, ui::px(34)})) {
             resetHudPosRequested = true;
             say("已重置悬浮窗位置", false);
         }
         ui::cardEnd();
         ImGui::EndGroup();
 
-        ui::vspace(ui::px(12));
+        ui::vspace(ui::px(14));
 
         // Bottom 2-column row: Coop Sync Switches + Emergency/Testing Tools
         ImGui::BeginGroup();
-        ui::cardBegin("##set_coop", "联机画面与战斗同步（即时生效）", {half, 0.f}, ui::Tone::Success);
+        ui::cardBegin("##set_coop", "联机画面与战斗同步", {half, 0.f}, "勾选项修改后立即生效");
         changed |= ui::toggleSwitch("sw_remote", &remote, "显示其他玩家的角色");
         ImGui::BeginDisabled(!remote);
-        changed |= ui::toggleSwitch("sw_squad", &squad, "显示其他玩家队伍中的其余三名干员");
+        changed |= ui::toggleSwitch("sw_squad", &squad, "同时显示队友队伍中的另外三名干员");
         changed |= ui::toggleSwitch("sw_replay", &replay, "重放其他玩家的技能动作、武器与特效");
-        changed |= ui::toggleSwitch("sw_outline", &outline, "给队友角色添加高亮描边");
+        changed |= ui::toggleSwitch("sw_outline", &outline, "给队友角色添加轮廓描边");
         ImGui::EndDisabled();
+        ImGui::Separator();
+        ui::vspace(ui::px(6));
         changed |= ui::toggleSwitch("sw_follow", &follow, "作为房客时跟随房主地图");
         changed |= ui::toggleSwitch("sw_combat", &combat, "同步战斗（共同攻击房主世界敌人）");
         ui::cardEnd();
         ImGui::EndGroup();
 
-        ImGui::SameLine(0.f, ui::px(12));
+        ImGui::SameLine(0.f, ui::px(14));
 
         ImGui::BeginGroup();
-        ui::cardBegin("##set_tools", "应急脱离与测试工具", {half, 0.f}, ui::Tone::Warning);
-        if (ui::secondaryButton("应急回到四号谷地", {-1.f, ui::px(34)})) act({{"action", "emergency_home"}});
-        ui::vspace(ui::px(4));
-        ui::hint("先离开当前房间，再通过游戏官方传送回到四号谷地枢纽。");
-        const auto teleport = state.value("game", json::object()).value("world_replication", json::object()).value("official_teleport", json::object());
-        if (teleport.contains("error")) {
+        ui::cardBegin("##set_tools", "应急脱离与测试工具", {half, 0.f});
+        ui::hint("若房客场景异常，可先安全退出房间并通过官方传送回到四号谷地枢纽。");
+        ui::vspace(ui::px(8));
+        if (ui::tonalButton("应急回到四号谷地", {-1.f, ui::px(36)})) act({{"action", "emergency_home"}});
+        const auto tp = state.value("game", json::object()).value("world_replication", json::object()).value("official_teleport", json::object());
+        if (tp.contains("error")) {
             ui::vspace(ui::px(6));
-            ui::noticeBanner(ui::Tone::Danger, ("官方传送失败：" + str(teleport, "error")).c_str());
+            ui::noticeBanner(ui::Tone::Error, ("官方传送失败：" + str(tp, "error")).c_str());
         }
-        ui::vspace(ui::px(10));
+        ui::vspace(ui::px(12));
         ImGui::Separator();
         ui::vspace(ui::px(8));
         bool invincible = state.value("testing_invincible", false);
-        if (ui::toggleSwitch("sw_invincible", &invincible, "测试：本机角色无敌",
-            "会保存并在重启后保持。作废本机干员受到的伤害，仅供联机测试。")) {
+        if (ui::toggleSwitch("sw_invincible", &invincible, "测试：本机角色无敌", "仅作用于本机干员，不影响队友替身或怪物；重启后保持。")) {
             act({{"action", "testing_invincible"}, {"enabled", invincible}});
         }
         ui::cardEnd();
@@ -1884,102 +1870,110 @@ struct Ui {
         if (changed) applySwitches();
     }
 
-    // ---- PAGE 5: 运行诊断 --------------------------------------------------
+    // ---- PAGE 5: 运行诊断 (Android About / Diagnostics Card Layout) --------
     void pageDiagnostics() {
         const auto g = state.value("game", json::object());
         const auto native = g.value("world_replication", json::object());
         const auto world = state.value("world_session", json::object());
         const auto entry = world.value("entry", json::object());
         const auto combatState = native.value("combat", json::object());
-        const auto squadState = combatState.value("squad", json::object());
-        const auto& atbState = liveSharedAtb();
-        const auto traffic = state.value("traffic", json::object());
+        const auto squadState = combatState.value("squad", native.value("squad", json::object()));
+        const auto& atb = liveSharedAtb();
         auto num = [](const json& j, const char* k) { return std::to_string(j.value(k, std::uint64_t(0))); };
 
-        const float half = (ImGui::GetContentRegionAvail().x - ui::px(12)) * 0.5f;
+        const float half = (ImGui::GetContentRegionAvail().x - ui::px(14)) * 0.5f;
 
         ImGui::BeginGroup();
-        ui::cardBegin("##diag_game", "游戏接入与钩子状态", {half, 0.f}, ui::Tone::Accent);
-        if (ImGui::BeginTable("##dg", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+        ui::cardBegin("##diag_hooks", "游戏接入与钩子状态", {half, 0.f});
+        if (ImGui::BeginTable("##dh", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("k", 0, 1.0f); ImGui::TableSetupColumn("v", 0, 1.8f);
             ui::kvRow("游戏接入", state.value("hook_ready", false) ? "已连接" : "等待场景", state.value("hook_ready", false) ? ui::Tone::Success : ui::Tone::Warning);
             ui::kvRow("地图 / 关卡", str(g, "map_id", "—") + " / " + str(g, "level_id", "—"));
-            ui::kvRow("本机角色", g.value("local_valid", false) ? ("已读取（骨骼 " + std::to_string(g.value("local_bones", 0)) + "）") : "未读取", g.value("local_valid", false) ? ui::Tone::Success : ui::Tone::Warning);
+            ui::kvRow("本机角色", g.value("local_valid", false) ? ("已读取（骨骼 " + std::to_string(g.value("local_bones", 0)) + "）") : "未读取",
+                g.value("local_valid", false) ? ui::Tone::Success : ui::Tone::Warning);
             ui::kvRow("共享世界", str(entry, "phase", "offline"), entry.value("active", false) ? ui::Tone::Success : ui::Tone::Warning);
             ui::kvRow("房客隔离", native.value("guest_policy", json::object()).value("ready", false) ? "就绪" : str(native.value("guest_policy", json::object()), "error", "—"));
-            ui::kvRow("战斗过滤", state.value("op_filter_ready", false) ? "就绪" : str(state, "op_filter_note", "—"), state.value("op_filter_ready", false) ? ui::Tone::Success : ui::Tone::Warning);
-            const bool atbHooks = state.value("atb_cost_hook_ready", false) && state.value("atb_set_hook_ready", false);
-            ui::kvRow("技力条钩子", atbHooks ? "就绪 (Cost/Set/Update/Reset)" : "等待游戏初始化", atbHooks ? ui::Tone::Success : ui::Tone::Warning);
+            ui::kvRow("战斗过滤", state.value("op_filter_ready", false) ? "就绪" : str(state, "op_filter_note", "—"),
+                state.value("op_filter_ready", false) ? ui::Tone::Success : ui::Tone::Warning);
+            const bool atbReady = state.value("atb_cost_hook_ready", false) && state.value("atb_set_hook_ready", false);
+            ui::kvRow("技力条钩子", atbReady ? "就绪 (Cost/Set/Update/Reset)" : "等待挂接", atbReady ? ui::Tone::Success : ui::Tone::Warning);
             ui::kvRow("版本", "EF Link " EFLINK_VERSION " · Windows x64");
             ImGui::EndTable();
         }
         ui::cardEnd();
         ImGui::EndGroup();
 
-        ImGui::SameLine(0.f, ui::px(12));
+        ImGui::SameLine(0.f, ui::px(14));
 
         ImGui::BeginGroup();
-        ui::cardBegin("##diag_sync", "战斗、技力与网络同步", {half, 0.f}, ui::Tone::Info);
-        if (ImGui::BeginTable("##ds", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+        ui::cardBegin("##diag_net", "战斗、技力与网络同步", {half, 0.f});
+        if (ImGui::BeginTable("##dn", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("k", 0, 1.0f); ImGui::TableSetupColumn("v", 0, 1.8f);
             ui::kvRow("敌人同步", num(native, "matched") + " 已同步 / " + num(native, "missing") + " 缺失");
             ui::kvRow("命中结算", num(combatState, "guest_hits_sent") + " 发出 / " + num(combatState, "room_hits_applied") + " 结算");
             ui::kvRow("技能重放", num(combatState, "player_casts_sent") + " 发 / " + num(combatState, "player_casts_mirrored") + " 播 / " + num(combatState, "player_casts_rejected") + " 拒");
-            ui::kvRow("共享技力", (atbState.value("active", false) ? std::string("启用 · ") : std::string("关闭 · ")) +
-                "同步 " + num(atbState, "syncs_sent") + "/" + num(atbState, "syncs_applied") + " · 增量 " + num(atbState, "deltas_sent") + "/" + num(atbState, "deltas_applied"));
+            ui::kvRow("共享技力", std::string(atb.value("active", false) ? "启用" : "未启用") + " · 同步 " +
+                num(atb, "syncs_sent") + "/" + num(atb, "syncs_applied") + " · 增量 " + num(atb, "deltas_sent") + "/" + num(atb, "deltas_applied"));
             ui::kvRow("队伍成员", num(squadState, "poses_sent") + " 发出 / " + num(squadState, "poses_in") + " 收到 / " + std::to_string(squadState.value("remote", json::array()).size()) + " 远端");
             ui::kvRow("网络延迟", std::to_string(state.value("rtt_ms", 0u)) + " ms");
-            if (traffic.value("tcp_only_links", 0u) > 0)
-                ui::kvRow("UDP 状态", std::to_string(traffic.value("tcp_only_links", 0u)) + " 条走 TCP 备用", ui::Tone::Warning);
-            else
+            const auto traffic = state.value("traffic", json::object());
+            if (traffic.value("tcp_only_links", 0u) > 0) {
+                ui::kvRow("UDP 状态", std::to_string(traffic.value("tcp_only_links", 0u)) + " 条连接走 TCP 备用通道", ui::Tone::Warning);
+            } else {
                 ui::kvRow("UDP 状态", traffic.value("udp_links", 0u) > 0 ? "已连通" : "—", traffic.value("udp_links", 0u) > 0 ? ui::Tone::Success : ui::Tone::Neutral);
-            const auto gui = state.value("gui_render", json::object());
-            ui::kvRow("界面后端", str(gui, "backend") + " · " + num(gui, "frames") + " 帧");
+            }
+            const auto guiInfo = state.value("gui_render", json::object());
+            ui::kvRow("界面后端", str(guiInfo, "backend", "overlay_dcomp") + " · " + num(guiInfo, "frames") + " 帧");
             ImGui::EndTable();
         }
         ui::cardEnd();
         ImGui::EndGroup();
 
-        // Any active error banners
-        bool hasErrors = false;
-        for (const auto& e : {str(world, "error"), str(native, "error"), str(g, "error"), str(state, "last_error"),
-                              str(combatState, "player_cast_error"), str(squadState, "error"), str(atbState, "error")}) {
-            if (!e.empty()) {
-                if (!hasErrors) { ui::vspace(ui::px(10)); hasErrors = true; }
-                ui::noticeBanner(ui::Tone::Danger, e.c_str());
-                ui::vspace(ui::px(5));
-            }
+        std::vector<std::string> errors;
+        for (const auto& e : {str(world, "error"), str(native, "error"), str(g, "error"), str(state, "last_error"), str(atb, "error"), str(combatState, "player_cast_error")}) {
+            if (!e.empty()) errors.push_back(e);
+        }
+        if (!errors.empty()) {
+            ui::vspace(ui::px(14));
+            ui::cardBegin("##diag_err", "最近异常日志", {0.f, 0.f});
+            for (const auto& e : errors) { ui::noticeBanner(ui::Tone::Error, e.c_str()); ui::vspace(ui::px(6)); }
+            ui::cardEnd();
         }
     }
 
-    // ---- Modal Confirmation Popups -----------------------------------------
+    // ---- Material 3 Alert Dialogs (28px rounded, right-aligned buttons) ----
     void popups() {
         if (leaveConfirm) { ImGui::OpenPopup("##leave"); leaveConfirm = false; }
         if (kickPending)  { ImGui::OpenPopup("##kick");  kickPending = false; }
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(22), ui::px(18)});
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(24), ui::px(22)});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ui::px(26));
         if (ImGui::BeginPopupModal("##leave", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
             ui::pushTitle();
             ImGui::TextUnformatted(role() == "host" ? "关闭房间？" : "离开房间？");
             ui::popTitle();
-            ui::vspace(ui::px(6));
-            ui::dim("%s", role() == "host" ? "所有玩家都会断开连接并结束本次联机。" : "将断开连接并自动回到进入房间前的位置。");
-            ui::vspace(ui::px(14));
-            if (ui::dangerButton("确认", {ui::px(120), ui::px(34)})) { act({{"action", "leave"}}); ImGui::CloseCurrentPopup(); }
+            ui::vspace(ui::px(8));
+            ui::muted("%s", role() == "host" ? "关闭后房间内所有玩家都会断开连接。" : "离开后将自动返回进入房间前的位置。");
+            ui::vspace(ui::px(20));
+            ui::alignRight(ui::px(176));
+            if (ui::textButton("取消", {ui::px(76), ui::px(36)})) ImGui::CloseCurrentPopup();
             ImGui::SameLine(0.f, ui::px(8));
-            if (ui::secondaryButton("取消", {ui::px(120), ui::px(34)})) ImGui::CloseCurrentPopup();
+            if (ui::dangerButton("确认", {ui::px(92), ui::px(36)})) { act({{"action", "leave"}}); ImGui::CloseCurrentPopup(); }
             ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal("##kick", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
             ui::pushTitle();
-            ImGui::Text("移出 %s (#%d)？", kickName.c_str(), kickId);
+            ImGui::Text("移出玩家 #%d？", kickId);
             ui::popTitle();
-            ui::vspace(ui::px(14));
-            if (ui::dangerButton("移出", {ui::px(120), ui::px(34)})) { act({{"action", "kick"}, {"id", kickId}}); kickId = -1; ImGui::CloseCurrentPopup(); }
+            if (!kickName.empty()) { ui::vspace(ui::px(6)); ui::muted("将断开与 %s 的联机连接。", kickName.c_str()); }
+            ui::vspace(ui::px(20));
+            ui::alignRight(ui::px(176));
+            if (ui::textButton("取消", {ui::px(76), ui::px(36)})) { kickId = -1; ImGui::CloseCurrentPopup(); }
             ImGui::SameLine(0.f, ui::px(8));
-            if (ui::secondaryButton("取消", {ui::px(120), ui::px(34)})) { kickId = -1; ImGui::CloseCurrentPopup(); }
+            if (ui::dangerButton("移出", {ui::px(92), ui::px(36)})) { act({{"action", "kick"}, {"id", kickId}}); kickId = -1; ImGui::CloseCurrentPopup(); }
             ImGui::EndPopup();
         }
-        ImGui::PopStyleVar();
+        ImGui::PopStyleVar(2);
     }
 };
 
@@ -2211,7 +2205,7 @@ void Gui::runOverlay(json) {
         io.IniFilename = nullptr; io.LogFilename = nullptr;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         const float displayScale = ui::scaleForHeight(unsigned(client.bottom));
-        ui::applyTheme(displayScale);
+        ui::applyTheme(displayScale, false);
         ui::fonts = ui::loadFonts(io.Fonts, displayScale);
         io.FontDefault = ui::fonts.body;
 
@@ -2219,6 +2213,7 @@ void Gui::runOverlay(json) {
         ImGui_ImplDX11_Init(surface.device.Get(), surface.context.Get());
 
         Ui ui;
+        ui.displayScale = displayScale;
         ui.post = [this](const json& input) { return post(input); };
         overlayReady = true;
         bool keyDown = false, enterDown = false, pvpKeyDown = false, dmgResetDown = false;
@@ -2315,12 +2310,13 @@ void Gui::runPreview(Request handler, json options) {
         throw std::runtime_error("预览渲染器创建失败");
     }
 
+    const bool previewDark = options.value("preview_dark", false);
     IMGUI_CHECKVERSION();
     auto* context = ImGui::CreateContext();
     ImGui::SetCurrentContext(context);
     auto& io = ImGui::GetIO();
     io.IniFilename = nullptr; io.LogFilename = nullptr;
-    ui::applyTheme(1.0f);
+    ui::applyTheme(1.0f, previewDark);
     ui::fonts = ui::loadFonts(io.Fonts, 1.0f);
     io.FontDefault = ui::fonts.body;
 
@@ -2329,10 +2325,13 @@ void Gui::runPreview(Request handler, json options) {
 
     std::string demoRole = str(options, "preview_demo");
     if (options.value("preview_hud", false) && demoRole.empty()) demoRole = "host";
-    json demoState = demoRole.empty() ? json() : demoStatus(demoRole);
+    json demoState = demoRole.empty() ? json() : demoStatus(demoRole, previewDark);
     json demoHudData = demoRole.empty() ? json() : demoHud(demoState);
 
     Ui ui;
+    ui.displayScale = 1.0f;
+    ui.darkMode = previewDark;
+    ui.appliedDarkMode = previewDark;
     ui.post = [handler, demoRole, demoState, demoHudData](const json& input) {
         std::promise<json> p;
         try {
@@ -2371,12 +2370,12 @@ void Gui::runPreview(Request handler, json options) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         const ImVec2 size{float(surface.width), float(surface.height)};
-        // In HUD-only preview or when menu is closed, show full HUD; when menu is open in preview, show clean backdrop + menu.
         if (!ui.open) ui.drawHud(size);
         if (ui.open) ui.drawMenu(size);
         if (ui.closeRequested) ui.closeRequested = false;
         ImGui::Render();
-        const float clear[4]{0.065f, 0.080f, 0.100f, 1.0f};
+        // Neutral game-like dark backdrop so transparent HUD and Material 3 floating sheet read clearly.
+        const float clear[4]{0.09f, 0.11f, 0.13f, 1.0f};
         const bool doCapture = !capture.empty() && overlayFrames >= 8 && now() - started > 600;
         const std::filesystem::path capturePath = doCapture
             ? std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(capture.data()), capture.size()))

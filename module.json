@@ -22,6 +22,7 @@
     "hud_opacity": 0.86,
     "damage_auto_reset": false,
     "damage_reset_key": 120,
+    "menu_dark_mode": false,
     "room_name": "",
     "max_players": 8,
     "port": 47615,

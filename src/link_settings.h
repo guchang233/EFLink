@@ -32,7 +32,7 @@ inline std::filesystem::path settingsPath() {
 inline void validateSettings(const nlohmann::json& j) {
     if(!j.is_object()) throw std::runtime_error("configuration must be an object");
     for(auto key:{"player_name","room_name"}) if(j.contains(key)&&(!j[key].is_string()||j[key].get<std::string>().size()>64)) throw std::runtime_error(std::string(key)+": max 64 UTF-8 bytes");
-    for(auto key:{"show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","testing_invincible","room_pvp","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","damage_auto_reset","player_name_custom","gui_enabled","preview_mode","window_menu"}) if(j.contains(key)&&!j[key].is_boolean()) throw std::runtime_error(std::string(key)+": expected boolean");
+    for(auto key:{"show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","testing_invincible","room_pvp","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","damage_auto_reset","menu_dark_mode","player_name_custom","gui_enabled","preview_mode","window_menu"}) if(j.contains(key)&&!j[key].is_boolean()) throw std::runtime_error(std::string(key)+": expected boolean");
     if(j.contains("room_pvp_scale")&&(!j["room_pvp_scale"].is_number()||j["room_pvp_scale"].get<double>()<0.1||j["room_pvp_scale"].get<double>()>5.0)) throw std::runtime_error("PVP 伤害倍率须为 0.1–5.0");
     if(j.contains("hud_opacity")&&(!j["hud_opacity"].is_number()||j["hud_opacity"].get<double>()<0.25||j["hud_opacity"].get<double>()>1.0)) throw std::runtime_error("HUD 透明度须为 0.25–1.0");
     const auto port=j.value("port",47615);if(port<1024||port>65535||port==47616) throw std::runtime_error("端口须为 1024–65535，且不能使用发现端口 47616");
@@ -55,7 +55,7 @@ inline void writeSettings(const nlohmann::json& config) {
     auto temp=path;temp+=L".tmp";
     // Persist only player preferences; never persist passwords, automatic joins or test options.
     nlohmann::json saved=nlohmann::json::object();
-    for(auto key:{"player_name","room_name","max_players","port","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","testing_invincible","room_pvp","room_pvp_scale","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","hud_opacity","damage_auto_reset","damage_reset_key","player_name_custom","menu_key","pvp_key","saved_servers"}) if(config.contains(key)) saved[key]=config[key];
+    for(auto key:{"player_name","room_name","max_players","port","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","sync_combat","testing_invincible","room_pvp","room_pvp_scale","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","hud_opacity","damage_auto_reset","damage_reset_key","menu_dark_mode","player_name_custom","menu_key","pvp_key","saved_servers"}) if(config.contains(key)) saved[key]=config[key];
     saved["menu_key_revision"]=kMenuKeyRevision;
     {std::ofstream out(temp,std::ios::binary|std::ios::trunc);out<<saved.dump(2);out.flush();if(!out) throw std::runtime_error("无法保存联机设置");}
     if(!MoveFileExW(temp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) throw std::runtime_error("无法更新联机设置");
