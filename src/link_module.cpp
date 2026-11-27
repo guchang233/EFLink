@@ -507,10 +507,14 @@ void __fastcall onCreateServerOp(void* reporter,int type,void* data,const std::u
     }
     if(nextCreateOp)nextCreateOp(reporter,type,data,owner,info);
 }
+bool isExecutableCode(const MEMORY_BASIC_INFORMATION& mbi) {
+    constexpr DWORD kExec=PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY;
+    return mbi.State==MEM_COMMIT&&(mbi.Protect&kExec)!=0&&(mbi.Protect&(PAGE_GUARD|PAGE_NOACCESS))==0;
+}
 std::map<std::uintptr_t,int> directCalls(const void* code) {
     std::map<std::uintptr_t,int> calls;if(!code)return calls;
     auto* p=static_cast<const unsigned char*>(code);
-    MEMORY_BASIC_INFORMATION mbi{};if(!VirtualQuery(p,&mbi,sizeof mbi))return calls;
+    MEMORY_BASIC_INFORMATION mbi{};if(!VirtualQuery(p,&mbi,sizeof mbi)||!isExecutableCode(mbi))return calls;
     const auto end=reinterpret_cast<const unsigned char*>(mbi.BaseAddress)+mbi.RegionSize;
     for(std::size_t i=0;i<4096&&p+i+5<=end;++i) {
         if(p[i]==0xCC&&p[i+1]==0xCC)break; // padding after the function
@@ -521,7 +525,7 @@ std::map<std::uintptr_t,int> directCalls(const void* code) {
 // Bytes up to the int3 padding that follows a function (bounded).
 std::size_t codeLength(const void* code) {
     auto* p=static_cast<const unsigned char*>(code);MEMORY_BASIC_INFORMATION mbi{};
-    if(!p||!VirtualQuery(p,&mbi,sizeof mbi))return 0;
+    if(!p||!VirtualQuery(p,&mbi,sizeof mbi)||!isExecutableCode(mbi))return 0;
     const auto end=reinterpret_cast<const unsigned char*>(mbi.BaseAddress)+mbi.RegionSize;
     std::size_t i=0;while(i<8192&&p+i+1<end&&!(p[i]==0xCC&&p[i+1]==0xCC))++i;return i;
 }
