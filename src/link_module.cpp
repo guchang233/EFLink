@@ -266,7 +266,7 @@ int __fastcall onDamage(void* ability,void* modifier,void* info) {
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
     if(!guestHit&&!cleanupRequested&&world.captureDamage(net,ability,modifier)) return 0;
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
-    auto damageStat=(!cleanupRequested&&damageScope.observe())?world.beforeDamageStat(net,ability,modifier):std::optional<eflink::World::LocalDamageStat>{};
+    auto damageStat=(!cleanupRequested&&damageScope.observe())?world.beforeDamageStat(net,ability,modifier,guestHit.has_value()):std::optional<eflink::World::LocalDamageStat>{};
     const auto result=nextDamage(ability,modifier,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
@@ -285,9 +285,12 @@ int __fastcall onTransferred(void* ability,void* modifier,bool triggerEvent,void
     eflink::DamageApplicationScope damageScope(ability,modifier);
     if(!cleanupRequested&&world.blocksActorEffect(ability,modifier))return 0;
     if(!cleanupRequested&&world.blocksLocalDamage(ability))return 0;
+    if(auto pvp=cleanupRequested?std::optional<eflink::World::PvpHit>{}:world.beforePvpHit(net,ability,modifier)) {
+        const auto result=nextTransferred(ability,modifier,triggerEvent,info);world.afterPvpHit(net,*pvp);return result;
+    }
     auto guestHit=cleanupRequested?std::optional<eflink::World::GuestHit>{}:world.beforeGuestHit(net,ability,modifier);
     auto observation=cleanupRequested?std::optional<eflink::World::DamageObservation>{}:world.beforeNativeDamage(net,ability,modifier);
-    auto damageStat=(!cleanupRequested&&damageScope.observe())?world.beforeDamageStat(net,ability,modifier):std::optional<eflink::World::LocalDamageStat>{};
+    auto damageStat=(!cleanupRequested&&damageScope.observe())?world.beforeDamageStat(net,ability,modifier,guestHit.has_value()):std::optional<eflink::World::LocalDamageStat>{};
     const auto result=nextTransferred(ability,modifier,triggerEvent,info);
     if(guestHit)world.afterGuestHit(net,*guestHit);
     if(observation)world.afterNativeDamage(net,*observation,result);
@@ -788,6 +791,7 @@ void applyConfiguration(const json& value) {
     world.sharedAtbAllowed=configuration.value("room_shared_atb",false);
     world.autoFollowHostMap=configuration.value("auto_follow_host_map",false);
     world.combatStats.autoReset=configuration.value("damage_auto_reset",false);
+    world.pvpCombatStats.autoReset=world.combatStats.autoReset;
     world.showMarkers=configuration.value("show_player_markers",true);
     session.followHost=configuration.value("follow_host_world",true);
     session.combat=configuration.value("sync_combat",true);
@@ -963,8 +967,8 @@ json perform(const json& input) {
         changed["room_shared_atb"]=enabled;applyConfiguration(changed);save=true;
         std::lock_guard lock(worldMutex);world.sharedAtbAllowed=enabled;
     }
-    else if(action=="combat_stats_reset") {std::lock_guard lock(worldMutex);world.resetCombatStats(net);}
-    else if(action=="combat_stats_share") {std::lock_guard lock(worldMutex);world.shareCombatStats(net);}
+    else if(action=="combat_stats_reset") {std::lock_guard lock(worldMutex);world.resetCombatStats(net,input.value("scope",std::string("all")));}
+    else if(action=="combat_stats_share") {std::lock_guard lock(worldMutex);world.shareCombatStats(net,input.value("scope",std::string("pve")));}
     else if(action=="pvp_key") {std::lock_guard lock(worldMutex);return world.pvpKey(net);}
     else if(action=="pvp_duel") {std::lock_guard lock(worldMutex);session.duelAction(net,input.at("op").get<std::string>(),input.at("target").get<std::uint16_t>());return json{{"ok",true}};}
     else if(action=="room_pvp") {
@@ -1011,7 +1015,7 @@ json perform(const json& input) {
     else if(action=="show_remote") {auto changed=configuration;changed["show_remote_players"]=input.at("enabled");applyConfiguration(changed);save=true;}
     else if(action=="settings") {auto changed=configuration;const auto& patch=input.at("configuration");eflink::validateSettings(patch);
         // The menu sends player_name only when the player edited the field.
-        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","auto_follow_host_map","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","hud_opacity","damage_auto_reset","damage_reset_key","menu_dark_mode","pvp_key"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
+        if(patch.contains("player_name")&&patch["player_name"].is_string()) changed["player_name_custom"]=true;for(auto key:{"player_name","room_name","max_players","port","menu_key","show_remote_players","show_remote_squad","replay_skills","outline_teammates","show_player_markers","follow_host_world","auto_follow_host_map","sync_combat","room_pvp","room_pvp_scale","room_pvp_revive","room_shared_atb","show_damage_hud","show_team_hud","show_atb_hud","hud_compact","hud_opacity","hud_style","damage_auto_reset","damage_reset_key","menu_dark_mode","pvp_key"}) if(patch.contains(key)) changed[key]=patch[key];applyConfiguration(changed);save=true;}
     else if(action=="save_server"||action=="remove_server") {
         auto address=input.at("address").get<std::string>();if(address.empty()||address.size()>256) throw std::runtime_error("请填写有效地址");
         auto servers=configuration.value("saved_servers",json::array());json updated=json::array();

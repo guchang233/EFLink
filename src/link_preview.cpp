@@ -23,6 +23,11 @@ int wmain(int argc,wchar_t** argv) {
         else if(arg==L"--tab"&&i+1<argc) tab=_wtoi(argv[++i]);
         else if(arg==L"--host") autoHost=true;
         else if(arg==L"--hud") config["preview_hud"]=true;
+        else if(arg==L"--hud-style"&&i+1<argc) {
+            std::wstring st=argv[++i];
+            std::string name;for(auto value:st) name.push_back(static_cast<char>(value));
+            config["preview_hud_style"]=name;
+        }
         else if(arg==L"--chat") config["preview_chat"]=true;
         else if(arg==L"--dark") config["preview_dark"]=true;
         else if(arg==L"--demo"&&i+1<argc) {

@@ -1412,7 +1412,12 @@ private:
         auto* parameter=runtime->object_new(runtime->context,api.klass("EntityAllocator/AllocObjParam","Gameplay.Beyond.dll","Beyond.Gameplay.Core").class_info);
         eflink::unity::Api::TemporaryRoot paramRoot(runtime,parameter);auto* raw=runtime->object_unbox(runtime->context,parameter);V3 rotation{};
         if(!raw)throw std::runtime_error("原生角色分配参数 ABI 不可用");
-        api.call(gm("EntityAllocator/AllocObjParam",".ctor","UnityEngine.Vector3|UnityEngine.Vector3"),raw,{&position,&rotation});
+        try {
+            int allocExtra=0;
+            api.call(gm("EntityAllocator/AllocObjParam",".ctor","UnityEngine.Vector3|UnityEngine.Vector3|System.Int32"),raw,{&position,&rotation,&allocExtra});
+        } catch(...) {
+            api.call(gm("EntityAllocator/AllocObjParam",".ctor","UnityEngine.Vector3|UnityEngine.Vector3"),raw,{&position,&rotation});
+        }
         actor.entity=api.call(gm("EntityAllocator","AllocateObject","Beyond.Gameplay.EntityTemplateData|System.UInt64|Beyond.Gameplay.Core.EntityAllocator.AllocObjParam|Beyond.Gameplay.LevelEntityData","Beyond.Gameplay.Core.Entity"),allocator,{entityTemplate,&actor.id,raw,nullptr});
         if(!actor.entity)throw std::runtime_error("原生角色分配失败");
         actor.entityRoot=rootOf(actor.entity);
@@ -1894,7 +1899,7 @@ private:
         // room is only admitted in the overworld.
         link.setAuthority({roomHost&&privateTargetIsolationReady,roomHost&&character!=nullptr,roomHost&&link.combat,roomHost&&character&&overworldScene()});
         if(role==Role::Offline||role==Role::Connecting||!link.followHost) {
-            if(role==Role::Offline) {vitals.clear();atbRemoteEnabled=false;atbEvents.clear();combatStats.clearMirror();}
+            if(role==Role::Offline) {vitals.clear();atbRemoteEnabled=false;atbEvents.clear();combatStats.clearMirror();pvpCombatStats.clearMirror();}
             hostMapConsent.reset();hostMapChoiceMap.clear();hostMapChoiceLevel.clear();hostMapChoiceDungeon.clear();hostMapChoiceRoom=0;
             if(!enemies.empty()||!privateEnemies.empty()||!spawnedEnemies.empty()) dropEnemies();dropActors();enemyEpoch=0;
             // Leaving the host's world returns this player to where they entered
@@ -3456,9 +3461,10 @@ private:
     float atbValue=0.f,atbMax=300.f,atbRecover=0.f;
     bool atbRemoteEnabled=false,lastSentAtbEnabled=false;
     std::string atbError;
-    // ---- Combat Damage Statistics ----
+    // ---- Combat Damage Statistics (separate PvE vs PvP tracks) ----
 public:
-    CombatStats combatStats;
+    CombatStats combatStats;    // PvE: damage against monsters
+    CombatStats pvpCombatStats; // PvP: damage against players
 private:
     std::uint64_t lastStatsPublish=0,lastPublishedStatsRev=0;
     int cachedCritFlag=-1;
@@ -3558,18 +3564,28 @@ public:
         }
         return out;
     }
-    nlohmann::json combatStatsSnapshot() const {return combatStats.snapshot(nowMs());}
-    void resetCombatStats(Net& net) {
+    nlohmann::json combatStatsSnapshot() const {
+        const auto now=nowMs();
+        auto s=combatStats.snapshot(now);
+        s["pvp"]=pvpCombatStats.snapshot(now);
+        return s;
+    }
+    void resetCombatStats(Net& net,const std::string& scope="all") {
+        const std::string norm=(scope=="pve"||scope=="pvp")?scope:std::string("all");
         if(net.currentRole()==Role::Client&&session) {
-            session->requestDamageReset(net);
+            session->requestDamageReset(net,norm);
         } else {
-            combatStats.reset(nowMs());
+            const auto now=nowMs();
+            if(norm=="pve"||norm=="all") combatStats.reset(now);
+            if(norm=="pvp"||norm=="all") pvpCombatStats.reset(now);
             lastPublishedStatsRev=0;
-            if(net.currentRole()==Role::Host&&session) session->sendDamageStats(net,combatStats.snapshot(nowMs()));
+            if(net.currentRole()==Role::Host&&session) session->sendDamageStats(net,combatStatsSnapshot());
         }
     }
-    void shareCombatStats(Net& net) {
-        const auto summary=combatStats.formatChatSummary(nowMs());
+    void shareCombatStats(Net& net,const std::string& scope="pve") {
+        const auto summary=(scope=="pvp")
+            ? pvpCombatStats.formatChatSummary(nowMs(),"PVP 伤害统计")
+            : combatStats.formatChatSummary(nowMs(),"对怪物伤害统计");
         if(net.currentRole()==Role::Host||net.currentRole()==Role::Client) net.chat(summary);
     }
 private:
@@ -3646,16 +3662,55 @@ private:
         const auto role=view.role;
         const auto now=nowMs();
         if(role==Role::Host) {
-            if(link.takeDamageResetRequested()) {combatStats.reset(now);lastPublishedStatsRev=0;}
-            for(const auto& p:view.peers) {
-                if(p.hasInfo) combatStats.updatePeerMeta(p.id,p.info.name,peerOpName(view,p.id));
+            if(auto resetScope=link.takeDamageResetScope();!resetScope.empty()) {
+                if(resetScope=="pve"||resetScope=="all") combatStats.reset(now);
+                if(resetScope=="pvp"||resetScope=="all") pvpCombatStats.reset(now);
+                lastPublishedStatsRev=0;
             }
-            if(now-lastStatsPublish>=300&&combatStats.revision()!=lastPublishedStatsRev) {
-                lastStatsPublish=now;lastPublishedStatsRev=combatStats.revision();
-                link.sendDamageStats(net,combatStats.snapshot(now));
+            for(const auto& r:link.takeDamageReports()) {
+                try {
+                    const auto category=r.value("category",std::string{});
+                    const auto attacker=r.value("attacker",std::uint16_t(0));
+                    const auto target=r.value("target",std::uint16_t(0));
+                    const double amount=r.value("amount",0.0);
+                    const bool isCrit=r.value("crit",false);
+                    const int dtype=r.value("dtype",0);
+                    const bool killed=r.value("killed",false);
+                    const bool takenOnly=r.value("taken_only",false);
+                    const auto op=r.value("op",std::string{});
+                    if(category=="pve"&&attacker) {
+                        const auto name=peerName(net,attacker);
+                        const auto opName=op.empty()?peerOpName(view,attacker):op;
+                        if(takenOnly) combatStats.recordTaken(attacker,name,opName,amount,now);
+                        else combatStats.recordHit(attacker,name,opName,amount,isCrit,dtype,killed,now);
+                    } else if(category=="pvp"&&attacker&&target) {
+                        pvpCombatStats.recordHit(attacker,peerName(net,attacker),peerOpName(view,attacker),amount,isCrit,dtype,killed,now);
+                        const auto tgtOp=op.empty()?peerOpName(view,target):op;
+                        pvpCombatStats.recordTaken(target,peerName(net,target),tgtOp,amount,now);
+                    }
+                } catch(...) {}
+            }
+            for(const auto& p:view.peers) {
+                if(p.hasInfo) {
+                    const auto op=peerOpName(view,p.id);
+                    combatStats.updatePeerMeta(p.id,p.info.name,op);
+                    pvpCombatStats.updatePeerMeta(p.id,p.info.name,op);
+                }
+            }
+            const auto combinedRev=combatStats.revision()+pvpCombatStats.revision();
+            if(now-lastStatsPublish>=300&&combinedRev!=lastPublishedStatsRev) {
+                lastStatsPublish=now;lastPublishedStatsRev=combinedRev;
+                link.sendDamageStats(net,combatStatsSnapshot());
             }
         } else if(role==Role::Client) {
-            if(auto remote=link.takeRemoteDamageStats()) combatStats.applyRemoteSnapshot(*remote);
+            if(auto remote=link.takeRemoteDamageStats()) {
+                auto pve=*remote;
+                if(pve.contains("pvp")&&pve["pvp"].is_object()) {
+                    pvpCombatStats.applyRemoteSnapshot(pve["pvp"]);
+                    pve.erase("pvp");
+                }
+                combatStats.applyRemoteSnapshot(pve);
+            }
         }
     }
     void extractModifierMeta(void* modifier,bool& isCrit,int& damageType) {
@@ -3672,22 +3727,22 @@ private:
     }
 public:
     struct LocalDamageStat {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;double before=0;bool isCrit=false;int damageType=0;bool isEnemy=false;bool isSelf=false;};
-    std::optional<LocalDamageStat> beforeDamageStat(Net& net,void* ability,void* modifier) {
+    std::optional<LocalDamageStat> beforeDamageStat(Net& net,void* ability,void* modifier,bool guestHitHandled=false) {
         try {
             if(applyingDamage||!ability||!modifier||!character) return {};
             if(!api.value<bool>(gm("AbilitySystem/Modifier","get_isDamage","","System.Boolean"),modifier)) return {};
             auto* target=api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),ability);
             if(!target) return {};
             const auto role=net.currentRole();
-            // Track self damage taken on host or offline.
-            if(target==character&&(role==Role::Host||role==Role::Offline)) {
+            if(role!=Role::Host&&role!=Role::Offline&&role!=Role::Client) return {};
+            // Track self PvE damage taken (host, offline, or client local enemy hit).
+            if(target==character) {
                 const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
                 if(!std::isfinite(before)||before<=0.0) return {};
                 return LocalDamageStat{ability,target,identityOf(target),before,false,0,false,true};
             }
-            // Only host and offline record local damage dealt to enemies directly here
-            // (guests submit enemy hits to the host, which records them in applyRoomHits).
-            if(role!=Role::Host&&role!=Role::Offline) return {};
+            // If guestHit already captures and submits this room enemy hit, skip here to avoid double-counting.
+            if(role==Role::Client&&guestHitHandled) return {};
             if(!api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),target)) return {};
             auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
             auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
@@ -3708,10 +3763,22 @@ public:
             const double after=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),stat.ability);
             const double dealt=stat.before-(std::max)(0.0,after);
             if(!std::isfinite(dealt)||dealt<=0.0) return;
+            const auto role=net.currentRole();
+            const std::string op=operatorDisplayName(localModel);
+            if(role==Role::Client) {
+                if(!session) return;
+                const auto me=net.localIdFast();
+                if(!me) return;
+                if(stat.isEnemy) {
+                    session->sendDamageReport(net,"pve",me,0,dealt,stat.isCrit,stat.damageType,after<=0.0&&stat.before>0.0,false,op);
+                } else if(stat.isSelf) {
+                    session->sendDamageReport(net,"pve",me,me,dealt,false,0,false,true,op);
+                }
+                return;
+            }
             const auto view=net.snapshot();
             const std::uint16_t selfId=view.localId?view.localId:std::uint16_t(1);
             const std::string selfName=view.localId?peerName(net,view.localId):net.name();
-            const std::string op=operatorDisplayName(localModel);
             if(stat.isEnemy) {
                 combatStats.recordHit(selfId,selfName,op,dealt,stat.isCrit,stat.damageType,after<=0.0&&stat.before>0.0,nowMs());
             } else if(stat.isSelf) {
@@ -3834,7 +3901,7 @@ private:
             bool skip=true;api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),ability,{&hp,&skip});
         }
     }
-    void applyPvpHit(Net& net,void* ability,double amount,const std::string& key) {
+    void applyPvpHit(Net& net,void* ability,double amount,const std::string& key,bool isCrit=false,int damageType=0) {
         if(!pvpActive(net)||testingInvincible||nowMs()<pvpImmuneUntil||!std::isfinite(amount)||amount<=0) {++pvpHitsIgnored;return;}
         const auto [scale,revive]=pvpRules(net);amount*=scale;
         const double before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
@@ -3852,10 +3919,25 @@ private:
         std::uint16_t attacker=0;try {attacker=std::uint16_t(std::stoul(key.substr(4)));}catch(...) {}
         if(!session||!session->duels.contains(attacker)) {++pvpHitsIgnored;return;}
         ++pvpHitsTaken;
+        auto recordSettledPvp=[&](double dealt,bool defeated) {
+            if(dealt<=0.0||!std::isfinite(dealt)) return;
+            const auto me=net.localIdFast();
+            const std::string op=operatorDisplayName(localModel);
+            if(net.currentRole()==Role::Host) {
+                const auto now=nowMs();
+                pvpCombatStats.recordHit(attacker,peerName(net,attacker),peerOpName(net,attacker),dealt,isCrit,damageType,defeated,now);
+                pvpCombatStats.recordTaken(me,peerName(net,me),op,dealt,now);
+            } else if(net.currentRole()==Role::Client&&session&&me) {
+                session->sendDamageReport(net,"pvp",attacker,me,dealt,isCrit,damageType,defeated,false,op);
+            }
+        };
         if(revive) {
             double hp=(std::max)(1.,before-amount);
+            const double dealt=(std::max)(0.,before-hp);
+            const bool defeated=hp<=1&&before>1;
             setHealth(ability,hp,false);
-            if(hp<=1&&before>1) {
+            recordSettledPvp(dealt,defeated);
+            if(defeated) {
                 ++pvpDefeats;pvpImmuneUntil=nowMs()+3000;pvpRecoverAt=nowMs()+3000;
                 pvpLastDefeat=peerName(net,attacker);net.chat("［PVP］"+pvpLastDefeat+" 击败了 "+peerName(net,net.snapshot().localId));
             }
@@ -3863,7 +3945,10 @@ private:
         }
         // No revive: the operator falls through the game's own death path.
         double hp=(std::max)(0.,before-amount);
+        const double dealt=(std::max)(0.,before-hp);
+        const bool defeated=hp<=0&&before>0;
         setHealth(ability,hp,false);
+        recordSettledPvp(dealt,defeated);
         if(hp<=0) {
             pvpDownEntity=character;pvpDownAt=nowMs();
             if(!api.value<bool>(gm("Entity","get_markDie","","System.Boolean"),character))api.call(gm("AbilitySystem","OnHpZero"),ability);
@@ -3871,7 +3956,7 @@ private:
         }
     }
 public:
-    struct PvpHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::uint16_t peer=0;double full=0,shown=0;};
+    struct PvpHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::uint16_t peer=0;double full=0,shown=0;bool isCrit=false;int damageType=0;};
     // This player's own operator (controlled or squad) damages another player's
     // stand-in: the stand-in is filled first so it never dies here, the native
     // loss is measured afterwards and sent to that player.
@@ -3889,6 +3974,7 @@ public:
             for(const auto& m:localMembers)if(m.entity&&m.entity==sourceEntity)own=true;
             if(!own)return {};
             PvpHit hit{ability,target,standIn->identity,peer};
+            extractModifierMeta(modifier,hit.isCrit,hit.damageType);
             hit.shown=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
             if(!std::isfinite(hit.shown)||!std::isfinite(hit.full)||hit.full<=0)return {};
@@ -3904,7 +3990,7 @@ public:
             // Show the hit at once; the player's own reported health corrects it.
             double shown=(std::max)(1.,hit.shown-(std::max)(0.,amount));bool skip=true;
             api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),hit.ability,{&shown,&skip});
-            if(amount>0&&session&&session->sendPlayerHit(net,hit.peer,amount,"pvp:"+std::to_string(net.snapshot().localId)))++pvpHitsSent;
+            if(amount>0&&session&&session->sendPlayerHit(net,hit.peer,amount,"pvp:"+std::to_string(net.localIdFast()),hit.isCrit,hit.damageType))++pvpHitsSent;
         }catch(const std::exception& e) {pvpError=e.what();}
     }
     std::string gameNickname;std::uint64_t lastNickname=0;
@@ -3938,7 +4024,7 @@ public:
                 if(!usable(character))continue;
                 auto* ability=api.call(gm("Entity","get_abilityCom","","Beyond.Gameplay.Core.AbilitySystem"),character);if(!ability)continue;
                 const auto key=hit.value("key",std::string{});
-                if(key.rfind("pvp:",0)==0) {applyPvpHit(net,ability,hit.at("amount").get<double>(),key);continue;}
+                if(key.rfind("pvp:",0)==0) {applyPvpHit(net,ability,hit.at("amount").get<double>(),key,hit.value("crit",false),hit.value("dtype",0));continue;}
                 // Health floor of 1: this is the player's real account operator,
                 // and room enemies are not part of the official server's world.
                 const double amt=hit.at("amount").get<double>();
@@ -3955,7 +4041,7 @@ public:
     // Guest side: an attack resolved by this player's own client on a room
     // replica. The replica is filled first so it never dies locally (the host owns
     // death and rewards); the measured loss is reported to the host.
-    struct GuestHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::string key;double before=0,full=0;bool isCrit=false;int damageType=0;};
+    struct GuestHit {void* ability=nullptr;void* target=nullptr;NativeIdentity identity;std::string key;double before=0,full=0,snapshotMaxHp=0;bool isCrit=false;int damageType=0;};
     std::optional<GuestHit> beforeGuestHit(Net& net,void* ability,void* modifier) {
         try {
             if(applyingDamage||!session||!session->combat||!session->followHost||!session->ready()||net.currentRole()!=Role::Client||!ability||!modifier||!character)return {};
@@ -3967,18 +4053,21 @@ public:
             std::string key;NativeIdentity identity;
             for(const auto& [id,e]:enemies)if(e.entity==target&&currentEnemy(e)&&roomEnemy(id)) {key=id;identity=e.identity;break;}
             if(key.empty())return {};
-            bool live=false;for(const auto& e:hosted.at("entities"))if(e.at("key")==key){live=e.value("alive",true)&&e.at("hp").get<double>()>0;break;}
+            bool live=false;double snapMax=0.0;
+            for(const auto& e:hosted.at("entities"))if(e.at("key")==key){live=e.value("alive",true)&&e.at("hp").get<double>()>0;snapMax=e.value("max_hp",0.0);break;}
             if(!live)return {};
             auto* source=api.call(gm("AbilitySystem/Modifier","get_source","","Beyond.Gameplay.Core.AbilitySystem"),modifier);
             auto* sourceEntity=source?api.call(gm("BaseComponent","get_entity","","Beyond.Gameplay.Core.Entity"),source):nullptr;
             if(!sourceEntity||api.call(gm("Entity","get_enemyCtrl","","Beyond.Gameplay.Core.EnemyController"),sourceEntity))return {};
             for(const auto& [peer,actor]:actors)if(actor.entity==sourceEntity)return {};
+            for(const auto& [mk,member]:remoteMembers)if(member.actor.entity==sourceEntity)return {};
             ++guestHitCandidates;
             if(auto* data=api.call(gm("Entity","get_entityData","","Beyond.Gameplay.Core.BaseEntityData"),sourceEntity)) {
                 auto sourceTemplate=text(api.call(gm("BaseEntityData","get_templateId","","System.String"),data));
                 if(guestHitSources.size()<64||guestHitSources.contains(sourceTemplate))++guestHitSources[sourceTemplate];
             }
             GuestHit hit{ability,target,identity,key};
+            hit.snapshotMaxHp=snapMax;
             extractModifierMeta(modifier,hit.isCrit,hit.damageType);
             hit.before=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),ability);
             hit.full=api.value<double>(gm("AbilitySystem","get_maxHp","","System.Double"),ability);
@@ -3991,12 +4080,17 @@ public:
         try {
             if(!currentEntity(hit.target,hit.identity))return;
             const double after=api.value<double>(gm("AbilitySystem","get_hp","","System.Double"),hit.ability);
-            const double amount=(std::min)(hit.full,hit.full-after);
-            double restore=(std::max)(1.,hit.before-(std::max)(0.,amount));bool skip=true;
+            const double rawAmount=(std::min)(hit.full,hit.full-after);
+            double restore=(std::max)(1.,hit.before-(std::max)(0.,rawAmount));bool skip=true;
             api.call(gm("AbilitySystem","SetHpDirectly","System.Double|System.Boolean"),hit.ability,{&restore,&skip});
-            if(amount>0&&session&&session->submitHit(net,hit.key,amount,hit.isCrit,hit.damageType)) {++guestHitsSent;localHitAt[hit.key]=nowMs();}
-            else if(amount<=0)++guestZeroDamage;
-            else ++guestHitSendFailed;
+            const double sendAmount=(hit.snapshotMaxHp>0.0)?(std::min)(rawAmount,hit.snapshotMaxHp):rawAmount;
+            if(sendAmount>0&&session&&session->submitHit(net,hit.key,sendAmount,hit.isCrit,hit.damageType)) {++guestHitsSent;localHitAt[hit.key]=nowMs();}
+            else if(rawAmount<=0)++guestZeroDamage;
+            else {
+                ++guestHitSendFailed;
+                const auto me=net.localIdFast();
+                if(session&&me) session->sendDamageReport(net,"pve",me,0,rawAmount,hit.isCrit,hit.damageType,false,false,operatorDisplayName(localModel));
+            }
         }catch(const std::exception& e){replicationError=e.what();}
     }
     struct DeathObservation {void* entity=nullptr;NativeIdentity identity;std::string key;};

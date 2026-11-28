@@ -272,8 +272,41 @@ int main() {
     std::optional<Json> remoteStats;
     check(wait([&]{tick();remoteStats=g.takeRemoteDamageStats();return remoteStats.has_value();})&&
         remoteStats->value("total_damage",0.0)==4500.0,"guest receives validated combat stats snapshot");
-    check(g.requestDamageReset(guest),"guest requests combat stats reset");
-    check(wait([&]{tick();return h.takeDamageResetRequested();}),"host receives guest combat stats reset request");
+    // Nested PvP snapshot validation + broadcast
+    CombatStats pvpStats;
+    pvpStats.recordHit(2,"队友A","伊冯",1800.0,true,4,true,15000);
+    pvpStats.recordTaken(1,"房主","管理员",1800.0,15000);
+    auto combinedSnap=snap;combinedSnap["pvp"]=pvpStats.snapshot(16000);
+    check(CombatStats::validRemoteSnapshot(combinedSnap),"valid combined PvE+PvP snapshot passes schema check");
+    auto badNested=combinedSnap;badNested["pvp"]["total_damage"]=-5.0;
+    check(!CombatStats::validRemoteSnapshot(badNested),"negative nested PvP damage snapshot is rejected");
+    check(h.sendDamageStats(host,combinedSnap),"host broadcasts combined PvE+PvP stats snapshot");
+    check(wait([&]{tick();remoteStats=g.takeRemoteDamageStats();return remoteStats.has_value();})&&
+        remoteStats->contains("pvp")&&remoteStats->at("pvp").value("total_damage",0.0)==1800.0,"guest receives nested PvP combat stats snapshot");
+    // Guest PvE damage report & PVP damage report (duel-gated)
+    check(g.sendDamageReport(guest,"pve",2,0,2200.0,true,4,false,false,"伊冯"),"guest submits local PvE damage report");
+    std::deque<Json> dmgReports;
+    check(wait([&]{tickFresh();dmgReports=h.takeDamageReports();return !dmgReports.empty();})&&
+        dmgReports.front().value("category",std::string{})=="pve"&&dmgReports.front().value("attacker",0)==2&&
+        dmgReports.front().value("amount",0.0)==2200.0&&dmgReports.front().value("crit",false)==true,"host receives validated guest PvE damage report");
+    auto pvpReportRej=h.status()["rejected"].get<int>();
+    check(g.sendDamageReport(guest,"pvp",1,2,900.0,false,0,false,false,"伊冯"),"guest sends PvP report while no duel is active");
+    check(wait([&]{tickFresh();return h.status()["rejected"].get<int>()>pvpReportRej;})&&h.takeDamageReports().empty(),"host rejects PvP damage report outside active duel");
+    h.pvp=true;g.duelAction(guest,"invite",1);
+    check(wait([&]{tickFresh();return h.duelInvites.contains(2);}),"invite host for PvP stats test");
+    h.duelAction(host,"accept",2);
+    check(wait([&]{tickFresh();return h.duelAllowed(1,2)&&g.duels.contains(1);}),"accept PvP duel for stats test");
+    check(h.sendPlayerHit(host,2,900.0,"pvp:1",true,2),"host sends PvP player_hit with crit & element metadata");
+    std::deque<Json> pvpIn;
+    check(wait([&]{tickFresh();pvpIn=g.takePlayerHits();return !pvpIn.empty();})&&
+        pvpIn.front().value("crit",false)==true&&pvpIn.front().value("dtype",0)==2,"guest receives PvP hit crit & element metadata");
+    check(g.sendDamageReport(guest,"pvp",1,2,900.0,true,2,true,false,"伊冯"),"guest reports settled PvP hit taken during active duel");
+    check(wait([&]{tickFresh();dmgReports=h.takeDamageReports();return !dmgReports.empty();})&&
+        dmgReports.front().value("category",std::string{})=="pvp"&&dmgReports.front().value("attacker",0)==1&&
+        dmgReports.front().value("target",0)==2&&dmgReports.front().value("killed",false)==true,"host receives settled PvP damage report");
+    h.pvp=false;
+    check(g.requestDamageReset(guest,"pvp"),"guest requests scoped PvP combat stats reset");
+    check(wait([&]{tick();return h.takeDamageResetScope()=="pvp";}),"host receives guest scoped PvP combat stats reset request");
     stats.autoReset=true;
     stats.recordHit(1,"房主","管理员",200.0,false,0,false,40000); // >15s after 12000 -> auto resets
     check(stats.snapshot(41000).value("total_damage",0.0)==200.0,"CombatStats auto-resets after 15s idle when enabled");
@@ -281,16 +314,21 @@ int main() {
 
     // Settings validation for new UI/HUD/ATB/auto-follow keys
     bool validOk=true;
-    try {validateSettings({{"auto_follow_host_map",true},{"room_shared_atb",true},{"show_damage_hud",true},{"show_team_hud",true},{"show_atb_hud",true},{"hud_compact",true},{"hud_opacity",0.86},{"damage_auto_reset",true},{"damage_reset_key",VK_F9}});}
+    try {validateSettings({{"auto_follow_host_map",true},{"room_shared_atb",true},{"show_damage_hud",true},{"show_team_hud",true},{"show_atb_hud",true},{"hud_compact",true},{"hud_opacity",0.86},{"hud_style","telemetry"},{"damage_auto_reset",true},{"damage_reset_key",VK_F9}});}
     catch(...) {validOk=false;}
-    check(validOk,"validateSettings accepts valid new HUD, auto-follow, and shared ATB settings");
+    for(auto s:{"telemetry","chamfer","hazard","material"}) {
+        try {validateSettings({{"hud_style",s}});} catch(...) {validOk=false;}
+    }
+    check(validOk,"validateSettings accepts valid new HUD, auto-follow, hud_style, and shared ATB settings");
     bool badAutoFollow=false;
     try {validateSettings({{"auto_follow_host_map","yes"}});} catch(...) {badAutoFollow=true;}
     bool badOpacity=false;
     try {validateSettings({{"hud_opacity",0.10}});} catch(...) {badOpacity=true;}
+    bool badHudStyle=false;
+    try {validateSettings({{"hud_style","neon_rainbow"}});} catch(...) {badHudStyle=true;}
     bool badResetKey=false;
     try {validateSettings({{"damage_reset_key",13}});} catch(...) {badResetKey=true;}
-    check(badAutoFollow&&badOpacity&&badResetKey,"validateSettings rejects invalid auto_follow_host_map, hud_opacity, and damage_reset_key");
+    check(badAutoFollow&&badOpacity&&badHudStyle&&badResetKey,"validateSettings rejects invalid auto_follow_host_map, hud_opacity, hud_style, and damage_reset_key");
 
     // Fast atomic ID/room getters match snapshot
     check(host.localIdFast()==host.snapshot().localId&&host.roomIdFast()==host.snapshot().roomId&&

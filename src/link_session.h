@@ -64,7 +64,8 @@ class Session {
     std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> atbBudgets;
     std::uint64_t atbDeltaSeq=0,atbStateSeq=0,atbLastStateSeq=0;
     Json remoteDamageStats;bool hasRemoteDamageStats=false;
-    bool damageResetRequested=false;std::map<std::uint16_t,std::uint64_t> damageResetAt;
+    bool damageResetRequested=false;std::string damageResetScope;std::map<std::uint16_t,std::uint64_t> damageResetAt;
+    std::deque<Json> damageReports;std::map<std::uint16_t,std::pair<std::uint64_t,unsigned>> damageReportBudgets;
     std::uint64_t lastGrowthPublish=0;
     std::uint64_t rejected=0,received=0,attacks=0;std::string error;
     // ---- PVP duels: two players must agree before they can hurt each other ----
@@ -229,7 +230,8 @@ public:
             duelPairs.clear();duelPending.clear();duelBudgets.clear();duels.clear();duelInvites.clear();
             atbDeltas.clear();atbUpdates.clear();atbPeerSequences.clear();atbBudgets.clear();
             atbDeltaSeq=atbStateSeq=atbLastStateSeq=0;
-            remoteDamageStats=Json();hasRemoteDamageStats=false;damageResetRequested=false;damageResetAt.clear();
+            remoteDamageStats=Json();hasRemoteDamageStats=false;damageResetRequested=false;damageResetScope.clear();damageResetAt.clear();
+            damageReports.clear();damageReportBudgets.clear();
         }
         self=s.localId;maintainDuels(net,s);
         if(role==Role::Host&&ready()) realm.reconcile(s,epoch,world.value("map",std::string{}),world.value("level",std::string{}));
@@ -342,22 +344,26 @@ public:
                 } else if(kind=="player_hit"&&role==Role::Client&&packet.from==proto::kHostId) {
                     const double amount=b.at("amount").get<double>();
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||playerHits.size()>=64) {++rejected;continue;}
-                    playerHits.push_back({{"amount",amount},{"key",b.value("key",std::string{}).substr(0,128)}});
-                } else if(kind=="player_hit"&&role==Role::Host&&canAct(packet.from)) {
-                    // An enemy simulated on that guest hit another player's stand-in
-                    // there. The host applies it to its own operator or relays it.
+                    playerHits.push_back({{"amount",amount},{"key",b.value("key",std::string{}).substr(0,128)},
+                        {"crit",b.value("crit",false)},{"dtype",b.value("dtype",0)}});
+                } else if(kind=="player_hit"&&role==Role::Host) {
+                    // An enemy simulated on that guest hit another player's stand-in,
+                    // or a guest hit another player's stand-in during an active PVP duel.
                     const double amount=b.at("amount").get<double>();const auto target=b.at("target").get<std::uint16_t>();
                     auto key=b.value("key",std::string{}).substr(0,128);
-                    if(key.rfind("pvp:",0)==0) {
+                    const bool isPvp=key.rfind("pvp:",0)==0;
+                    if(isPvp) {
                         if(!duelAllowed(packet.from,target)) {++rejected;continue;}
                         key="pvp:"+std::to_string(packet.from); // never trust the claimed attacker
-                    }
+                    } else if(!canAct(packet.from)) {++rejected;continue;}
                     if(b.at("epoch").get<std::uint64_t>()!=epoch||!std::isfinite(amount)||amount<=0||amount>1e9||target==packet.from||!find(s,target)) {++rejected;continue;}
                     auto& budget=hitBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
                     if(budget.second>=40) {++rejected;continue;}
                     ++budget.second;
-                    if(target==s.localId) {if(playerHits.size()<64)playerHits.push_back({{"amount",amount},{"key",key}});}
-                    else send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key}},target);
+                    const bool isCrit=b.value("crit",false);
+                    const int dtype=b.value("dtype",0);
+                    if(target==s.localId) {if(playerHits.size()<64)playerHits.push_back({{"amount",amount},{"key",key},{"crit",isCrit},{"dtype",dtype}});}
+                    else send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key},{"crit",isCrit},{"dtype",dtype}},target);
                 } else if(kind=="enemy_cast"&&(role==Role::Client?packet.from==proto::kHostId:role==Role::Host&&canAct(packet.from))) {
                     // From the host: any room enemy. From a guest: an enemy that guest
                     // owns (the game adapter checks ownership before replaying it).
@@ -420,10 +426,35 @@ public:
                 } else if(kind=="damage_stats"&&role==Role::Client&&packet.from==proto::kHostId) {
                     if(!b.contains("stats")||!CombatStats::validRemoteSnapshot(b.at("stats"))) {++rejected;continue;}
                     remoteDamageStats=b.at("stats");hasRemoteDamageStats=true;
+                } else if(kind=="damage_report"&&role==Role::Host) {
+                    const auto category=b.value("category",std::string{});
+                    const double amount=b.value("amount",-1.0);
+                    if((category!="pve"&&category!="pvp")||!std::isfinite(amount)||amount<=0.0||amount>1e12||damageReports.size()>=256) {++rejected;continue;}
+                    const auto now=nowMs();
+                    auto& budget=damageReportBudgets[packet.from];if(now-budget.first>=1000) budget={now,0};
+                    if(budget.second>=80) {++rejected;continue;}
+                    std::uint16_t attacker=packet.from,target=0;
+                    const bool takenOnly=b.value("taken_only",false);
+                    if(category=="pvp") {
+                        // Settled PVP damage is reported by the defender (`packet.from`) after scale/immunity.
+                        attacker=b.value("attacker",std::uint16_t(0));
+                        target=packet.from;
+                        if(!attacker||attacker==target||!find(s,attacker)||!duelAllowed(attacker,target)) {++rejected;continue;}
+                    } else {
+                        attacker=packet.from;
+                        target=takenOnly?packet.from:std::uint16_t(0);
+                    }
+                    ++budget.second;
+                    damageReports.push_back({{"category",category},{"attacker",attacker},{"target",target},
+                        {"amount",amount},{"crit",b.value("crit",false)},{"dtype",b.value("dtype",0)},
+                        {"killed",b.value("killed",false)},{"taken_only",takenOnly},
+                        {"op",b.value("op",std::string{}).substr(0,48)}});
                 } else if(kind=="damage_reset"&&role==Role::Host) {
                     const auto now=nowMs();
                     if(now-damageResetAt[packet.from]<500) {++rejected;continue;}
-                    damageResetAt[packet.from]=now;damageResetRequested=true;
+                    const auto scope=b.value("scope",std::string("all"));
+                    if(scope!="all"&&scope!="pve"&&scope!="pvp") {++rejected;continue;}
+                    damageResetAt[packet.from]=now;damageResetRequested=true;damageResetScope=scope;
                 } else if(kind=="pvp_duel"&&role==Role::Host) {
                     const auto op=b.at("op").get<std::string>();const auto target=b.at("target").get<std::uint16_t>();
                     auto& budget=duelBudgets[packet.from];if(nowMs()-budget.first>=1000) budget={nowMs(),0};
@@ -480,13 +511,15 @@ public:
         if(role!=Role::Client||!combat||!canAct(net.localIdFast())||!std::isfinite(amount)||amount<=0) return false;
         return send(net,{{"kind","hit"},{"epoch",epoch},{"seq",++hitSequence},{"key",key},{"amount",amount},{"crit",isCrit},{"dtype",damageType}},proto::kHostId);
     }
-    bool sendPlayerHit(Net& net,std::uint16_t peer,double amount,const std::string& key) {
+    bool sendPlayerHit(Net& net,std::uint16_t peer,double amount,const std::string& key,bool isCrit=false,int damageType=0) {
         if(!ready()||!std::isfinite(amount)||amount<=0) return false;
-        if(role==Role::Host) return peer!=proto::kHostId&&send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key}},peer);
+        if(role==Role::Host) return peer!=proto::kHostId&&send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key},{"crit",isCrit},{"dtype",damageType}},peer);
         // A guest forwards through the host, which owns the room's rules.
         const auto local=net.localIdFast();
-        return role==Role::Client&&canAct(local)&&peer!=local&&
-            send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key},{"target",peer}},proto::kHostId);
+        const bool isPvp=key.rfind("pvp:",0)==0;
+        const bool permitted=isPvp?duels.contains(peer):canAct(local);
+        return role==Role::Client&&permitted&&peer!=local&&
+            send(net,{{"kind","player_hit"},{"epoch",epoch},{"amount",amount},{"key",key},{"target",peer},{"crit",isCrit},{"dtype",damageType}},proto::kHostId);
     }
     // Presentation: a host room enemy began a native skill against a player.
     bool sendEnemyCast(Net& net,const std::string& key,const std::string& skill,std::uint16_t target) {
@@ -534,11 +567,26 @@ public:
         if(!hasRemoteDamageStats) return {};
         hasRemoteDamageStats=false;auto out=std::move(remoteDamageStats);remoteDamageStats=Json();return out;
     }
-    bool requestDamageReset(Net& net) {
+    bool requestDamageReset(Net& net,const std::string& scope="all") {
         if(role!=Role::Client) return false;
-        return send(net,{{"kind","damage_reset"},{"epoch",epoch}},proto::kHostId);
+        return send(net,{{"kind","damage_reset"},{"epoch",epoch},{"scope",scope}},proto::kHostId);
     }
-    bool takeDamageResetRequested() {const bool v=damageResetRequested;damageResetRequested=false;return v;}
+    bool takeDamageResetRequested() {const bool v=damageResetRequested;damageResetRequested=false;damageResetScope.clear();return v;}
+    std::string takeDamageResetScope() {
+        if(!damageResetRequested) return {};
+        damageResetRequested=false;
+        auto out=damageResetScope.empty()?std::string("all"):std::move(damageResetScope);
+        damageResetScope.clear();
+        return out;
+    }
+    bool sendDamageReport(Net& net,const std::string& category,std::uint16_t attacker,std::uint16_t target,
+                          double amount,bool isCrit,int damageType,bool killed,bool takenOnly,const std::string& op) {
+        if(role!=Role::Client||!std::isfinite(amount)||amount<=0.0||amount>1e12) return false;
+        return send(net,{{"kind","damage_report"},{"epoch",epoch},{"category",category},{"attacker",attacker},
+            {"target",target},{"amount",amount},{"crit",isCrit},{"dtype",damageType},
+            {"killed",killed},{"taken_only",takenOnly},{"op",op.substr(0,48)}},proto::kHostId);
+    }
+    std::deque<Json> takeDamageReports() {std::deque<Json> out;out.swap(damageReports);return out;}
     // Guest: report the room enemies whose AI this player runs.
     bool sendEnemyStates(Net& net,const Json& states) {
         if(role!=Role::Client||!canAct(net.snapshot().localId)||!states.is_array()||states.empty()||states.size()>64) return false;

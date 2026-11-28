@@ -34,6 +34,82 @@ inline void shadowText(ImDrawList* d, ImVec2 at, ImU32 tint, const char* text) {
     d->AddText(at, tint, text);
 }
 
+// ---- HUD Style Presets (Endfield Tactical + Material 3) --------------------
+enum class HudStyle : int {
+    Telemetry = 0, // 方案 B：无框战术准星（默认）
+    Chamfer   = 1, // 方案 A：工业切角框
+    Hazard    = 2, // 方案 C：塔卫二高反差条
+    Material  = 3, // 圆角 Material 玻璃
+};
+
+inline HudStyle hudStyleFromKey(const std::string& key) {
+    if (key == "chamfer")  return HudStyle::Chamfer;
+    if (key == "hazard")   return HudStyle::Hazard;
+    if (key == "material") return HudStyle::Material;
+    return HudStyle::Telemetry;
+}
+
+inline const char* hudStyleKey(HudStyle style) {
+    switch (style) {
+    case HudStyle::Chamfer:  return "chamfer";
+    case HudStyle::Hazard:   return "hazard";
+    case HudStyle::Material: return "material";
+    default:                 return "telemetry";
+    }
+}
+
+inline void addChamferRectFilled(ImDrawList* d, ImVec2 min, ImVec2 max, float cutTR, float cutBL, ImU32 col) {
+    const float maxC = (std::min)(max.x - min.x, max.y - min.y) * 0.45f;
+    cutTR = (std::clamp)(cutTR, 0.f, (std::max)(0.f, maxC));
+    cutBL = (std::clamp)(cutBL, 0.f, (std::max)(0.f, maxC));
+    ImVec2 pts[6] = {
+        {min.x, min.y},
+        {max.x - cutTR, min.y},
+        {max.x, min.y + cutTR},
+        {max.x, max.y},
+        {min.x + cutBL, max.y},
+        {min.x, max.y - cutBL}
+    };
+    d->AddConvexPolyFilled(pts, 6, col);
+}
+
+inline void addChamferRect(ImDrawList* d, ImVec2 min, ImVec2 max, float cutTR, float cutBL, ImU32 col, float thickness = 1.f) {
+    const float maxC = (std::min)(max.x - min.x, max.y - min.y) * 0.45f;
+    cutTR = (std::clamp)(cutTR, 0.f, (std::max)(0.f, maxC));
+    cutBL = (std::clamp)(cutBL, 0.f, (std::max)(0.f, maxC));
+    ImVec2 pts[6] = {
+        {min.x, min.y},
+        {max.x - cutTR, min.y},
+        {max.x, min.y + cutTR},
+        {max.x, max.y},
+        {min.x + cutBL, max.y},
+        {min.x, max.y - cutBL}
+    };
+    d->AddPolyline(pts, 6, col, ImDrawFlags_Closed, thickness);
+}
+
+inline void addCornerBrackets(ImDrawList* d, ImVec2 min, ImVec2 max, float arm, ImU32 colTL, ImU32 colBR, float thick = 1.5f) {
+    const float a = (std::min)(arm, (std::min)(max.x - min.x, max.y - min.y) * 0.35f);
+    if (a <= 1.f) return;
+    d->AddLine({min.x, min.y}, {min.x + a, min.y}, colTL, thick);
+    d->AddLine({min.x, min.y}, {min.x, min.y + a}, colTL, thick);
+    d->AddLine({max.x - a, max.y}, {max.x, max.y}, colBR, thick);
+    d->AddLine({max.x, max.y - a}, {max.x, max.y}, colBR, thick);
+}
+
+inline void addHazardStripe(ImDrawList* d, ImVec2 min, ImVec2 max, float opacity) {
+    const float w = max.x - min.x, h = max.y - min.y;
+    if (w <= 1.f || h <= 1.f) return;
+    d->PushClipRect(min, max, true);
+    d->AddRectFilled(min, max, IM_COL32(18, 20, 24, int(235 * opacity)));
+    const ImU32 yel = u32(hud_orig::accent, opacity);
+    const float step = px(8), barW = px(3.5f);
+    for (float x = min.x - h; x < max.x + h; x += step) {
+        d->AddQuadFilled({x, max.y}, {x + barW, max.y}, {x + barW + h * 0.72f, min.y}, {x + h * 0.72f, min.y}, yel);
+    }
+    d->PopClipRect();
+}
+
 // Hybrid Endfield × Material 3 translucent dark tonal glass surface for in-game HUD.
 inline void hudGlassPanel(ImDrawList* d, ImVec2 min, ImVec2 max, float opacity, float rounding = 14.f,
                           ImVec4 rimCol = hud_orig::rim, float fillAlpha = 0.68f) {
@@ -46,16 +122,77 @@ inline void hudGlassPanel(ImDrawList* d, ImVec2 min, ImVec2 max, float opacity, 
     d->AddRect(min, max, u32(rimCol, opacity), r, 0, px(1));
 }
 
-// Compact Material 3 tonal pill chip drawn directly on an ImDrawList (for HUD tags / events).
+// Unified HUD panel renderer supporting all 4 presets.
+// fadeDir: -1 = left-anchored (fades right), +1 = right-anchored (fades left), 0 = centered fade.
+inline void hudStyledPanel(ImDrawList* d, ImVec2 min, ImVec2 max, float opacity, HudStyle style,
+                           ImVec4 rimCol = hud_orig::rim, float fillAlpha = 0.70f, int fadeDir = 0, float rounding = 14.f) {
+    if (style == HudStyle::Material) {
+        hudGlassPanel(d, min, max, opacity, rounding, rimCol, fillAlpha);
+        return;
+    }
+    if (style == HudStyle::Chamfer) {
+        const float cut = px(10);
+        addChamferRectFilled(d, {min.x, min.y + px(2)}, {max.x, max.y + px(3)}, cut, cut, IM_COL32(0, 0, 0, int(64 * opacity)));
+        addChamferRectFilled(d, min, max, cut, cut, u32(hud_orig::base, (std::min)(0.86f, fillAlpha + 0.10f) * opacity));
+        addChamferRect(d, min, max, cut, cut, u32(rimCol, (std::min)(1.f, opacity * 1.25f)), px(1));
+        return;
+    }
+    if (style == HudStyle::Hazard) {
+        d->AddRectFilled({min.x, min.y + px(2)}, {max.x, max.y + px(3)}, IM_COL32(0, 0, 0, int(80 * opacity)));
+        d->AddRectFilled(min, max, u32(hud_orig::base, (std::min)(0.90f, fillAlpha + 0.16f) * opacity));
+        d->AddRect(min, max, IM_COL32(255, 255, 255, int(48 * opacity)), 0.f, 0, px(1));
+        return;
+    }
+    // Style B: Telemetry (borderless directional gradient scrim + L-shaped tactical corner brackets)
+    const float w = max.x - min.x;
+    const ImU32 cStrong = IM_COL32(10, 12, 16, int(156 * fillAlpha / 0.70f * opacity));
+    const ImU32 cMid    = IM_COL32(10, 12, 16, int(92 * fillAlpha / 0.70f * opacity));
+    const ImU32 cZero   = IM_COL32(10, 12, 16, 0);
+    if (fadeDir < 0) {
+        const float split = min.x + w * 0.74f;
+        d->AddRectFilledMultiColor(min, {split, max.y}, cStrong, cMid, cMid, cStrong);
+        d->AddRectFilledMultiColor({split, min.y}, max, cMid, cZero, cZero, cMid);
+        addCornerBrackets(d, min, max, px(8), u32(hud_orig::accent, opacity), IM_COL32(255, 255, 255, int(130 * opacity)), px(1.5f));
+    } else if (fadeDir > 0) {
+        const float split = min.x + w * 0.26f;
+        d->AddRectFilledMultiColor(min, {split, max.y}, cZero, cMid, cMid, cZero);
+        d->AddRectFilledMultiColor({split, min.y}, max, cMid, cStrong, cStrong, cMid);
+        addCornerBrackets(d, min, max, px(8), u32(hud_orig::accent, opacity), IM_COL32(255, 255, 255, int(130 * opacity)), px(1.5f));
+    } else {
+        const float edge = (std::min)(w * 0.18f, px(44));
+        d->AddRectFilledMultiColor(min, {min.x + edge, max.y}, cZero, cStrong, cStrong, cZero);
+        d->AddRectFilled({min.x + edge, min.y}, {max.x - edge, max.y}, cStrong);
+        d->AddRectFilledMultiColor({max.x - edge, min.y}, max, cStrong, cZero, cZero, cStrong);
+    }
+}
+
+// Compact HUD tag/chip drawn directly on an ImDrawList (adapts to HudStyle).
 inline float hudChipWidth(const char* text) {
     return ImGui::CalcTextSize(text).x + px(12);
 }
-inline void hudChip(ImDrawList* d, ImVec2 at, const char* text, ImVec4 fg, ImVec4 bg, float opacity, float height = 0.f) {
+inline void hudChip(ImDrawList* d, ImVec2 at, const char* text, ImVec4 fg, ImVec4 bg, float opacity,
+                    float height = 0.f, HudStyle style = HudStyle::Material) {
     const ImVec2 ts = ImGui::CalcTextSize(text);
     const float padX = px(6);
     const float h = height > 0.f ? height : (ts.y + px(2));
     const ImVec2 max{at.x + ts.x + padX * 2.f, at.y + h};
-    d->AddRectFilled(at, max, u32(bg, opacity), h * 0.5f);
+    if (style == HudStyle::Material) {
+        d->AddRectFilled(at, max, u32(bg, opacity), h * 0.5f);
+        d->AddText({at.x + padX, at.y + (h - ts.y) * 0.5f}, u32(fg, opacity), text);
+        return;
+    }
+    if (style == HudStyle::Telemetry) {
+        shadowText(d, {at.x + padX, at.y + (h - ts.y) * 0.5f}, u32(fg, opacity), text);
+        return;
+    }
+    if (style == HudStyle::Chamfer) {
+        d->AddRectFilled(at, max, u32(bg, opacity));
+        d->AddRect(at, max, u32(fg, 0.55f * opacity), 0.f, 0, px(1));
+        d->AddText({at.x + padX, at.y + (h - ts.y) * 0.5f}, u32(fg, opacity), text);
+        return;
+    }
+    // Hazard: crisp high-contrast sharp rectangle
+    d->AddRectFilled(at, max, u32(bg, (std::min)(1.f, opacity * 1.15f)));
     d->AddText({at.x + padX, at.y + (h - ts.y) * 0.5f}, u32(fg, opacity), text);
 }
 
@@ -733,6 +870,56 @@ inline void drawProgressBar(ImDrawList* d, ImVec2 min, ImVec2 max, float fractio
         const float segFrac = std::clamp(scaled - float(i), 0.f, 1.f);
         if (segFrac > 0.005f) {
             d->AddRectFilled({x0, min.y}, {x0 + segW * segFrac, max.y}, fillCol, r);
+        }
+    }
+}
+
+inline void drawHudProgressBar(ImDrawList* d, ImVec2 min, ImVec2 max, float fraction, ImU32 fillCol, ImU32 bgCol,
+                               int segments, HudStyle style) {
+    if (style == HudStyle::Material) {
+        drawProgressBar(d, min, max, fraction, fillCol, bgCol, segments);
+        return;
+    }
+    fraction = std::clamp(fraction, 0.f, 1.f);
+    if (segments <= 1) {
+        d->AddRectFilled(min, max, bgCol);
+        const float fillW = (max.x - min.x) * fraction;
+        if (fillW > 1.f) {
+            if (style == HudStyle::Telemetry) {
+                const unsigned a = (fillCol >> IM_COL32_A_SHIFT) & 0xFFu;
+                const ImU32 glow = (fillCol & 0x00FFFFFFu) | (ImU32((a * 60u) / 255u) << IM_COL32_A_SHIFT);
+                d->AddRectFilled({min.x, min.y - px(1)}, {min.x + fillW, max.y + px(1)}, glow);
+            }
+            d->AddRectFilled(min, {min.x + fillW, max.y}, fillCol);
+        }
+        return;
+    }
+    const float gap = style == HudStyle::Telemetry ? px(5) : (style == HudStyle::Hazard ? px(3) : px(4));
+    const float skew = style == HudStyle::Chamfer ? px(3.5f) : 0.f;
+    const float totalW = (max.x - min.x) - skew;
+    const float segW = (totalW - gap * float(segments - 1)) / float(segments);
+    const float scaled = fraction * float(segments);
+    for (int i = 0; i < segments; ++i) {
+        const float x0 = min.x + float(i) * (segW + gap);
+        const float x1 = x0 + segW;
+        const float segFrac = std::clamp(scaled - float(i), 0.f, 1.f);
+        if (skew > 0.f) {
+            d->AddQuadFilled({x0 + skew, min.y}, {x1 + skew, min.y}, {x1, max.y}, {x0, max.y}, bgCol);
+            if (segFrac > 0.005f) {
+                const float fx1 = x0 + segW * segFrac;
+                d->AddQuadFilled({x0 + skew, min.y}, {fx1 + skew, min.y}, {fx1, max.y}, {x0, max.y}, fillCol);
+            }
+        } else {
+            d->AddRectFilled({x0, min.y}, {x1, max.y}, bgCol);
+            if (segFrac > 0.005f) {
+                const float fx1 = x0 + segW * segFrac;
+                if (style == HudStyle::Telemetry) {
+                    const unsigned a = (fillCol >> IM_COL32_A_SHIFT) & 0xFFu;
+                    const ImU32 glow = (fillCol & 0x00FFFFFFu) | (ImU32((a * 64u) / 255u) << IM_COL32_A_SHIFT);
+                    d->AddRectFilled({x0, min.y - px(1)}, {fx1, max.y + px(1)}, glow);
+                }
+                d->AddRectFilled({x0, min.y}, {fx1, max.y}, fillCol);
+            }
         }
     }
 }

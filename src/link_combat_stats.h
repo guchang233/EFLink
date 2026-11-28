@@ -253,7 +253,7 @@ public:
         };
     }
 
-    static bool validRemoteSnapshot(const nlohmann::json& j) {
+    static bool validSingleSnapshot(const nlohmann::json& j) {
         if (!j.is_object() || j.dump().size() > 32768) return false;
         if (!j.contains("players") || !j["players"].is_array() || j["players"].size() > 16) return false;
         if (j.contains("timeline") && (!j["timeline"].is_array() || j["timeline"].size() > kTimelineSeconds)) return false;
@@ -272,22 +272,34 @@ public:
         return true;
     }
 
+    static bool validRemoteSnapshot(const nlohmann::json& j) {
+        if (!j.is_object() || j.dump().size() > 65536) return false;
+        if (j.contains("pvp")) {
+            if (!validSingleSnapshot(j["pvp"]) || j["pvp"].contains("pvp")) return false;
+            auto copy = j;
+            copy.erase("pvp");
+            return validSingleSnapshot(copy);
+        }
+        return validSingleSnapshot(j);
+    }
+
     bool applyRemoteSnapshot(const nlohmann::json& j) {
-        if (!validRemoteSnapshot(j)) return false;
+        if (!validSingleSnapshot(j)) return false;
         mirrored_ = true;
         mirroredSnapshot_ = j;
         generation_ = j.value("generation", generation_);
         return true;
     }
 
-    std::string formatChatSummary(std::uint64_t nowMs) const {
+    std::string formatChatSummary(std::uint64_t nowMs, const char* label = "对怪物伤害统计") const {
         const auto s = snapshot(nowMs);
         const auto& players = s.at("players");
         if (players.empty() || s.value("total_damage", 0.0) <= 0.0) {
-            return "［伤害统计］当前暂无伤害记录";
+            return std::string("［") + label + "］当前暂无伤害记录";
         }
-        char head[160]{};
-        std::snprintf(head, sizeof head, "［伤害统计］总伤 %s · %.1fs · 团队DPS %s",
+        char head[192]{};
+        std::snprintf(head, sizeof head, "［%s］总伤 %s · %.1fs · 团队DPS %s",
+            label,
             formatDamageNumber(s.value("total_damage", 0.0)).c_str(),
             s.value("duration_s", 0.0),
             formatDamageNumber(s.value("team_dps", 0.0)).c_str());

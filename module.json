@@ -3,7 +3,7 @@
   "id": "eflink.core",
   "name": "EF Link · 终末地联机",
   "author": "EF Link contributors",
-  "version": "1.6.8",
+  "version": "1.6.9",
   "abi": 1,
   "libraries": {"windows-x64": "native/windows-x64/eflink.core.dll"},
   "default_configuration": {
@@ -20,6 +20,7 @@
     "show_atb_hud": true,
     "hud_compact": false,
     "hud_opacity": 0.86,
+    "hud_style": "telemetry",
     "damage_auto_reset": false,
     "damage_reset_key": 120,
     "menu_dark_mode": false,
