@@ -3473,11 +3473,7 @@ private:
         for(const auto& p:view.peers) if(p.id==id&&p.hasInfo&&!p.info.modelPath.empty()) return operatorDisplayName(p.info.modelPath);
         return {};
     }
-    std::string peerOpName(Net& net,std::uint16_t id) const {
-        if(auto v=vitals.find(id);v!=vitals.end()&&!v->second.op.empty()) return v->second.op;
-        for(const auto& p:net.snapshot().peers) if(p.id==id&&p.hasInfo&&!p.info.modelPath.empty()) return operatorDisplayName(p.info.modelPath);
-        return {};
-    }
+    std::string peerOpName(Net& net,std::uint16_t id) const {return peerOpName(net.snapshot(),id);}
     void pushAtbEvent(std::uint16_t peer,const std::string& name,float delta,const std::string& reason) {
         if(!std::isfinite(delta)||std::abs(delta)<0.05f) return;
         atbEvents.push_back({++atbEventSerial,peer,name,delta,reason,nowMs()});

@@ -440,12 +440,6 @@ inline void kpiCard(const char* id, const char* label, const char* bigValue, con
 }
 
 // ---- Material 3 Status Chips & Tonal Badges --------------------------------
-inline float pillWidth(const char* text, bool dot = true) {
-    pushNote();
-    const float w = ImGui::CalcTextSize(text).x + px(12) * 2 + (dot ? px(12) : 0.f);
-    popNote();
-    return w;
-}
 
 inline void statusPill(const char* text, Tone tone, bool dot = false) {
     pushNote();

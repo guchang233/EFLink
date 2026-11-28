@@ -45,9 +45,9 @@ class NativeProtoCodec {
         auto* array=api->runtime_invoke(api->context,toArray.method_info,stream,nullptr,&exception);
         if(exception||!array)throw std::runtime_error("MemoryStream.ToArray rejected");
         Root arrayRoot(api,array);
-        const auto length=reinterpret_cast<std::uintptr_t(*)(void*)>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"),"il2cpp_array_length"));
-        if(!length)throw std::runtime_error("il2cpp_array_length unavailable");
-        const auto count=std::size_t(length(array));
+        const auto arrayLengthFn=reinterpret_cast<std::uintptr_t(*)(void*)>(GetProcAddress(GetModuleHandleW(L"GameAssembly.dll"),"il2cpp_array_length"));
+        if(!arrayLengthFn)throw std::runtime_error("il2cpp_array_length unavailable");
+        const auto count=std::size_t(arrayLengthFn(array));
         if(count>maxBytes)throw std::runtime_error("protobuf serialized message exceeds limit");
         // Standard Windows x64 IL2CPP array: 32-byte prefix (klass, monitor, bounds, length).
         return base64(static_cast<const unsigned char*>(array)+32,count);

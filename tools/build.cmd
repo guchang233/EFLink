@@ -9,7 +9,7 @@ if not exist build mkdir build
 set "TASK_ID=%~1"
 if "%TASK_ID%"=="" set "TASK_ID=eflink.core"
 pushd build
-set "TASK_FLAGS=/nologo /std:c++20 /EHa /W4 /O2 /MT /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I..\include /I..\src /I..\vendor\imgui"
+set "TASK_FLAGS=/nologo /std:c++20 /EHa /W4 /O2 /MT /DNDEBUG /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I..\include /I..\src /I..\vendor\imgui"
 if "%~2"=="reuse-gui" goto module
 if "%~2"=="reuse-imgui" goto gui
 cl %TASK_FLAGS% /c ..\src\link_gui.cpp ..\vendor\imgui\imgui.cpp ..\vendor\imgui\imgui_draw.cpp ..\vendor\imgui\imgui_tables.cpp ..\vendor\imgui\imgui_widgets.cpp ..\vendor\imgui\backends\imgui_impl_win32.cpp ..\vendor\imgui\backends\imgui_impl_dx11.cpp

@@ -259,7 +259,7 @@ struct Fonts {
 };
 inline thread_local Fonts fonts{};
 
-inline Fonts loadFonts(ImFontAtlas* atlas, float scale) {
+inline Fonts loadFonts(ImFontAtlas* atlas, float scale, int maxTexDim = 8192) {
     Fonts f{};
     wchar_t winDir[MAX_PATH]{};
     GetWindowsDirectoryW(winDir, MAX_PATH);
@@ -268,32 +268,82 @@ inline Fonts loadFonts(ImFontAtlas* atlas, float scale) {
     const auto bold    = fontDir / L"msyhbd.ttc";
     const auto mono    = fontDir / L"consola.ttf";
 
-    if (std::filesystem::is_regular_file(regular)) {
-        const auto* cjk = atlas->GetGlyphRangesChineseFull();
-        ImFontConfig cfg{};
-        cfg.OversampleH = 2; cfg.OversampleV = 1;
-        f.body = atlas->AddFontFromFileTTF(regular.string().c_str(), 15.5f * scale, &cfg, cjk);
-        f.note = atlas->AddFontFromFileTTF(regular.string().c_str(), 13.5f * scale, &cfg, cjk);
-        if (std::filesystem::is_regular_file(bold)) {
-            f.bold  = atlas->AddFontFromFileTTF(bold.string().c_str(), 15.5f * scale, &cfg, cjk);
-            f.title = atlas->AddFontFromFileTTF(bold.string().c_str(), 20.5f * scale, &cfg, cjk);
-            f.kpi   = atlas->AddFontFromFileTTF(bold.string().c_str(), 24.0f * scale, &cfg, cjk);
-        } else {
-            f.bold = f.body;
-            f.title = atlas->AddFontFromFileTTF(regular.string().c_str(), 20.0f * scale, &cfg, cjk);
-            f.kpi   = atlas->AddFontFromFileTTF(regular.string().c_str(), 23.0f * scale, &cfg, cjk);
+    // Keep glyph range buffers alive until atlas->Build() / GetTexDataAsRGBA32() runs.
+    static thread_local ImVector<ImWchar> fullRanges, titleRanges, kpiRanges;
+    fullRanges.clear(); titleRanges.clear(); kpiRanges.clear();
+    {
+        static const ImWchar kanaRange[] = {0x3040, 0x30FF, 0};
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(atlas->GetGlyphRangesChineseFull());
+        b.AddRanges(kanaRange);
+        b.AddText("·—…［］▍◆×°✓");
+        b.BuildRanges(&fullRanges);
+    }
+    {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(atlas->GetGlyphRangesChineseSimplifiedCommon());
+        b.AddText("·—…［］▍◆×°✓聊灼伊冯佩丽卡莱万汀艾尔黛拉管理员切磋决斗技力池");
+        b.BuildRanges(&titleRanges);
+    }
+    {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(atlas->GetGlyphRangesDefault());
+        b.AddText("万亿秒人·—/");
+        b.BuildRanges(&kpiRanges);
+    }
+
+    const bool hasRegular = std::filesystem::is_regular_file(regular);
+    const bool hasBold    = std::filesystem::is_regular_file(bold);
+    const bool hasMono    = std::filesystem::is_regular_file(mono);
+    const int desiredMax  = (std::clamp)(maxTexDim, 2048, 8192);
+
+    auto populate = [&](bool compactFallback) {
+        f = Fonts{};
+        atlas->Clear();
+        atlas->TexDesiredWidth = (scale > 1.15f && desiredMax >= 8192) ? 8192 : (std::min)(4096, desiredMax);
+        if (hasRegular) {
+            ImFontConfig cfg{};
+            cfg.OversampleH = 1;
+            cfg.OversampleV = 1;
+            cfg.PixelSnapH  = true;
+            const ImWchar* bodyR = compactFallback ? titleRanges.Data : fullRanges.Data;
+            f.body = atlas->AddFontFromFileTTF(regular.string().c_str(), 15.5f * scale, &cfg, bodyR);
+            f.note = atlas->AddFontFromFileTTF(regular.string().c_str(), 13.5f * scale, &cfg, bodyR);
+            if (!compactFallback) {
+                if (hasBold) {
+                    f.bold  = atlas->AddFontFromFileTTF(bold.string().c_str(), 15.5f * scale, &cfg, fullRanges.Data);
+                    f.title = atlas->AddFontFromFileTTF(bold.string().c_str(), 20.5f * scale, &cfg, titleRanges.Data);
+                    f.kpi   = atlas->AddFontFromFileTTF(bold.string().c_str(), 24.0f * scale, &cfg, kpiRanges.Data);
+                } else {
+                    f.bold  = f.body;
+                    f.title = atlas->AddFontFromFileTTF(regular.string().c_str(), 20.0f * scale, &cfg, titleRanges.Data);
+                    f.kpi   = atlas->AddFontFromFileTTF(regular.string().c_str(), 23.0f * scale, &cfg, kpiRanges.Data);
+                }
+            }
+        }
+        if (hasMono) {
+            ImFontConfig mcfg{}; mcfg.OversampleH = 2; mcfg.OversampleV = 1;
+            f.mono = atlas->AddFontFromFileTTF(mono.string().c_str(), 14.0f * scale, &mcfg, atlas->GetGlyphRangesDefault());
+        }
+        if (!f.body)  f.body  = atlas->AddFontDefault();
+        if (!f.bold)  f.bold  = f.body;
+        if (!f.title) f.title = f.bold;
+        if (!f.kpi)   f.kpi   = f.title;
+        if (!f.note)  f.note  = f.body;
+        if (!f.mono)  f.mono  = f.body;
+    };
+
+    populate(false);
+    // Pre-build and verify dimensions stay strictly below GPU texture limits.
+    if (!atlas->Build() || atlas->TexWidth > desiredMax || atlas->TexHeight > desiredMax) {
+        populate(true);
+        if (!atlas->Build() || atlas->TexWidth > desiredMax || atlas->TexHeight > desiredMax) {
+            atlas->Clear();
+            f = Fonts{};
+            f.body = f.bold = f.title = f.kpi = f.note = f.mono = atlas->AddFontDefault();
+            atlas->Build();
         }
     }
-    if (std::filesystem::is_regular_file(mono)) {
-        ImFontConfig mcfg{}; mcfg.OversampleH = 2;
-        f.mono = atlas->AddFontFromFileTTF(mono.string().c_str(), 14.0f * scale, &mcfg, atlas->GetGlyphRangesDefault());
-    }
-    if (!f.body)  f.body  = atlas->AddFontDefault();
-    if (!f.bold)  f.bold  = f.body;
-    if (!f.title) f.title = f.bold;
-    if (!f.kpi)   f.kpi   = f.title;
-    if (!f.note)  f.note  = f.body;
-    if (!f.mono)  f.mono  = f.body;
     return f;
 }
 

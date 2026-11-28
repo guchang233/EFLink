@@ -420,10 +420,8 @@ struct Ui {
         return map.empty() ? "新区域" : map;
     }
 
-    void saveSettings() {
-        json patch = {
-            {"room_name", room}, {"port", port}, {"max_players", limit},
-            {"menu_key", key}, {"pvp_key", pvpKey}, {"damage_reset_key", damageResetKey},
+    json switchSettingsPatch() const {
+        return {
             {"show_remote_players", remote}, {"show_remote_squad", squad},
             {"replay_skills", replay}, {"outline_teammates", outline},
             {"show_player_markers", markers}, {"follow_host_world", follow}, {"auto_follow_host_map", autoFollowHostMap}, {"sync_combat", combat},
@@ -432,6 +430,14 @@ struct Ui {
             {"hud_opacity", double(hudOpacity)}, {"hud_style", ui::hudStyleKey(hudStyle)}, {"damage_auto_reset", damageAutoReset},
             {"menu_dark_mode", darkMode}
         };
+    }
+
+    void saveSettings() {
+        json patch = switchSettingsPatch();
+        patch.update({
+            {"room_name", room}, {"port", port}, {"max_players", limit},
+            {"menu_key", key}, {"pvp_key", pvpKey}, {"damage_reset_key", damageResetKey}
+        });
         if (nameEdited) { patch["player_name"] = name; nameEdited = false; }
         act({{"action", "settings"}, {"configuration", patch}});
         say("设置已保存", false);
@@ -439,15 +445,7 @@ struct Ui {
 
     void applySwitches() {
         syncThemeIfNeeded();
-        act({{"action", "settings"}, {"configuration", {
-            {"show_remote_players", remote}, {"show_remote_squad", squad},
-            {"replay_skills", replay}, {"outline_teammates", outline},
-            {"show_player_markers", markers}, {"follow_host_world", follow}, {"auto_follow_host_map", autoFollowHostMap}, {"sync_combat", combat},
-            {"show_damage_hud", showDamageHud}, {"show_team_hud", showTeamHud},
-            {"show_atb_hud", showAtbHud}, {"hud_compact", hudCompact},
-            {"hud_opacity", double(hudOpacity)}, {"hud_style", ui::hudStyleKey(hudStyle)}, {"damage_auto_reset", damageAutoReset},
-            {"menu_dark_mode", darkMode}
-        }}});
+        act({{"action", "settings"}, {"configuration", switchSettingsPatch()}});
     }
 
     void join() {
@@ -930,7 +928,7 @@ struct Ui {
 
         ImGui::PushStyleColor(ImGuiCol_WindowBg, isMat ? ui::alpha(ui::hud_orig::base, op * 0.68f) : ImVec4{0, 0, 0, 0});
         ImGui::PushStyleColor(ImGuiCol_Border, isMat ? ui::alpha(ui::hud_orig::rim, op) : ImVec4{0, 0, 0, 0});
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(isHazard ? 10 : 13), ui::px(isHazard ? 9 : 11)});
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {ui::px(isHazard ? 10.f : 13.f), ui::px(isHazard ? 9.f : 11.f)});
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, isMat ? ui::px(15) : 0.f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, isMat ? ui::px(1) : 0.f);
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -1105,7 +1103,7 @@ struct Ui {
                         }
                         const float ty = o.y + (barH - lh) * 0.5f;
                         const float maxLeft = (std::max)(ui::px(40), rw - rSz.x - ui::px(20));
-                        ui::shadowText(d, {o.x + ui::px(isHazard ? 7 : 10), ty}, ui::u32(ui::hud_orig::text, op), ui::ellipsize(leftStr, maxLeft).c_str());
+                        ui::shadowText(d, {o.x + ui::px(isHazard ? 7.f : 10.f), ty}, ui::u32(ui::hud_orig::text, op), ui::ellipsize(leftStr, maxLeft).c_str());
                         if (isHazard && idx == 0) {
                             d->AddRectFilled({o.x + rw - rSz.x - ui::px(11), o.y + ui::px(2)}, {o.x + rw - ui::px(3), o.y + barH - ui::px(2)}, IM_COL32(16, 18, 21, int(235 * op)));
                             d->AddText({o.x + rw - rSz.x - ui::px(7), ty}, ui::u32(ui::hud_orig::accent, op), rightStr);
@@ -2614,19 +2612,27 @@ struct Surface {
         return target != nullptr;
     }
 
+    int maxTextureSize() const {
+        return (device && device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0) ? 8192 : 4096;
+    }
+
     void makeTarget() {
         target.Reset();
+        if (!swap || !device) return;
         ComPtr<ID3D11Texture2D> back;
         if (SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&back)))) device->CreateRenderTargetView(back.Get(), nullptr, &target);
     }
 
-    void resize(unsigned w, unsigned h) {
+    bool resize(unsigned w, unsigned h) {
         w = (std::max)(1u, w); h = (std::max)(1u, h);
-        if (w == width && h == height) return;
+        if (w == width && h == height) return true;
+        if (!swap || !context) return false;
         width = w; height = h;
         target.Reset(); context->ClearState(); context->Flush();
-        swap->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+        const HRESULT hr = swap->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return false;
         makeTarget();
+        return target != nullptr;
     }
 
     void setInteractive(bool value) {
@@ -2646,13 +2652,15 @@ struct Surface {
         ShowWindow(window, value ? SW_SHOWNA : SW_HIDE);
     }
 
-    void render(const float clear[4], const std::filesystem::path* capturePath = nullptr) {
+    bool render(const float clear[4], const std::filesystem::path* capturePath = nullptr) {
         auto* rtv = target.Get();
+        if (!rtv || !context || !swap) return false;
         context->OMSetRenderTargets(1, &rtv, nullptr);
         context->ClearRenderTargetView(rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         if (capturePath && !capturePath->empty()) capture(*capturePath);
-        swap->Present(1, 0);
+        const HRESULT hr = swap->Present(1, 0);
+        return hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET;
     }
 
     void capture(const std::filesystem::path& path) {
@@ -2691,6 +2699,20 @@ struct Surface {
     }
 };
 
+    ImGuiContext* initImGui(Surface& surface, float scale, bool darkMode, bool navKeyboard) {
+        IMGUI_CHECKVERSION();
+        auto* context = ImGui::CreateContext();
+        ImGui::SetCurrentContext(context);
+        auto& io = ImGui::GetIO();
+        io.IniFilename = nullptr; io.LogFilename = nullptr;
+        if (navKeyboard) io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ui::applyTheme(scale, darkMode);
+        ui::fonts = ui::loadFonts(io.Fonts, scale, surface.maxTextureSize());
+        io.FontDefault = ui::fonts.body;
+        ImGui_ImplWin32_Init(surface.window);
+        ImGui_ImplDX11_Init(surface.device.Get(), surface.context.Get());
+        return context;
+    }
 } // namespace
 
 // ================= Gui =================
@@ -2779,19 +2801,9 @@ void Gui::runOverlay(json) {
             surface.destroy();
             throw std::runtime_error("界面渲染器创建失败（DirectComposition）");
         }
-        IMGUI_CHECKVERSION();
-        auto* context = ImGui::CreateContext();
-        ImGui::SetCurrentContext(context);
-        auto& io = ImGui::GetIO();
-        io.IniFilename = nullptr; io.LogFilename = nullptr;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         const float displayScale = ui::scaleForHeight(unsigned(client.bottom));
-        ui::applyTheme(displayScale, false);
-        ui::fonts = ui::loadFonts(io.Fonts, displayScale);
-        io.FontDefault = ui::fonts.body;
-
-        ImGui_ImplWin32_Init(surface.window);
-        ImGui_ImplDX11_Init(surface.device.Get(), surface.context.Get());
+        auto* context = initImGui(surface, displayScale, false, true);
+        auto& io = ImGui::GetIO();
 
         Ui ui;
         ui.displayScale = displayScale;
@@ -2857,7 +2869,7 @@ void Gui::runOverlay(json) {
                 client = area; origin = at;
                 SetWindowPos(surface.window, nullptr, origin.x, origin.y, client.right, client.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
             }
-            surface.resize(unsigned(client.right), unsigned(client.bottom));
+            if (!surface.resize(unsigned(client.right), unsigned(client.bottom))) break;
             surface.show(true);
             ui.poll(ui.open || ui.chatting);
 
@@ -2869,7 +2881,7 @@ void Gui::runOverlay(json) {
             if (ui.open) ui.drawMenu(size);
             ImGui::Render();
             const float clear[4]{0, 0, 0, 0};
-            surface.render(clear);
+            if (!surface.render(clear)) break;
             ++overlayFrames;
             if (!ui.open && !ui.chatting) std::this_thread::sleep_for(std::chrono::milliseconds(8));
         }
@@ -2893,17 +2905,12 @@ void Gui::runPreview(Request handler, json options) {
     }
 
     const bool previewDark = options.value("preview_dark", false);
-    IMGUI_CHECKVERSION();
-    auto* context = ImGui::CreateContext();
-    ImGui::SetCurrentContext(context);
-    auto& io = ImGui::GetIO();
-    io.IniFilename = nullptr; io.LogFilename = nullptr;
-    ui::applyTheme(1.0f, previewDark);
-    ui::fonts = ui::loadFonts(io.Fonts, 1.0f);
-    io.FontDefault = ui::fonts.body;
-
-    ImGui_ImplWin32_Init(surface.window);
-    ImGui_ImplDX11_Init(surface.device.Get(), surface.context.Get());
+    float previewScale = 1.0f;
+    char envScale[16]{};
+    if (GetEnvironmentVariableA("EFLINK_PREVIEW_SCALE", envScale, sizeof envScale) > 0) {
+        previewScale = (std::clamp)(float(std::atof(envScale)), 0.85f, 1.55f);
+    }
+    auto* context = initImGui(surface, previewScale, previewDark, false);
 
     std::string demoRole = str(options, "preview_demo");
     if (options.value("preview_hud", false) && demoRole.empty()) demoRole = "host";
@@ -2982,5 +2989,4 @@ void Gui::runPreview(Request handler, json options) {
     uiReady = false;
     overlayReady = false;
 }
-
 } // namespace eflink
